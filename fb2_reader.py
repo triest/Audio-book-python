@@ -5,20 +5,34 @@ fb2_reader.py — озвучивание книг в формате FB2 на р�
 
 Возможности:
   * извлечение текста из .fb2 (и .fb2.zip) по главам;
-  * озвучка тремя способами:
-      1) silero  — (рекомендуется) нейросетевой синтез Silero TTS.
-                   Лучшее качество: живая интонация, естественные паузы
-                   на знаках препинания, ударения расставляются
-                   автоматически. Модель скачивается один раз (~50-100 МБ),
-                   дальше работает офлайн. Требует torch.
-      2) online  — через gTTS (Google Text-to-Speech), нужен интернет
-                   на каждый запуск, голос неплохой, но менее выразительный.
-      3) offline — через pyttsx3 и системный TTS (espeak и т.п.), самое
-                   низкое качество, зато совсем без интернета и без torch.
+  * озвучка четырьмя способами:
+      1) silero      — (рекомендуется, если torch не нужен на этой машине)
+                       нейросетевой синтез Silero TTS локально через torch.hub.
+                       Живая интонация, естественные паузы на знаках
+                       препинания, ударения расставляются автоматически.
+                       Модель скачивается один раз (~50-100 МБ), дальше
+                       работает офлайн. Требует torch.
+      2) silero_rest — синтез через удалённый/локальный Silero-REST-Service
+                       (https://github.com/Flokss/Silero-REST-Service).
+                       Текст главы автоматически превращается в SSML с
+                       интонационными паузами на запятых/тире/двоеточиях,
+                       более длинными паузами между предложениями и
+                       абзацами, и с сохранением интонации вопросительных
+                       и восклицательных предложений. Требует запущенного
+                       сервиса (см. --rest-url) и пакет requests.
+                       Для пауз на сервисе должен быть эндпоинт /getssmlwav
+                       (см. патч в этом репозитории).
+      3) online      — через gTTS (Google Text-to-Speech), нужен интернет
+                       на каждый запуск, голос неплохой, но менее выразительный.
+      4) offline     — через pyttsx3 и системный TTS (espeak и т.п.), самое
+                       низкое качество, зато совсем без интернета и без torch.
 
 Установка зависимостей:
-  # для рекомендуемого режима silero (лучшее качество голоса):
+  # для локального режима silero (лучшее качество голоса):
   pip install torch torchaudio omegaconf numpy
+
+  # для режима silero_rest (клиент к REST-сервису):
+  pip install requests numpy
 
   # для остальных режимов:
   pip install gTTS pyttsx3 pygame lxml pydub
@@ -27,11 +41,16 @@ fb2_reader.py — озвучивание книг в формате FB2 на р�
   sudo apt install espeak-ng
 
 Примеры запуска:
-  # Лучшее качество: нейросетевой голос Silero, сохранить в wav
+  # Лучшее качество: нейросетевой голос Silero (локально), сохранить в wav
   python3 fb2_reader.py book.fb2 --mode silero --speaker xenia --outdir audiobook
 
   # То же самое, но сразу слушать по мере озвучки
   python3 fb2_reader.py book.fb2 --mode silero --play
+
+  # Через Silero-REST-Service с интонационными паузами (SSML), сервис
+  # запущен на localhost:5010 (см. install.sh из Silero-REST-Service)
+  python3 fb2_reader.py book.fb2 --mode silero_rest --rest-url http://localhost:5010 \
+      --speaker xenia --outdir audiobook
 
   # Озвучить книгу через gTTS и сразу проигрывать
   python3 fb2_reader.py book.fb2 --mode online --play
@@ -325,6 +344,157 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
 
 
+# --------------------------------------------------------------------------
+# SSML: расстановка интонационных пауз, вопросов/восклицаний
+# --------------------------------------------------------------------------
+
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+_SOFT_PAUSE_RE = re.compile(r"([,;:]|—|--)\s+")
+
+
+def _xml_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def text_to_ssml(text: str, sentence_break_ms: int = 320,
+                  paragraph_break_ms: int = 550, comma_break_ms: int = 180) -> str:
+    """Превращает обычный текст главы в SSML-документ для Silero.
+
+    * абзацы -> <p>, между ними длинная пауза (paragraph_break_ms);
+    * предложения -> <s>, между ними пауза покороче (sentence_break_ms);
+      знаки "?" и "!" сохраняются как есть — по ним Silero строит
+      вопросительную/восклицательную интонацию;
+    * внутри предложения после запятых/тире/двоеточий/точек с запятой
+      добавляется короткая пауза <break/> (comma_break_ms), имитирующая
+      естественную интонационную паузу при чтении.
+    """
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()] or [text.strip()]
+
+    p_chunks = []
+    for para in paragraphs:
+        sentences = [s.strip() for s in _SENT_SPLIT_RE.split(para) if s.strip()]
+        s_chunks = []
+        for sent in sentences:
+            escaped = _xml_escape(sent)
+            escaped = _SOFT_PAUSE_RE.sub(
+                lambda m: f'{_xml_escape(m.group(1))}<break time="{comma_break_ms}ms"/> ',
+                escaped,
+            )
+            s_chunks.append(f"<s>{escaped}</s>")
+        if s_chunks:
+            joiner = f'<break time="{sentence_break_ms}ms"/>'
+            p_chunks.append("<p>" + joiner.join(s_chunks) + "</p>")
+
+    joiner = f'<break time="{paragraph_break_ms}ms"/>'
+    return "<speak>" + joiner.join(p_chunks) + "</speak>"
+
+
+def _split_paragraphs_for_ssml(text: str, max_len: int):
+    """Делит текст главы на куски по абзацам/предложениям так, чтобы
+    длина обычного текста каждого куска не превышала max_len (SSML-разметка
+    добавляется уже поверх каждого куска отдельно)."""
+    paragraphs = [p for p in text.split("\n") if p.strip()]
+    chunks, cur = [], []
+    cur_len = 0
+    for para in paragraphs:
+        if cur_len + len(para) + 1 > max_len and cur:
+            chunks.append("\n".join(cur))
+            cur, cur_len = [], 0
+        if len(para) > max_len:
+            # длинный абзац без переносов — режем по предложениям
+            for sent in split_text(para, max_len):
+                if cur_len + len(sent) + 1 > max_len and cur:
+                    chunks.append("\n".join(cur))
+                    cur, cur_len = [], 0
+                cur.append(sent)
+                cur_len += len(sent) + 1
+        else:
+            cur.append(para)
+            cur_len += len(para) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks or [text]
+
+
+def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rate: int,
+                     play: bool, rest_url: str, sentence_break_ms: int, paragraph_break_ms: int,
+                     comma_break_ms: int, max_len: int = 700):
+    """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
+
+    Текст каждой главы автоматически превращается в SSML с интонационными
+    паузами (см. text_to_ssml) и отправляется на эндпоинт /getssmlwav
+    (нужен патч сервиса, добавляющий поддержку ssml_text/SSML — обычный
+    /getwav SSML не понимает).
+    """
+    import io
+    import requests
+    import numpy as np
+    import wave as wave_mod
+
+    rest_url = rest_url.rstrip("/")
+    endpoint = f"{rest_url}/getssmlwav"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    def synth_ssml_chunk(plain_text_chunk: str) -> bytes:
+        ssml = text_to_ssml(
+            plain_text_chunk,
+            sentence_break_ms=sentence_break_ms,
+            paragraph_break_ms=paragraph_break_ms,
+            comma_break_ms=comma_break_ms,
+        )
+        resp = requests.get(endpoint, params={
+            "text_to_speech": ssml,
+            "speaker": speaker,
+            "sample_rate": sample_rate,
+            "raw_ssml": "true",
+        }, timeout=300)
+        resp.raise_for_status()
+        return resp.content
+
+    for idx, (title, text) in enumerate(chapters, 1):
+        if idx < start:
+            continue
+        fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
+        out_path = outdir / fname
+        print(f"[{idx}/{len(chapters)}] Озвучиваю (silero_rest): {title} -> {fname}")
+
+        chunks = _split_paragraphs_for_ssml(text, max_len)
+        pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
+        audio_parts = []
+
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            try:
+                wav_bytes = synth_ssml_chunk(chunk)
+                with wave_mod.open(io.BytesIO(wav_bytes), "rb") as wf:
+                    n = wf.getnframes()
+                    pcm = wf.readframes(n)
+                    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
+                audio_parts.append(audio)
+                audio_parts.append(pause)
+            except Exception as e:
+                print(f"  Пропускаю фрагмент из-за ошибки синтеза: {e}")
+
+        if not audio_parts:
+            continue
+
+        full_audio = np.concatenate(audio_parts)
+        with wave_mod.open(str(out_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            pcm = (full_audio * 32767).astype(np.int16).tobytes()
+            wf.writeframes(pcm)
+
+        if play:
+            print("  Проигрывание...")
+            play_file(out_path)
+
+    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+
+
 def run_offline(chapters, start: int, rate: int, voice_hint: str):
     import pyttsx3
     engine = pyttsx3.init()
@@ -364,9 +534,11 @@ def run_offline(chapters, start: int, rate: int, voice_hint: str):
 def main():
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
     ap.add_argument("book", type=Path, help="путь к .fb2 или .fb2.zip файлу")
-    ap.add_argument("--mode", choices=["online", "offline", "silero"], default="silero",
-                     help="silero = нейросетевой голос (лучшее качество, интонация, офлайн после скачивания модели); "
-                          "online = gTTS (интернет); offline = pyttsx3 (без интернета, системный голос)")
+    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest"], default="silero",
+                     help="silero = нейросетевой голос локально через torch.hub; "
+                          "silero_rest = синтез через Silero-REST-Service с интонационными паузами "
+                          "(SSML: паузы на запятых/тире, границах предложений и абзацев, интонация "
+                          "вопросов/восклицаний); online = gTTS (интернет); offline = pyttsx3 (без интернета)")
     ap.add_argument("--outdir", type=Path, default=Path("audiobook_output"),
                      help="папка для сохранения аудио (online и silero режимы)")
     ap.add_argument("--play", action="store_true",
@@ -379,6 +551,14 @@ def main():
     ap.add_argument("--sample-rate", type=int, default=48000,
                      help="частота дискретизации для silero-режима (8000/24000/48000)")
     ap.add_argument("--list", action="store_true", help="только показать список глав и выйти")
+    ap.add_argument("--rest-url", type=str, default="http://localhost:5010",
+                     help="адрес Silero-REST-Service для режима silero_rest")
+    ap.add_argument("--sentence-break-ms", type=int, default=320,
+                     help="пауза между предложениями в silero_rest-режиме (мс)")
+    ap.add_argument("--paragraph-break-ms", type=int, default=550,
+                     help="пауза между абзацами в silero_rest-режиме (мс)")
+    ap.add_argument("--comma-break-ms", type=int, default=180,
+                     help="пауза на запятых/тире/двоеточиях в silero_rest-режиме (мс)")
     args = ap.parse_args()
 
     if not args.book.exists():
@@ -400,6 +580,10 @@ def main():
         print(f"\nГотово. Файлы сохранены в: {args.outdir.resolve()}")
     elif args.mode == "silero":
         run_silero(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play)
+    elif args.mode == "silero_rest":
+        run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
+                         args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,
+                         args.comma_break_ms)
     else:
         run_offline(chapters, args.start, args.rate, args.voice)
 
