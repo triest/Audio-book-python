@@ -37,8 +37,20 @@ fb2_reader.py — озвучивание книг в формате FB2 на р�
   # для остальных режимов:
   pip install gTTS pyttsx3 pygame lxml pydub
 
+  # необязательно, но рекомендуется — красивый прогресс-бар по фрагментам
+  # главы вместо простого текстового счётчика (без него используется
+  # встроенная упрощённая замена):
+  pip install tqdm
+
 Для offline-режима (pyttsx3) на Linux дополнительно нужен espeak-ng:
   sudo apt install espeak-ng
+
+Повторный запуск: если для главы уже есть готовый .mp3/.wav файл,
+озвученный с теми же параметрами (голос, частота дискретизации, паузы и
+сам текст главы не изменились), она пропускается — файл не переозвучивается
+заново. Признак хранится в скрытом файле рядом с аудио (например,
+"001_Глава 1.wav.meta.json"). Если поменять --speaker, --sample-rate,
+паузы или сам текст книги — соответствующая глава переозвучится заново.
 
 Примеры запуска:
   # Лучшее качество: нейросетевой голос Silero (локально), сохранить в wav
@@ -66,11 +78,47 @@ kseniya (жен.), xenia (жен.), eugene (муж.), random (случайный
 """
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import sys
 import zipfile
 from pathlib import Path
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        """Мини-замена tqdm на случай, если пакет не установлен —
+        выводит прогресс вида 'Глава 3: 5/12' в одну строку."""
+
+        def __init__(self, iterable=None, total=None, desc="", unit="", leave=True):
+            self.iterable = iterable
+            self.total = total if total is not None else (len(iterable) if iterable is not None else None)
+            self.desc = desc
+            self.unit = unit
+            self.n = 0
+
+        def __iter__(self):
+            for item in self.iterable:
+                yield item
+                self.update(1)
+            self.close()
+
+        def update(self, n=1):
+            self.n += n
+            suffix = f"/{self.total}" if self.total else ""
+            print(f"\r  {self.desc}: {self.n}{suffix} {self.unit}".rstrip(), end="", flush=True)
+
+        def close(self):
+            print()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
 
 try:
     from lxml import etree
@@ -206,20 +254,61 @@ def sanitize_filename(name: str) -> str:
     return name.strip()[:80] or "chapter"
 
 
-def synth_online(text: str, out_path: Path, lang="ru"):
+# --------------------------------------------------------------------------
+# Пропуск уже озвученных глав (если файл уже сгенерирован с теми же
+# параметрами — не переозвучиваем заново)
+# --------------------------------------------------------------------------
+
+def _meta_path(out_path: Path) -> Path:
+    return out_path.with_name(out_path.name + ".meta.json")
+
+
+def _params_fingerprint(text: str, **params) -> dict:
+    """Собирает "отпечаток" параметров озвучки главы: сам текст (хэш) плюс
+    все параметры синтеза. Если хоть один параметр изменился (голос,
+    частота, паузы и т.п.) или изменился текст главы — считаем, что файл
+    нужно переозвучить."""
+    fingerprint = dict(params)
+    fingerprint["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return fingerprint
+
+
+def _is_already_done(out_path: Path, fingerprint: dict) -> bool:
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return False
+    meta_path = _meta_path(out_path)
+    if not meta_path.exists():
+        return False
+    try:
+        saved = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return saved == fingerprint
+
+
+def _save_fingerprint(out_path: Path, fingerprint: dict) -> None:
+    _meta_path(out_path).write_text(
+        json.dumps(fingerprint, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+def synth_online(text: str, out_path: Path, lang="ru", desc: str = ""):
     from gtts import gTTS
     # gTTS ограничивает длину — разбиваем на куски по предложениям
     max_len = 4500
     chunks = split_text(text, max_len)
     if len(chunks) == 1:
-        gTTS(text=chunks[0], lang=lang).save(str(out_path))
+        with tqdm(total=1, desc=desc or "синтез", unit="фрагм.") as bar:
+            gTTS(text=chunks[0], lang=lang).save(str(out_path))
+            bar.update(1)
         return
     # склеиваем несколько mp3 через pydub, если он есть; иначе сохраняем по частям
     try:
         from pydub import AudioSegment
         combined = AudioSegment.empty()
         tmp_files = []
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(tqdm(chunks, desc=desc or "синтез", unit="фрагм.")):
             tmp = out_path.with_suffix(f".part{i}.mp3")
             gTTS(text=chunk, lang=lang).save(str(tmp))
             combined += AudioSegment.from_mp3(str(tmp))
@@ -229,7 +318,7 @@ def synth_online(text: str, out_path: Path, lang="ru"):
             t.unlink(missing_ok=True)
     except ImportError:
         # Без pydub — сохраняем части отдельными файлами
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(tqdm(chunks, desc=desc or "синтез", unit="фрагм.")):
             part_path = out_path.with_name(f"{out_path.stem}_part{i+1}{out_path.suffix}")
             gTTS(text=chunk, lang=lang).save(str(part_path))
         print("  (pydub не установлен — глава сохранена частями *_partN.mp3)")
@@ -268,8 +357,16 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str):
             continue
         fname = f"{idx:03d}_{sanitize_filename(title)}.mp3"
         out_path = outdir / fname
+        fingerprint = _params_fingerprint(text, mode="online", lang=voice_lang)
+        if _is_already_done(out_path, fingerprint):
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {fname}")
+            if play:
+                print("  Проигрывание...")
+                play_file(out_path)
+            continue
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
-        synth_online(text, out_path, lang=voice_lang)
+        synth_online(text, out_path, lang=voice_lang, desc=f"Гл.{idx}")
+        _save_fingerprint(out_path, fingerprint)
         if play:
             print("  Проигрывание...")
             play_file(out_path)
@@ -283,11 +380,14 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     import torch
 
     print("Загружаю модель Silero TTS (при первом запуске — скачивание)...")
+    # v5_5_ru — актуальная модель: умеет сама расставлять ударения,
+    # разрешать омографы и строить вопросительную интонацию без
+    # дополнительной разметки. API идентичен v4 (те же голоса и методы).
     model, _ = torch.hub.load(
         repo_or_dir="snakers4/silero-models",
         model="silero_tts",
         language="ru",
-        speaker="v4_ru",
+        speaker="v5_5_ru",
     )
     device = torch.device("cpu")
     model.to(device)
@@ -302,6 +402,17 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             continue
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
+
+        fingerprint = _params_fingerprint(
+            text, mode="silero", speaker=speaker, sample_rate=sample_rate, max_len=max_len,
+        )
+        if _is_already_done(out_path, fingerprint):
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
+            if play:
+                print("  Проигрывание...")
+                play_file(out_path)
+            continue
+
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
 
         chunks = split_text(text, max_len)
@@ -309,7 +420,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         audio_parts = []
         pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)  # пауза между кусками
 
-        for chunk in chunks:
+        for chunk in tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."):
             if not chunk.strip():
                 continue
             try:
@@ -337,6 +448,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             pcm = (full_audio * 32767).astype(np.int16).tobytes()
             wf.writeframes(pcm)
 
+        _save_fingerprint(out_path, fingerprint)
+
         if play:
             print("  Проигрывание...")
             play_file(out_path)
@@ -357,17 +470,39 @@ def _xml_escape(s: str) -> str:
              .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _prosody_wrap(escaped_sentence: str, original_sentence: str, emphasize: bool) -> str:
+    """Слегка усиливает интонацию вопросительных/восклицательных предложений
+    через <prosody pitch=.../rate=...> поверх того, что модель и так делает
+    по самому знаку "?"/"!" — особенно заметно на репликах в кавычках и
+    коротких восклицаниях."""
+    if not emphasize:
+        return f"<s>{escaped_sentence}</s>"
+    stripped = original_sentence.rstrip()
+    if stripped.endswith("?"):
+        return f'<s><prosody pitch="high">{escaped_sentence}</prosody></s>'
+    if stripped.endswith("!"):
+        return f'<s><prosody pitch="high" rate="fast">{escaped_sentence}</prosody></s>'
+    return f"<s>{escaped_sentence}</s>"
+
+
 def text_to_ssml(text: str, sentence_break_ms: int = 320,
-                  paragraph_break_ms: int = 550, comma_break_ms: int = 180) -> str:
+                  paragraph_break_ms: int = 550, comma_break_ms: int = 180,
+                  emphasize: bool = True) -> str:
     """Превращает обычный текст главы в SSML-документ для Silero.
 
     * абзацы -> <p>, между ними длинная пауза (paragraph_break_ms);
     * предложения -> <s>, между ними пауза покороче (sentence_break_ms);
       знаки "?" и "!" сохраняются как есть — по ним Silero строит
-      вопросительную/восклицательную интонацию;
+      вопросительную/восклицательную интонацию, а если emphasize=True —
+      дополнительно оборачиваются в <prosody pitch="high"[...]"> для более
+      выраженной интонации;
     * внутри предложения после запятых/тире/двоеточий/точек с запятой
       добавляется короткая пауза <break/> (comma_break_ms), имитирующая
       естественную интонационную паузу при чтении.
+
+    Ударения (RUAccent) в готовый SSML не добавляются здесь — это делает
+    сервер (silero_rest_service.py) при получении запроса, в том числе для
+    уже готового SSML, который присылает этот клиент.
     """
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()] or [text.strip()]
 
@@ -381,7 +516,7 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
                 lambda m: f'{_xml_escape(m.group(1))}<break time="{comma_break_ms}ms"/> ',
                 escaped,
             )
-            s_chunks.append(f"<s>{escaped}</s>")
+            s_chunks.append(_prosody_wrap(escaped, sent, emphasize))
         if s_chunks:
             joiner = f'<break time="{sentence_break_ms}ms"/>'
             p_chunks.append("<p>" + joiner.join(s_chunks) + "</p>")
@@ -419,63 +554,165 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
 
 def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rate: int,
                      play: bool, rest_url: str, sentence_break_ms: int, paragraph_break_ms: int,
-                     comma_break_ms: int, max_len: int = 700):
+                     comma_break_ms: int, emphasize: bool = True, max_len: int = 700):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
     паузами (см. text_to_ssml) и отправляется на эндпоинт /getssmlwav
     (нужен патч сервиса, добавляющий поддержку ssml_text/SSML — обычный
     /getwav SSML не понимает).
+
+    Синтез каждого фрагмента проходит по каскаду вариантов, чтобы почти
+    всегда что-то сгенерировалось, а не пропускалось молча:
+      1) SSML с паузами и усиленной интонацией (как обычно);
+      2) тот же текст через /getwav (обычный текст, без SSML) — на случай,
+         если конкретный SSML сервис не смог разобрать (сервис сам внутри
+         себя тоже пробует упрощённые варианты, см. silero_rest_service.py);
+      3) если и это не удалось (например, сервис вообще недоступен) — в
+         файл вставляется короткая тишина вместо фрагмента, чтобы длина
+         и порядок остальных фрагментов не съезжали, а не пропускается
+         совсем без следа.
+    Все ошибки подробно пишутся в лог-файл рядом с аудио (см. LOG_FILE).
     """
     import io
+    import time
+    import traceback as tb_module
     import requests
     import numpy as np
     import wave as wave_mod
 
     rest_url = rest_url.rstrip("/")
-    endpoint = f"{rest_url}/getssmlwav"
+    ssml_endpoint = f"{rest_url}/getssmlwav"
+    plain_endpoint = f"{rest_url}/getwav"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    def synth_ssml_chunk(plain_text_chunk: str) -> bytes:
+    log_path = outdir / "silero_rest_client.log"
+
+    def log(message: str):
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        print(f"  {message}")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def _error_detail(exc: Exception) -> str:
+        """Достаёт понятное сообщение об ошибке: если сервер ответил
+        HTTPException с текстом (detail), берём его — там обычно и есть
+        настоящая причина сбоя, а не просто код 400."""
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            try:
+                return f"HTTP {resp.status_code}: {resp.json().get('detail', resp.text)[:500]}"
+            except Exception:
+                return f"HTTP {resp.status_code}: {resp.text[:500]}"
+        return f"{type(exc).__name__}: {exc}"
+
+    def _get_with_retry(url: str, params: dict, retries: int = 3, backoff_s: float = 5.0):
+        """Повторяет запрос при обрыве соединения (например, сервис как раз
+        перезапускается) — именно так выглядела ситуация в логах: сервис
+        ненадолго "падал"/перезапускался, и все запросы в этом окне
+        получали ConnectionRefused. HTTP-ошибки (4xx/5xx, т.е. сервис
+        ответил, но не смог синтезировать) не повторяем — там причина не в
+        временной недоступности, и retry всё равно даст ту же ошибку."""
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                resp = requests.get(url, params=params, timeout=300)
+                resp.raise_for_status()
+                return resp
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                if attempt < retries:
+                    log(f"сервис недоступен ({type(e).__name__}), попытка {attempt}/{retries}, "
+                        f"жду {backoff_s:.0f} сек и пробую снова...")
+                    time.sleep(backoff_s)
+            except requests.exceptions.HTTPError as e:
+                raise e
+        raise last_exc
+
+    def synth_via_ssml(plain_text_chunk: str) -> bytes:
         ssml = text_to_ssml(
             plain_text_chunk,
             sentence_break_ms=sentence_break_ms,
             paragraph_break_ms=paragraph_break_ms,
             comma_break_ms=comma_break_ms,
+            emphasize=emphasize,
         )
-        resp = requests.get(endpoint, params={
+        resp = _get_with_retry(ssml_endpoint, {
             "text_to_speech": ssml,
             "speaker": speaker,
             "sample_rate": sample_rate,
             "raw_ssml": "true",
-        }, timeout=300)
-        resp.raise_for_status()
+        })
+        level = resp.headers.get("X-Synthesis-Level", "as-is")
+        if level != "as-is":
+            log(f"сервис использовал упрощённый вариант синтеза: {level}")
         return resp.content
+
+    def synth_via_plain_text(plain_text_chunk: str) -> bytes:
+        resp = _get_with_retry(plain_endpoint, {
+            "text_to_speech": plain_text_chunk,
+            "speaker": speaker,
+            "sample_rate": sample_rate,
+        })
+        return resp.content
+
+    def synth_chunk(plain_text_chunk: str, chunk_no: int, idx: int, title: str) -> "np.ndarray":
+        try:
+            wav_bytes = synth_via_ssml(plain_text_chunk)
+        except Exception as e_ssml:
+            log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] SSML-синтез не удался "
+                f"({_error_detail(e_ssml)}), пробую обычный текст без SSML...")
+            try:
+                wav_bytes = synth_via_plain_text(plain_text_chunk)
+                log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] синтез обычным текстом удался")
+            except Exception as e_plain:
+                log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] ОШИБКА: не удалось синтезировать "
+                    f"даже обычным текстом ({_error_detail(e_plain)}). "
+                    f"Вставляю тишину вместо фрагмента, чтобы не потерять место в главе.")
+                log("Полный traceback последней ошибки:\n" + tb_module.format_exc())
+                # тишина длиной пропорционально длине текста (примерно как
+                # если бы его прочитали) — чтобы не выпадать из ритма главы
+                silence_seconds = max(1.0, min(8.0, len(plain_text_chunk) / 15))
+                return np.zeros(int(sample_rate * silence_seconds), dtype=np.float32)
+
+        with wave_mod.open(io.BytesIO(wav_bytes), "rb") as wf:
+            n = wf.getnframes()
+            pcm = wf.readframes(n)
+            return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
 
     for idx, (title, text) in enumerate(chapters, 1):
         if idx < start:
             continue
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
+
+        fingerprint = _params_fingerprint(
+            text, mode="silero_rest", speaker=speaker, sample_rate=sample_rate,
+            sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
+            comma_break_ms=comma_break_ms, emphasize=emphasize, max_len=max_len,
+        )
+        if _is_already_done(out_path, fingerprint):
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
+            if play:
+                print("  Проигрывание...")
+                play_file(out_path)
+            continue
+
         print(f"[{idx}/{len(chapters)}] Озвучиваю (silero_rest): {title} -> {fname}")
 
         chunks = _split_paragraphs_for_ssml(text, max_len)
         pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
         audio_parts = []
 
-        for chunk in chunks:
+        for chunk_no, chunk in enumerate(tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."), 1):
             if not chunk.strip():
                 continue
-            try:
-                wav_bytes = synth_ssml_chunk(chunk)
-                with wave_mod.open(io.BytesIO(wav_bytes), "rb") as wf:
-                    n = wf.getnframes()
-                    pcm = wf.readframes(n)
-                    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
-                audio_parts.append(audio)
-                audio_parts.append(pause)
-            except Exception as e:
-                print(f"  Пропускаю фрагмент из-за ошибки синтеза: {e}")
+            audio = synth_chunk(chunk, chunk_no, idx, title)
+            audio_parts.append(audio)
+            audio_parts.append(pause)
 
         if not audio_parts:
             continue
@@ -488,11 +725,14 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             pcm = (full_audio * 32767).astype(np.int16).tobytes()
             wf.writeframes(pcm)
 
+        _save_fingerprint(out_path, fingerprint)
+
         if play:
             print("  Проигрывание...")
             play_file(out_path)
 
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+    print(f"Подробный лог ошибок (если были): {log_path.resolve()}")
 
 
 def run_offline(chapters, start: int, rate: int, voice_hint: str):
@@ -559,6 +799,10 @@ def main():
                      help="пауза между абзацами в silero_rest-режиме (мс)")
     ap.add_argument("--comma-break-ms", type=int, default=180,
                      help="пауза на запятых/тире/двоеточиях в silero_rest-режиме (мс)")
+    ap.add_argument("--no-emphasis", action="store_true",
+                     help="не усиливать интонацию вопросительных/восклицательных "
+                          "предложений через <prosody> в silero_rest-режиме "
+                          "(по умолчанию усиление включено)")
     args = ap.parse_args()
 
     if not args.book.exists():
@@ -583,7 +827,7 @@ def main():
     elif args.mode == "silero_rest":
         run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                          args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,
-                         args.comma_break_ms)
+                         args.comma_break_ms, emphasize=not args.no_emphasis)
     else:
         run_offline(chapters, args.start, args.rate, args.voice)
 
