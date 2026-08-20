@@ -1,5 +1,15 @@
 fb2_reader.py — озвучивание книг в формате FB2 на русском языке.
 
+Графический интерфейс:
+  python3 fb2_reader.py              # без аргументов — откроется окно
+  python3 fb2_reader.py --gui
+  python3 fb2_reader_gui.py
+  run_gui.bat                        # Windows, можно перетащить .fb2 на файл
+
+Командная строка (как раньше):
+  python3 fb2_reader.py book.fb2 --mode silero --speaker xenia
+  run_cli.bat book.fb2 --mode silero --speaker xenia   # Windows
+
 Возможности:
   * извлечение текста из .fb2 (и .fb2.zip) по главам;
   * озвучка четырьмя способами:
@@ -26,7 +36,7 @@ fb2_reader.py — озвучивание книг в формате FB2 на р�
 
 Установка зависимостей:
   # для локального режима silero (лучшее качество голоса):
-  pip install torch torchaudio omegaconf numpy
+  pip install silero torch torchaudio omegaconf numpy
 
   # для режима silero_rest (клиент + сам сервис):
   pip install requests numpy fastapi uvicorn torch ruaccent num2words
@@ -82,6 +92,10 @@ silero_rest_service.py — fb2_reader.py сам к модели не обращ�
 ---
 
 Примеры запуска:
+  # Графический интерфейс (выбор книги, голоса, режима)
+  python3 fb2_reader.py --gui
+  # или двойной клик по run_gui.bat (Windows)
+
   # Лучшее качество без сервиса: нейросетевой голос Silero локально
   python3 fb2_reader.py book.fb2 --mode silero --speaker xenia --outdir audiobook
 
@@ -101,8 +115,15 @@ silero_rest_service.py — fb2_reader.py сам к модели не обращ�
   # Просто посмотреть список глав, ничего не озвучивая
   python3 fb2_reader.py book.fb2 --list
 
-Доступные голоса Silero (--speaker): aidar (муж.), baya (жен.),
-kseniya (жен.), xenia (жен.), eugene (муж.), random (случайный на каждой фразе).
+Доступные модели Silero (--model):
+  v5_5_ru — последняя (ударения, омографы, вопросы), по умолчанию
+  v5_4_ru, v5_ru, v4_ru (устаревшая, голос random)
+
+Голоса (--speaker): aidar (муж.), baya (жен.),
+kseniya (жен.), xenia (жен.), eugene (муж.), random (только v4_ru).
+
+Пример с последней моделью:
+  python3 fb2_reader.py book.fb2 --mode silero --model v5_5_ru --speaker xenia
 
 ---
 
@@ -133,6 +154,9 @@ SSML для интонационных пауз.
 
 Улучшения интонации (последнее обновление)
 
+  * Модель Silero v5_5_ru — последняя на август 2026: ударения, омографы,
+    вопросительная интонация. Выбирается через --model v5_5_ru (по умолчанию)
+    или в GUI в поле «Модель». Загрузка: pip install silero, иначе torch.hub.
   * Модель Silero обновлена с v4_ru на v5_5_ru — она официально умеет сама
     расставлять ударения, разрешать омографы (за́мок/замо́к) и строить
     вопросительную интонацию без дополнительной разметки. Голоса и API те

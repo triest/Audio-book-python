@@ -55,15 +55,10 @@ async def _log_unhandled_exceptions(request: Request, exc: Exception):
                  + traceback.format_exc())
     return JSONResponse(status_code=500, content={"detail": f"Внутренняя ошибка сервера: {exc}"})
  
-# v5_5_ru — актуальная модель Silero для русского: умеет автоматически
-# расставлять ударения, разрешать омографы и строить вопросительную
-# интонацию без дополнительной разметки (в отличие от v4_ru). API
-# идентичен v4 (те же голоса aidar/baya/kseniya/xenia/eugene,
-# те же model.save_wav/apply_tts), поэтому это прямая замена.
-# Имя файла отличается от старого silero_model.pt специально — чтобы
-# не подхватить случайно закэшированную старую модель v4.
-MODEL_URL = "https://models.silero.ai/models/tts/ru/v5_5_ru.pt"
-MODEL_LOCAL_FILE = "silero_model_v5_5_ru.pt"
+from silero_config import DEFAULT_SILERO_MODEL, load_silero_package
+
+# Модель по умолчанию — v5_5_ru (последняя). Переопределить: set SILERO_MODEL=v5_4_ru
+MODEL_ID = os.environ.get("SILERO_MODEL", DEFAULT_SILERO_MODEL)
  
  
 def _patch_ruaccent_token_type_ids(accentizer_obj):
@@ -130,15 +125,11 @@ async def startup_event():
  
     device = torch.device('cpu')
     torch.set_num_threads(4)
- 
-    if not os.path.isfile(MODEL_LOCAL_FILE):
-        logger.info(f"Downloading Silero TTS model ({MODEL_LOCAL_FILE})...")
-        torch.hub.download_url_to_file(MODEL_URL, MODEL_LOCAL_FILE)
- 
+
     try:
-        model = torch.package.PackageImporter(MODEL_LOCAL_FILE).load_pickle("tts_models", "model")
-        model.to(device)
-        logger.info("TTS Model loaded successfully")
+        logger.info(f"Loading Silero TTS model {MODEL_ID}...")
+        model = load_silero_package(MODEL_ID, device)
+        logger.info(f"TTS Model {MODEL_ID} loaded successfully")
     except Exception:
         logger.error("Failed to load TTS model:\n" + traceback.format_exc())
         model = None

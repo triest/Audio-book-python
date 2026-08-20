@@ -29,7 +29,8 @@ fb2_reader.py — озвучивание книг в формате FB2 на р�
 
 Установка зависимостей:
   # для локального режима silero (лучшее качество голоса):
-  pip install torch torchaudio omegaconf numpy
+  pip install silero torch torchaudio omegaconf numpy
+  # silero — официальный пакет; без него модель загрузится через torch.hub
 
   # для режима silero_rest (клиент к REST-сервису):
   pip install requests numpy
@@ -73,8 +74,20 @@ fb2_reader.py — озвучивание книг в формате FB2 на р�
   # Просто посмотреть список глав, ничего не озвучивая
   python3 fb2_reader.py book.fb2 --list
 
-Доступные голоса Silero (--speaker): aidar (муж.), baya (жен.),
-kseniya (жен.), xenia (жен.), eugene (муж.), random (случайный на каждой фразе).
+  # Графический интерфейс (любой из способов):
+  python3 fb2_reader.py              # без аргументов — откроется окно
+  python3 fb2_reader.py --gui
+  python3 fb2_reader.py --gui book.fb2
+  python3 fb2_reader_gui.py
+  python3 fb2_reader_gui.py book.fb2
+
+  # Командная строка (как раньше):
+  python3 fb2_reader.py book.fb2 --mode silero --speaker xenia --outdir audiobook
+
+Доступные модели Silero (--model): v5_5_ru (последняя, по умолчанию),
+v5_4_ru, v5_ru, v4_ru (устаревшая, поддерживает random).
+Голоса (--speaker): aidar (муж.), baya (жен.),
+kseniya (жен.), xenia (жен.), eugene (муж.), random (только v4_ru).
 """
 
 import argparse
@@ -129,6 +142,24 @@ except ImportError:
 
 
 FB2_NS = {"fb": "http://www.gribuser.ru/xml/fictionbook/2.0"}
+
+from silero_config import (
+    DEFAULT_SILERO_MODEL,
+    SILERO_MODELS,
+    load_silero_model,
+    speaker_choices,
+    speakers_for_model,
+)
+
+# Голоса Silero TTS для последней модели (используются в CLI и GUI)
+SILERO_SPEAKERS = speaker_choices(DEFAULT_SILERO_MODEL)
+
+TTS_MODES = {
+    "silero": "Silero (локально, лучшее качество)",
+    "silero_rest": "Silero REST (через сервис, SSML-паузы)",
+    "online": "Google TTS (нужен интернет)",
+    "offline": "Системный TTS (pyttsx3, без интернета)",
+}
 
 
 # --------------------------------------------------------------------------
@@ -372,25 +403,18 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str):
             play_file(out_path)
 
 
-def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: int, play: bool):
-    """Озвучка через Silero TTS — нейросетевой русский голос,
-    хорошо передаёт интонацию и паузы по знакам препинания.
-    При первом запуске модель (~50-100 МБ) скачивается и кэшируется torch.hub.
+def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: int, play: bool,
+               model_id: str = DEFAULT_SILERO_MODEL):
+    """Озвучка через Silero TTS — нейросетевой русский голос.
+    По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
     """
-    import torch
+    allowed = speakers_for_model(model_id)
+    if speaker not in allowed:
+        print(f"Голос {speaker!r} недоступен для {model_id}, использую xenia")
+        speaker = "xenia" if "xenia" in allowed else allowed[0]
 
-    print("Загружаю модель Silero TTS (при первом запуске — скачивание)...")
-    # v5_5_ru — актуальная модель: умеет сама расставлять ударения,
-    # разрешать омографы и строить вопросительную интонацию без
-    # дополнительной разметки. API идентичен v4 (те же голоса и методы).
-    model, _ = torch.hub.load(
-        repo_or_dir="snakers4/silero-models",
-        model="silero_tts",
-        language="ru",
-        speaker="v5_5_ru",
-    )
-    device = torch.device("cpu")
-    model.to(device)
+    print(f"Загружаю модель Silero TTS {model_id} (при первом запуске — скачивание)...")
+    model = load_silero_model(model_id)
 
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -404,7 +428,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         out_path = outdir / fname
 
         fingerprint = _params_fingerprint(
-            text, mode="silero", speaker=speaker, sample_rate=sample_rate, max_len=max_len,
+            text, mode="silero", model=model_id, speaker=speaker,
+            sample_rate=sample_rate, max_len=max_len,
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -554,7 +579,8 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
 
 def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rate: int,
                      play: bool, rest_url: str, sentence_break_ms: int, paragraph_break_ms: int,
-                     comma_break_ms: int, emphasize: bool = True, max_len: int = 700):
+                     comma_break_ms: int, emphasize: bool = True, max_len: int = 700,
+                     model_id: str = DEFAULT_SILERO_MODEL):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -690,7 +716,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         out_path = outdir / fname
 
         fingerprint = _params_fingerprint(
-            text, mode="silero_rest", speaker=speaker, sample_rate=sample_rate,
+            text, mode="silero_rest", model=model_id, speaker=speaker, sample_rate=sample_rate,
             sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
             comma_break_ms=comma_break_ms, emphasize=emphasize, max_len=max_len,
         )
@@ -735,22 +761,45 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     print(f"Подробный лог ошибок (если были): {log_path.resolve()}")
 
 
-def run_offline(chapters, start: int, rate: int, voice_hint: str):
+def list_offline_voices():
+    """Возвращает список системных голосов pyttsx3: [{id, name, is_russian}, ...]."""
+    import pyttsx3
+    engine = pyttsx3.init()
+    result = []
+    for v in engine.getProperty("voices") or []:
+        vid = v.id or ""
+        vname = getattr(v, "name", "") or vid
+        langs = getattr(v, "languages", [])
+        lang_str = " ".join(str(l) for l in langs).lower()
+        is_russian = (
+            "ru" in vid.lower()
+            or "russian" in vname.lower()
+            or "ru" in lang_str
+        )
+        result.append({"id": vid, "name": vname, "is_russian": is_russian})
+    try:
+        engine.stop()
+    except Exception:
+        pass
+    result.sort(key=lambda x: (not x["is_russian"], x["name"].lower()))
+    return result
+
+
+def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str = ""):
     import pyttsx3
     engine = pyttsx3.init()
     engine.setProperty("rate", rate)
 
-    # Пытаемся найти русский голос
-    voices = engine.getProperty("voices")
-    chosen = None
-    for v in voices:
-        vid = (v.id or "").lower()
-        vname = (getattr(v, "name", "") or "").lower()
-        langs = getattr(v, "languages", [])
-        lang_str = " ".join(str(l) for l in langs).lower()
-        if "ru" in vid or "russian" in vname or "ru" in lang_str or (voice_hint and voice_hint.lower() in vid):
-            chosen = v.id
-            break
+    chosen = voice_id or None
+    if not chosen:
+        for v in engine.getProperty("voices") or []:
+            vid = (v.id or "").lower()
+            vname = (getattr(v, "name", "") or "").lower()
+            langs = getattr(v, "languages", [])
+            lang_str = " ".join(str(l) for l in langs).lower()
+            if "ru" in vid or "russian" in vname or "ru" in lang_str or (voice_hint and voice_hint.lower() in vid):
+                chosen = v.id
+                break
     if chosen:
         engine.setProperty("voice", chosen)
         print(f"Использую голос: {chosen}")
@@ -773,7 +822,8 @@ def run_offline(chapters, start: int, rate: int, voice_hint: str):
 
 def main():
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
-    ap.add_argument("book", type=Path, help="путь к .fb2 или .fb2.zip файлу")
+    ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
+    ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
     ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest"], default="silero",
                      help="silero = нейросетевой голос локально через torch.hub; "
                           "silero_rest = синтез через Silero-REST-Service с интонационными паузами "
@@ -787,7 +837,12 @@ def main():
     ap.add_argument("--rate", type=int, default=170, help="скорость речи для offline-режима (слов/мин)")
     ap.add_argument("--voice", type=str, default="", help="подсказка имени голоса для offline-режима")
     ap.add_argument("--speaker", type=str, default="xenia",
-                     help="голос для silero-режима: aidar, baya, kseniya, xenia, eugene, random (по умолчанию xenia)")
+                     help="голос Silero: aidar, baya, kseniya, xenia, eugene "
+                          "(random — только для --model v4_ru)")
+    ap.add_argument("--model", type=str, default=DEFAULT_SILERO_MODEL,
+                     choices=list(SILERO_MODELS.keys()),
+                     help="модель Silero для silero/silero_rest "
+                          f"(по умолчанию {DEFAULT_SILERO_MODEL} — последняя)")
     ap.add_argument("--sample-rate", type=int, default=48000,
                      help="частота дискретизации для silero-режима (8000/24000/48000)")
     ap.add_argument("--list", action="store_true", help="только показать список глав и выйти")
@@ -805,6 +860,15 @@ def main():
                           "(по умолчанию усиление включено)")
     args = ap.parse_args()
 
+    # GUI: --gui, запуск без аргументов, или book.fb2 вместе с --gui
+    if args.gui or (args.book is None and len(sys.argv) == 1):
+        from fb2_reader_gui import run_gui
+        run_gui(initial_book=args.book)
+        return
+
+    if not args.book:
+        ap.error("укажите путь к книге или запустите без аргументов / с --gui для графического интерфейса")
+
     if not args.book.exists():
         print(f"Файл не найден: {args.book}", file=sys.stderr)
         sys.exit(1)
@@ -819,17 +883,26 @@ def main():
             print(f"  {i:3d}. {ch_title}  ({len(text)} символов)")
         return
 
+    if args.mode in ("silero", "silero_rest"):
+        allowed = speakers_for_model(args.model)
+        if args.speaker not in allowed:
+            print(f"Предупреждение: голос {args.speaker!r} недоступен для модели {args.model}. "
+                  f"Доступны: {', '.join(allowed)}", file=sys.stderr)
+            args.speaker = "xenia" if "xenia" in allowed else allowed[0]
+            print(f"Использую голос: {args.speaker}")
+
     if args.mode == "online":
         run_online(chapters, args.outdir, args.play, args.start, voice_lang="ru")
         print(f"\nГотово. Файлы сохранены в: {args.outdir.resolve()}")
     elif args.mode == "silero":
-        run_silero(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play)
+        run_silero(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
+                   model_id=args.model)
     elif args.mode == "silero_rest":
         run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                          args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,
-                         args.comma_break_ms, emphasize=not args.no_emphasis)
+                         args.comma_break_ms, emphasize=not args.no_emphasis, model_id=args.model)
     else:
-        run_offline(chapters, args.start, args.rate, args.voice)
+        run_offline(chapters, args.start, args.rate, args.voice, voice_id=args.voice)
 
 
 if __name__ == "__main__":
