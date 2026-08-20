@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 import subprocess
 import sys
 import threading
@@ -17,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from fb2_reader import (
     TTS_MODES,
+    YANDEX_VOICES,
     list_offline_voices,
     parse_fb2,
     play_file,
@@ -24,6 +27,7 @@ from fb2_reader import (
     run_online,
     run_silero,
     run_silero_rest,
+    run_yandex,
 )
 from silero_config import (
     DEFAULT_SILERO_MODEL,
@@ -58,6 +62,42 @@ class TextRedirector(io.TextIOBase):
         pass
 
 
+SETTINGS_PATH = Path(__file__).resolve().parent / "fb2_reader_settings.json"
+
+# Какие поля запоминаются между запусками программы (имя атрибута-переменной
+# -> ничего больше не нужно, tk.Variable сама знает свой тип через .get()).
+SETTINGS_FIELDS = [
+    "mode_var", "model_var", "start_var", "outdir_var", "play_var",
+    "sample_rate_var", "rest_url_var", "auto_start_rest_var", "rate_var",
+    "sentence_break_var", "paragraph_break_var", "comma_break_var",
+    "accent_var", "yo_var", "emphasis_var",
+    "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
+]
+
+
+def add_context_menu(widget):
+    """Добавляет виджету Entry стандартное контекстное меню правой кнопкой
+    мыши (Вырезать/Копировать/Вставить/Выделить всё) — у полей tkinter его
+    нет по умолчанию, из-за чего вставка правой кнопкой мыши (в отличие от
+    Ctrl+V) может выглядеть так, будто ничего не работает."""
+    menu = tk.Menu(widget, tearoff=0)
+    menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+    menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+    menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Выделить всё", command=lambda: widget.select_range(0, "end"))
+
+    def show_menu(event):
+        widget.focus_set()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    widget.bind("<Button-3>", show_menu)
+    return widget
+
+
 class AudiobookApp(tk.Tk):
     def __init__(self, initial_book: Path | None = None):
         super().__init__()
@@ -75,9 +115,56 @@ class AudiobookApp(tk.Tk):
 
         self._build_ui()
         self._bind_events()
+        self._load_settings()
 
         if initial_book and initial_book.exists():
             self.load_book(initial_book)
+
+    def _load_settings(self):
+        """Восстанавливает сохранённые настройки (в т.ч. API-ключ Yandex,
+        Folder ID и остальные поля) из предыдущего запуска, если файл
+        настроек существует. Ошибки чтения тихо игнорируются — при первом
+        запуске файла ещё нет, это нормально."""
+        if not SETTINGS_PATH.exists():
+            return
+        try:
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for name in SETTINGS_FIELDS:
+            if name not in data:
+                continue
+            var = getattr(self, name, None)
+            if var is None:
+                continue
+            try:
+                var.set(data[name])
+            except Exception:
+                pass
+        # mode_var/model_var могли поменяться — обновить зависящие от них
+        # виджеты (список голосов, доступность полей и т.п.)
+        self._on_model_changed()
+        self._on_mode_changed()
+
+    def _save_settings(self):
+        """Сохраняет текущие настройки в JSON-файл рядом со скриптом —
+        вызывается при закрытии окна и перед стартом озвучки, чтобы
+        API-ключ и остальные поля не терялись между запусками программы."""
+        data = {}
+        for name in SETTINGS_FIELDS:
+            var = getattr(self, name, None)
+            if var is None:
+                continue
+            try:
+                data[name] = var.get()
+            except Exception:
+                pass
+        try:
+            SETTINGS_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as e:
+            self.log(f"Не удалось сохранить настройки: {e}")
 
     def _build_ui(self):
         style = ttk.Style(self)
@@ -93,7 +180,9 @@ class AudiobookApp(tk.Tk):
 
         ttk.Label(file_row, text="Книга FB2:").pack(side="left")
         self.book_var = tk.StringVar()
-        ttk.Entry(file_row, textvariable=self.book_var).pack(side="left", fill="x", expand=True, padx=6)
+        add_context_menu(
+            ttk.Entry(file_row, textvariable=self.book_var)
+        ).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(file_row, text="Обзор…", command=self.browse_book).pack(side="left")
         ttk.Button(file_row, text="Загрузить", command=self.reload_book).pack(side="left", padx=(6, 0))
 
@@ -188,7 +277,9 @@ class AudiobookApp(tk.Tk):
         out_row = ttk.Frame(settings)
         out_row.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
         self.outdir_var = tk.StringVar(value=str(Path("audiobook_output").resolve()))
-        ttk.Entry(out_row, textvariable=self.outdir_var).pack(side="left", fill="x", expand=True)
+        add_context_menu(
+            ttk.Entry(out_row, textvariable=self.outdir_var)
+        ).pack(side="left", fill="x", expand=True)
         ttk.Button(out_row, text="…", width=3, command=self.browse_outdir).pack(side="left", padx=(4, 0))
 
         row += 1
@@ -211,7 +302,7 @@ class AudiobookApp(tk.Tk):
         row += 1
         ttk.Label(settings, text="REST URL:").grid(row=row, column=0, sticky="w", pady=4)
         self.rest_url_var = tk.StringVar(value="http://localhost:5010")
-        self.rest_url_entry = ttk.Entry(settings, textvariable=self.rest_url_var)
+        self.rest_url_entry = add_context_menu(ttk.Entry(settings, textvariable=self.rest_url_var))
         self.rest_url_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
 
         row += 1
@@ -230,6 +321,65 @@ class AudiobookApp(tk.Tk):
         self.rate_spin.grid(row=row, column=1, sticky="w", pady=4)
 
         settings.columnconfigure(1, weight=1)
+
+        # --- Yandex SpeechKit: ключ, каталог, голос ---
+        yandex_frame = ttk.LabelFrame(right, text="Yandex SpeechKit (режим yandex)", padding=10)
+        yandex_frame.pack(fill="x", pady=(8, 0))
+
+        yrow = 0
+        ttk.Label(yandex_frame, text="API-ключ:").grid(row=yrow, column=0, sticky="w", pady=3)
+        key_row = ttk.Frame(yandex_frame)
+        key_row.grid(row=yrow, column=1, columnspan=2, sticky="ew", pady=3)
+        self.yandex_api_key_var = tk.StringVar(value=os.environ.get("YANDEX_API_KEY", ""))
+        self.yandex_api_key_entry = add_context_menu(
+            ttk.Entry(key_row, textvariable=self.yandex_api_key_var, show="•")
+        )
+        self.yandex_api_key_entry.pack(side="left", fill="x", expand=True)
+        self._yandex_key_show_var = tk.BooleanVar(value=False)
+
+        def _toggle_key_visibility():
+            self.yandex_api_key_entry.configure(show="" if self._yandex_key_show_var.get() else "•")
+
+        ttk.Checkbutton(
+            key_row, text="показать", variable=self._yandex_key_show_var, command=_toggle_key_visibility
+        ).pack(side="left", padx=(6, 0))
+
+        yrow += 1
+        ttk.Label(yandex_frame, text="Folder ID (необязательно):").grid(row=yrow, column=0, sticky="w", pady=3)
+        self.yandex_folder_id_var = tk.StringVar(value=os.environ.get("YANDEX_FOLDER_ID", ""))
+        self.yandex_folder_id_entry = add_context_menu(
+            ttk.Entry(yandex_frame, textvariable=self.yandex_folder_id_var)
+        )
+        self.yandex_folder_id_entry.grid(row=yrow, column=1, columnspan=2, sticky="ew", pady=3)
+
+        yrow += 1
+        ttk.Label(yandex_frame, text="Голос:").grid(row=yrow, column=0, sticky="w", pady=3)
+        self._yandex_voice_keys = list(YANDEX_VOICES.keys())
+        yandex_voice_labels = [f"{k} — {v}" for k, v in YANDEX_VOICES.items()]
+        self.yandex_voice_var = tk.StringVar(value=yandex_voice_labels[0])
+        self.yandex_voice_combo = ttk.Combobox(
+            yandex_frame, textvariable=self.yandex_voice_var, values=yandex_voice_labels,
+            state="readonly", width=28,
+        )
+        self.yandex_voice_combo.grid(row=yrow, column=1, columnspan=2, sticky="ew", pady=3)
+
+        yrow += 1
+        ttk.Label(yandex_frame, text="Скорость речи:").grid(row=yrow, column=0, sticky="w", pady=3)
+        self.yandex_speed_var = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(
+            yandex_frame, from_=0.1, to=3.0, increment=0.1, textvariable=self.yandex_speed_var, width=8
+        ).grid(row=yrow, column=1, sticky="w", pady=3)
+
+        yrow += 1
+        ttk.Label(
+            yandex_frame,
+            text="Платный облачный сервис (после пробного периода) — нужен интернет\n"
+                 "на каждую главу. Как получить ключ и Folder ID — см. README.",
+            foreground="#555", justify="left",
+        ).grid(row=yrow, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        yandex_frame.columnconfigure(1, weight=1)
+        self._yandex_frame = yandex_frame
 
         # --- интонация: паузы по знакам препинания, ударения, усиление ---
         intonation = ttk.LabelFrame(right, text="Интонация и паузы (silero / silero_rest)", padding=10)
@@ -507,6 +657,10 @@ class AudiobookApp(tk.Tk):
         self.voice_combo.configure(values=["Google TTS — русский (выбор голоса недоступен)"], state="disabled")
         self.voice_combo.current(0)
 
+    def _set_yandex_voice_placeholder(self):
+        self.voice_combo.configure(values=["см. блок «Yandex SpeechKit» ниже"], state="disabled")
+        self.voice_combo.current(0)
+
     def _on_mode_changed(self):
         mode = self._current_mode()
         self.mode_desc.configure(text=TTS_MODES.get(mode, ""))
@@ -520,10 +674,17 @@ class AudiobookApp(tk.Tk):
         self.auto_start_rest_check.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.emphasis_check.configure(state="normal" if mode == "silero_rest" else "disabled")
 
+        yandex_field_state = "normal" if mode == "yandex" else "disabled"
+        self.yandex_api_key_entry.configure(state=yandex_field_state)
+        self.yandex_folder_id_entry.configure(state=yandex_field_state)
+        self.yandex_voice_combo.configure(state="readonly" if mode == "yandex" else "disabled")
+
         if mode in ("silero", "silero_rest"):
             self._set_silero_voices()
         elif mode == "offline":
             self._set_offline_voices()
+        elif mode == "yandex":
+            self._set_yandex_voice_placeholder()
         else:
             self._set_online_voice()
 
@@ -538,6 +699,12 @@ class AudiobookApp(tk.Tk):
         if idx < 0 or idx >= len(self._offline_voices):
             return ""
         return self._offline_voices[idx]["id"]
+
+    def _selected_yandex_voice(self) -> str:
+        idx = self.yandex_voice_combo.current()
+        if idx < 0:
+            return "alena"
+        return self._yandex_voice_keys[idx]
 
     def _set_busy(self, busy: bool):
         state = "disabled" if busy else "normal"
@@ -670,6 +837,8 @@ class AudiobookApp(tk.Tk):
         start = max(1, int(self.start_var.get()))
         play = self.play_var.get()
 
+        self._save_settings()
+
         self._stop_requested = False
         self._set_busy(True)
         self.log(f"\n--- Старт озвучки: режим {mode}, с главы {start} ---")
@@ -726,6 +895,18 @@ class AudiobookApp(tk.Tk):
                         model_id=self._selected_model_id(),
                         on_progress=self._on_synthesis_progress,
                     )
+                elif mode == "yandex":
+                    run_yandex(
+                        self.chapters,
+                        outdir,
+                        start,
+                        play,
+                        self.yandex_api_key_var.get().strip(),
+                        self.yandex_folder_id_var.get().strip(),
+                        voice=self._selected_yandex_voice(),
+                        speed=float(self.yandex_speed_var.get()),
+                        on_progress=self._on_synthesis_progress,
+                    )
                 else:
                     run_offline(
                         self.chapters,
@@ -778,6 +959,7 @@ class AudiobookApp(tk.Tk):
         if self._worker and self._worker.is_alive():
             if not messagebox.askyesno("Выход", "Озвучка ещё идёт. Закрыть приложение?"):
                 return
+        self._save_settings()
         if self._rest_proc is not None and self._rest_proc.poll() is None:
             if messagebox.askyesno(
                 "Сервис Silero REST",

@@ -157,8 +157,23 @@ SILERO_SPEAKERS = speaker_choices(DEFAULT_SILERO_MODEL)
 TTS_MODES = {
     "silero": "Silero (локально, лучшее качество)",
     "silero_rest": "Silero REST (через сервис, SSML-паузы)",
+    "yandex": "Yandex SpeechKit (облако, платно, нужен API-ключ)",
     "online": "Google TTS (нужен интернет)",
     "offline": "Системный TTS (pyttsx3, без интернета)",
+}
+
+# Голоса Yandex SpeechKit (v1, ru-RU) на момент добавления — актуальный
+# список стоит сверять в консоли Yandex Cloud, он время от времени
+# пополняется новыми дикторами.
+YANDEX_VOICES = {
+    "alena": "Алёна (жен., нейтральный)",
+    "filipp": "Филипп (муж., нейтральный)",
+    "ermil": "Ермил (муж., с эмоциями good/neutral)",
+    "jane": "Джейн (жен., с эмоциями good/neutral/evil)",
+    "madirus": "Мадирус (муж.)",
+    "omazh": "Омаж (жен.)",
+    "zahar": "Захар (муж.)",
+    "lera": "Лера (жен., укр.)",
 }
 
 
@@ -373,7 +388,55 @@ def split_text(text: str, max_len: int):
 
 
 def play_file(path: Path):
-    import pygame
+    """Проигрывает готовый аудиофайл.
+
+    Раньше для этого всегда требовался pygame — но на новых версиях
+    Python (например 3.14) у pygame ещё может не быть готового wheel под
+    Windows, и pip пытается собрать его из исходников, что почти всегда
+    падает без установленного компилятора Visual Studio. Поэтому сначала
+    используются средства, которые есть в системе без установки чего бы
+    то ни было: winsound для .wav на Windows (входит в стандартную
+    библиотеку Python), иначе — открытие файла проигрывателем по
+    умолчанию (os.startfile на Windows, afplay на macOS, xdg-open на
+    Linux). pygame используется только как запасной вариант, если он
+    всё-таки установлен, а системные способы не сработали.
+    """
+    if sys.platform == "win32":
+        if path.suffix.lower() == ".wav":
+            try:
+                import winsound
+                winsound.PlaySound(str(path), winsound.SND_FILENAME)
+                return
+            except Exception:
+                pass
+        try:
+            os.startfile(str(path))  # noqa: S606 — открывает системный проигрыватель по умолчанию
+            return
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            import subprocess
+            subprocess.run(["afplay", str(path)], check=True)
+            return
+        except Exception:
+            pass
+    else:
+        try:
+            import subprocess
+            subprocess.run(["xdg-open", str(path)], check=True)
+            return
+        except Exception:
+            pass
+
+    # запасной вариант, если ни один системный способ не сработал
+    try:
+        import pygame
+    except ImportError:
+        raise RuntimeError(
+            "Не удалось проиграть файл: не нашёл ни системного проигрывателя, "
+            f"ни pygame. Откройте файл вручную: {path}"
+        )
     pygame.mixer.init()
     pygame.mixer.music.load(str(path))
     pygame.mixer.music.play()
@@ -386,6 +449,141 @@ def _relevant_total(chapters, start: int) -> int:
     для прогресс-бара, чтобы он всегда доходил от 0 до 100%, а не
     останавливался на середине, если озвучка начинается не с первой главы."""
     return max(1, len(chapters) - max(0, start - 1))
+
+
+YANDEX_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
+YANDEX_MAX_CHARS = 4900  # лимит SpeechKit — 5000 символов на запрос, берём с запасом
+
+
+def synth_yandex_chunk(text: str, api_key: str, folder_id: str, voice: str, lang: str,
+                        speed: float, emotion: str, audio_format: str) -> bytes:
+    """Один запрос к Yandex SpeechKit (REST), возвращает содержимое аудио
+    (mp3 по умолчанию). Поднимает исключение с понятным текстом при ошибке
+    (неверный ключ, кончились деньги/лимит и т.п.).
+
+    Folder ID необязателен: если API-ключ выпущен для сервисного аккаунта
+    (обычный случай для этого скрипта — см. README), SpeechKit сам знает
+    каталог, в котором создан аккаунт, и folderId можно не передавать.
+    Указывать его нужно только для другого, более редкого способа
+    авторизации (IAM-токен пользовательского аккаунта), который этот
+    скрипт не использует."""
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    if not api_key:
+        raise ValueError(
+            "Не указан API-ключ Yandex SpeechKit. Получить его можно в консоли "
+            "Yandex Cloud (см. README, раздел про Yandex SpeechKit)."
+        )
+
+    params = {
+        "text": text,
+        "lang": lang,
+        "voice": voice,
+        "format": audio_format,
+        "speed": str(speed),
+    }
+    if folder_id:
+        params["folderId"] = folder_id
+    if emotion:
+        params["emotion"] = emotion
+
+    data = urllib.parse.urlencode(params).encode("utf-8")
+    req = urllib.request.Request(
+        YANDEX_TTS_URL,
+        data=data,
+        headers={
+            "Authorization": f"Api-Key {api_key}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"Yandex SpeechKit вернул ошибку HTTP {e.code}: {body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Не удалось связаться с Yandex SpeechKit: {e.reason}") from e
+
+
+def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, folder_id: str,
+               voice: str = "alena", lang: str = "ru-RU", speed: float = 1.0,
+               emotion: str = "", on_progress=None):
+    """Озвучка через облачный Yandex SpeechKit. Требует интернет, ключ и
+    Folder ID на каждый запуск, платный после пробного периода (см.
+    README). Текст режется на куски по YANDEX_MAX_CHARS (лимит SpeechKit —
+    5000 символов на запрос) и склеивается через pydub, если он
+    установлен, иначе сохраняется частями."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    total = _relevant_total(chapters, start)
+    audio_format = "mp3"
+
+    for idx, (title, text) in enumerate(chapters, 1):
+        if idx < start:
+            continue
+        pos = idx - start + 1
+        fname = f"{idx:03d}_{sanitize_filename(title)}.mp3"
+        out_path = outdir / fname
+
+        fingerprint = _params_fingerprint(
+            text, mode="yandex", voice=voice, lang=lang, speed=speed,
+            emotion=emotion, format=audio_format,
+        )
+        if _is_already_done(out_path, fingerprint):
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {fname}")
+            if play:
+                print("  Проигрывание...")
+                play_file(out_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
+            continue
+
+        print(f"[{idx}/{len(chapters)}] Озвучиваю (Yandex SpeechKit): {title} -> {fname}")
+
+        chunks = split_text(text, YANDEX_MAX_CHARS)
+        chunks_total = len(chunks) or 1
+        if on_progress:
+            on_progress(pos, total, 0, chunks_total)
+
+        chunk_bytes = []
+        for chunk_no, chunk in enumerate(tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."), 1):
+            if chunk.strip():
+                data = synth_yandex_chunk(
+                    chunk, api_key, folder_id, voice, lang, speed, emotion, audio_format
+                )
+                chunk_bytes.append(data)
+            if on_progress:
+                on_progress(pos, total, chunk_no, chunks_total)
+
+        if not chunk_bytes:
+            continue
+
+        if len(chunk_bytes) == 1:
+            out_path.write_bytes(chunk_bytes[0])
+        else:
+            try:
+                from pydub import AudioSegment
+                import io as _io
+                combined = AudioSegment.empty()
+                for data in chunk_bytes:
+                    combined += AudioSegment.from_file(_io.BytesIO(data), format="mp3")
+                combined.export(str(out_path), format="mp3")
+            except ImportError:
+                for i, data in enumerate(chunk_bytes):
+                    part_path = out_path.with_name(f"{out_path.stem}_part{i + 1}{out_path.suffix}")
+                    part_path.write_bytes(data)
+                print("  (pydub не установлен — глава сохранена частями *_partN.mp3)")
+
+        _save_fingerprint(out_path, fingerprint)
+
+        if play:
+            print("  Проигрывание...")
+            play_file(out_path)
+
+    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
 
 
 def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, on_progress=None):
@@ -977,11 +1175,13 @@ def main():
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
     ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
     ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
-    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest"], default="silero",
+    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "yandex"], default="silero",
                      help="silero = нейросетевой голос локально через torch.hub; "
                           "silero_rest = синтез через Silero-REST-Service с интонационными паузами "
                           "(SSML: паузы на запятых/тире, границах предложений и абзацев, интонация "
-                          "вопросов/восклицаний); online = gTTS (интернет); offline = pyttsx3 (без интернета)")
+                          "вопросов/восклицаний); yandex = облачный Yandex SpeechKit (платно, нужны "
+                          "--yandex-api-key и --yandex-folder-id); online = gTTS (интернет); "
+                          "offline = pyttsx3 (без интернета)")
     ap.add_argument("--outdir", type=Path, default=Path("audiobook_output"),
                      help="папка для сохранения аудио (online и silero режимы)")
     ap.add_argument("--play", action="store_true",
@@ -1017,6 +1217,20 @@ def main():
     ap.add_argument("--no-yo", action="store_true",
                      help="не заменять 'е' на 'ё' там, где нужно, в silero-режиме "
                           "(по умолчанию заменяется)")
+    ap.add_argument("--yandex-api-key", type=str, default="",
+                     help="API-ключ Yandex SpeechKit (режим yandex); можно также задать "
+                          "переменной окружения YANDEX_API_KEY")
+    ap.add_argument("--yandex-folder-id", type=str, default="",
+                     help="Folder ID каталога в Yandex Cloud (режим yandex); можно также задать "
+                          "переменной окружения YANDEX_FOLDER_ID")
+    ap.add_argument("--yandex-voice", type=str, default="alena",
+                     choices=list(YANDEX_VOICES.keys()),
+                     help="голос Yandex SpeechKit (режим yandex)")
+    ap.add_argument("--yandex-emotion", type=str, default="",
+                     help="эмоция для голосов, которые её поддерживают (ermil, jane): "
+                          "good, neutral, evil")
+    ap.add_argument("--yandex-speed", type=float, default=1.0,
+                     help="скорость речи Yandex SpeechKit, от 0.1 до 3.0 (по умолчанию 1.0)")
     ap.add_argument("--check-model-updates", action="store_true",
                      help="проверить на GitHub, не появилась ли более новая модель "
                           "Silero для русского языка, и выйти")
@@ -1078,6 +1292,11 @@ def main():
         run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                          args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,
                          args.comma_break_ms, emphasize=not args.no_emphasis, model_id=args.model)
+    elif args.mode == "yandex":
+        api_key = args.yandex_api_key or os.environ.get("YANDEX_API_KEY", "")
+        folder_id = args.yandex_folder_id or os.environ.get("YANDEX_FOLDER_ID", "")
+        run_yandex(chapters, args.outdir, args.start, args.play, api_key, folder_id,
+                   voice=args.yandex_voice, speed=args.yandex_speed, emotion=args.yandex_emotion)
     else:
         run_offline(chapters, args.start, args.rate, args.voice, voice_id=args.voice)
 
