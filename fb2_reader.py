@@ -403,11 +403,82 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str):
             play_file(out_path)
 
 
-def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: int, play: bool,
-               model_id: str = DEFAULT_SILERO_MODEL):
-    """Озвучка через Silero TTS — нейросетевой русский голос.
-    По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
+_LOCAL_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+_LOCAL_COMMA_SPLIT_RE = re.compile(r"(?<=[,;:—-])\s+")
+
+
+def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms: int,
+                           comma_break_ms: int, max_chars: int = 350):
+    """Делит текст главы на короткие озвучиваемые куски по знакам
+    препинания (абзац -> предложение -> часть предложения по запятым/тире),
+    и для каждого куска сразу вычисляет длину паузы (мс), которая должна
+    идти ПОСЛЕ него — короткая на запятой/тире/двоеточии, побольше на
+    границе предложений, самая длинная между абзацами. Так локальный режим
+    silero тоже получает интонационные паузы по пунктуации, а не только
+    silero_rest. Длинные куски дополнительно режутся по max_chars (это
+    ограничение самого Silero на длину текста за один вызов), с небольшой
+    паузой между такими техническими обрезками.
+
+    Возвращает список (текст_куска, пауза_после_мс).
     """
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()] or [text.strip()]
+    segments: list[tuple[str, int]] = []
+
+    for pi, para in enumerate(paragraphs):
+        is_last_para = pi == len(paragraphs) - 1
+        sentences = [s.strip() for s in _LOCAL_SENT_SPLIT_RE.split(para) if s.strip()] or [para]
+        for si, sent in enumerate(sentences):
+            is_last_sentence = si == len(sentences) - 1
+            comma_parts = [c.strip() for c in _LOCAL_COMMA_SPLIT_RE.split(sent) if c.strip()] or [sent]
+            for ci, part in enumerate(comma_parts):
+                is_last_comma = ci == len(comma_parts) - 1
+                if not is_last_comma:
+                    pause = comma_break_ms
+                elif not is_last_sentence:
+                    pause = sentence_break_ms
+                elif not is_last_para:
+                    pause = paragraph_break_ms
+                else:
+                    pause = 0
+
+                if len(part) <= max_chars:
+                    segments.append((part, pause))
+                else:
+                    # слишком длинный кусок для одного вызова Silero — режем
+                    # дальше по предложениям/словам, между техническими
+                    # обрезками ставим небольшую паузу (comma_break_ms)
+                    sub_chunks = split_text(part, max_chars)
+                    for j, sub in enumerate(sub_chunks):
+                        sub_pause = pause if j == len(sub_chunks) - 1 else min(comma_break_ms, 120)
+                        segments.append((sub, sub_pause))
+
+    return segments
+
+
+def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: int, play: bool,
+               model_id: str = DEFAULT_SILERO_MODEL, sentence_break_ms: int = 320,
+               paragraph_break_ms: int = 550, comma_break_ms: int = 180,
+               put_accent: bool = True, put_yo: bool = True):
+    """Озвучка через Silero TTS — нейросетевой русский голос, локально.
+    По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
+
+    Текст делится на короткие куски по знакам препинания (см.
+    _segments_with_pauses), между кусками вставляется пауза нужной длины —
+    короткая на запятых/тире, побольше между предложениями, самая длинная
+    между абзацами. Ударения (put_accent) и буква "ё" (put_yo) расставляются
+    моделью автоматически.
+
+    Если синтез фрагмента не удаётся — не пропускается молча: сначала
+    делается повторная попытка, затем (если фрагмент состоит из нескольких
+    слов) он делится пополам и пробуется по частям, и только если ничего не
+    помогло — на его место вставляется короткая тишина (чтобы не потерять
+    место в тексте и не сломать порядок остальных фрагментов), с явным
+    сообщением в лог. Раньше такие фрагменты просто выбрасывались, из-за
+    чего в готовой озвучке появлялись заметные пропуски.
+    """
+    import numpy as np
+    import wave
+
     allowed = speakers_for_model(model_id)
     if speaker not in allowed:
         print(f"Голос {speaker!r} недоступен для {model_id}, использую xenia")
@@ -418,8 +489,45 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Silero имеет ограничение на длину текста за один вызов — разбиваем по абзацам/предложениям
-    max_len = 900
+    max_chars = 350
+
+    def synth_one(part_text: str):
+        """Один вызов модели. Бросает исключение при неудаче."""
+        return model.apply_tts(
+            text=part_text,
+            speaker=speaker,
+            sample_rate=sample_rate,
+            put_accent=put_accent,
+            put_yo=put_yo,
+        ).numpy()
+
+    def synth_with_fallback(part_text: str, idx: int, title: str) -> "np.ndarray":
+        """Синтезирует один фрагмент с повтором и делением пополам при
+        ошибке; в самом крайнем случае возвращает тишину вместо исключения."""
+        try:
+            return synth_one(part_text)
+        except Exception as e1:
+            print(f"  [Гл.{idx} «{title}»] ошибка синтеза фрагмента ({e1}), повторяю…")
+            try:
+                return synth_one(part_text)
+            except Exception as e2:
+                words = part_text.split()
+                if len(words) > 3:
+                    mid = len(words) // 2
+                    left, right = " ".join(words[:mid]), " ".join(words[mid:])
+                    print(f"  [Гл.{idx} «{title}»] повтор не помог ({e2}), делю фрагмент пополам и пробую снова…")
+                    try:
+                        left_audio = synth_with_fallback(left, idx, title)
+                        right_audio = synth_with_fallback(right, idx, title)
+                        gap = np.zeros(int(sample_rate * 0.12), dtype=np.float32)
+                        return np.concatenate([left_audio, gap, right_audio])
+                    except Exception:
+                        pass
+                silence_seconds = max(0.4, min(6.0, len(part_text) / 15))
+                print(f"  [Гл.{idx} «{title}»] ОШИБКА: не удалось синтезировать фрагмент "
+                      f"({e2}). Вставляю тишину ({silence_seconds:.1f} с) вместо него: "
+                      f"{part_text[:80]!r}…")
+                return np.zeros(int(sample_rate * silence_seconds), dtype=np.float32)
 
     for idx, (title, text) in enumerate(chapters, 1):
         if idx < start:
@@ -429,7 +537,9 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
         fingerprint = _params_fingerprint(
             text, mode="silero", model=model_id, speaker=speaker,
-            sample_rate=sample_rate, max_len=max_len,
+            sample_rate=sample_rate, max_chars=max_chars,
+            sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
+            comma_break_ms=comma_break_ms, put_accent=put_accent, put_yo=put_yo,
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -440,32 +550,26 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
 
-        chunks = split_text(text, max_len)
-        import numpy as np
+        segments = _segments_with_pauses(
+            text, sentence_break_ms=sentence_break_ms,
+            paragraph_break_ms=paragraph_break_ms, comma_break_ms=comma_break_ms,
+            max_chars=max_chars,
+        )
         audio_parts = []
-        pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)  # пауза между кусками
+        skipped = 0
 
-        for chunk in tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."):
-            if not chunk.strip():
+        for part_text, pause_ms in tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."):
+            if not part_text.strip():
                 continue
-            try:
-                audio = model.apply_tts(
-                    text=chunk,
-                    speaker=speaker,
-                    sample_rate=sample_rate,
-                    put_accent=True,
-                    put_yo=True,
-                )
-                audio_parts.append(audio.numpy())
-                audio_parts.append(pause)
-            except Exception as e:
-                print(f"  Пропускаю фрагмент из-за ошибки синтеза: {e}")
+            audio = synth_with_fallback(part_text, idx, title)
+            audio_parts.append(audio)
+            if pause_ms > 0:
+                audio_parts.append(np.zeros(int(sample_rate * pause_ms / 1000), dtype=np.float32))
 
         if not audio_parts:
             continue
 
         full_audio = np.concatenate(audio_parts)
-        import wave
         with wave.open(str(out_path), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
@@ -849,16 +953,38 @@ def main():
     ap.add_argument("--rest-url", type=str, default="http://localhost:5010",
                      help="адрес Silero-REST-Service для режима silero_rest")
     ap.add_argument("--sentence-break-ms", type=int, default=320,
-                     help="пауза между предложениями в silero_rest-режиме (мс)")
+                     help="пауза между предложениями в silero/silero_rest-режимах (мс)")
     ap.add_argument("--paragraph-break-ms", type=int, default=550,
-                     help="пауза между абзацами в silero_rest-режиме (мс)")
+                     help="пауза между абзацами в silero/silero_rest-режимах (мс)")
     ap.add_argument("--comma-break-ms", type=int, default=180,
-                     help="пауза на запятых/тире/двоеточиях в silero_rest-режиме (мс)")
+                     help="пауза на запятых/тире/двоеточиях в silero/silero_rest-режимах (мс)")
     ap.add_argument("--no-emphasis", action="store_true",
                      help="не усиливать интонацию вопросительных/восклицательных "
                           "предложений через <prosody> в silero_rest-режиме "
                           "(по умолчанию усиление включено)")
+    ap.add_argument("--no-accent", action="store_true",
+                     help="не расставлять ударения автоматически в silero-режиме "
+                          "(по умолчанию расставляются)")
+    ap.add_argument("--no-yo", action="store_true",
+                     help="не заменять 'е' на 'ё' там, где нужно, в silero-режиме "
+                          "(по умолчанию заменяется)")
+    ap.add_argument("--check-model-updates", action="store_true",
+                     help="проверить на GitHub, не появилась ли более новая модель "
+                          "Silero для русского языка, и выйти")
     args = ap.parse_args()
+
+    if args.check_model_updates:
+        from silero_config import check_for_model_updates
+        print("Проверяю обновления моделей Silero...")
+        result = check_for_model_updates()
+        if not result["ok"]:
+            print(f"Не удалось проверить: {result['error']}")
+        elif result["new_models"]:
+            print("Найдены модели, которых ещё нет в этом скрипте: " + ", ".join(result["new_models"]))
+            print("Добавьте их в SILERO_MODELS в silero_config.py, чтобы использовать.")
+        else:
+            print(f"Новых моделей нет. Известные Silero-модели ru: {', '.join(result['checked'])}")
+        return
 
     # GUI: --gui, запуск без аргументов, или book.fb2 вместе с --gui
     if args.gui or (args.book is None and len(sys.argv) == 1):
@@ -896,7 +1022,9 @@ def main():
         print(f"\nГотово. Файлы сохранены в: {args.outdir.resolve()}")
     elif args.mode == "silero":
         run_silero(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
-                   model_id=args.model)
+                   model_id=args.model, sentence_break_ms=args.sentence_break_ms,
+                   paragraph_break_ms=args.paragraph_break_ms, comma_break_ms=args.comma_break_ms,
+                   put_accent=not args.no_accent, put_yo=not args.no_yo)
     elif args.mode == "silero_rest":
         run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                          args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,

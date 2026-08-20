@@ -21,7 +21,12 @@ from fb2_reader import (
     run_silero,
     run_silero_rest,
 )
-from silero_config import DEFAULT_SILERO_MODEL, SILERO_MODELS, speaker_choices
+from silero_config import (
+    DEFAULT_SILERO_MODEL,
+    SILERO_MODELS,
+    check_for_model_updates,
+    speaker_choices,
+)
 
 
 class TextRedirector(io.TextIOBase):
@@ -141,14 +146,20 @@ class AudiobookApp(tk.Tk):
         self._model_labels = [SILERO_MODELS[k]["title"] for k in self._model_keys]
         default_model_idx = self._model_keys.index(DEFAULT_SILERO_MODEL)
         self.model_var = tk.StringVar(value=self._model_labels[default_model_idx])
+        model_row = ttk.Frame(settings)
+        model_row.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
         self.model_combo = ttk.Combobox(
-            settings,
+            model_row,
             textvariable=self.model_var,
             values=self._model_labels,
             state="readonly",
-            width=28,
+            width=22,
         )
-        self.model_combo.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+        self.model_combo.pack(side="left", fill="x", expand=True)
+        self.check_updates_btn = ttk.Button(
+            model_row, text="Обновления…", command=self.check_model_updates
+        )
+        self.check_updates_btn.pack(side="left", padx=(6, 0))
 
         row += 1
         ttk.Label(settings, text="Голос:").grid(row=row, column=0, sticky="w", pady=4)
@@ -203,6 +214,54 @@ class AudiobookApp(tk.Tk):
         self.rate_spin.grid(row=row, column=1, sticky="w", pady=4)
 
         settings.columnconfigure(1, weight=1)
+
+        # --- интонация: паузы по знакам препинания, ударения, усиление ---
+        intonation = ttk.LabelFrame(right, text="Интонация и паузы (silero / silero_rest)", padding=10)
+        intonation.pack(fill="x", pady=(8, 0))
+
+        irow = 0
+        ttk.Label(intonation, text="Пауза на запятых/тире, мс:").grid(row=irow, column=0, sticky="w", pady=3)
+        self.comma_break_var = tk.IntVar(value=180)
+        ttk.Spinbox(intonation, from_=0, to=1000, increment=10, textvariable=self.comma_break_var, width=8).grid(
+            row=irow, column=1, sticky="w", pady=3
+        )
+
+        irow += 1
+        ttk.Label(intonation, text="Пауза между предложениями, мс:").grid(row=irow, column=0, sticky="w", pady=3)
+        self.sentence_break_var = tk.IntVar(value=320)
+        ttk.Spinbox(intonation, from_=0, to=2000, increment=10, textvariable=self.sentence_break_var, width=8).grid(
+            row=irow, column=1, sticky="w", pady=3
+        )
+
+        irow += 1
+        ttk.Label(intonation, text="Пауза между абзацами, мс:").grid(row=irow, column=0, sticky="w", pady=3)
+        self.paragraph_break_var = tk.IntVar(value=550)
+        ttk.Spinbox(intonation, from_=0, to=3000, increment=10, textvariable=self.paragraph_break_var, width=8).grid(
+            row=irow, column=1, sticky="w", pady=3
+        )
+
+        irow += 1
+        self.accent_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(intonation, text="Расставлять ударения автоматически", variable=self.accent_var).grid(
+            row=irow, column=0, columnspan=2, sticky="w", pady=3
+        )
+
+        irow += 1
+        self.yo_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(intonation, text='Заменять "е" на "ё" где нужно', variable=self.yo_var).grid(
+            row=irow, column=0, columnspan=2, sticky="w", pady=3
+        )
+
+        irow += 1
+        self.emphasis_var = tk.BooleanVar(value=True)
+        self.emphasis_check = ttk.Checkbutton(
+            intonation,
+            text="Усиливать интонацию «?!» (только silero_rest)",
+            variable=self.emphasis_var,
+        )
+        self.emphasis_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+
+        intonation.columnconfigure(1, weight=1)
 
         # --- кнопки ---
         btn_row = ttk.Frame(right)
@@ -333,6 +392,42 @@ class AudiobookApp(tk.Tk):
         default_idx = self._silero_voice_keys.index("xenia") if "xenia" in self._silero_voice_keys else 0
         self.voice_combo.current(default_idx)
 
+    def check_model_updates(self):
+        """Проверяет на GitHub, не появилась ли более новая модель Silero,
+        чем те, что уже есть в списке. Ничего не скачивает — только
+        сообщает в журнал; сама проверка идёт в фоновом потоке, чтобы не
+        подвешивать окно на время сетевого запроса."""
+        self.check_updates_btn.configure(state="disabled")
+        self.log("Проверяю обновления моделей Silero…")
+
+        def worker():
+            result = check_for_model_updates()
+            self.after(0, lambda: self._on_model_updates_checked(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_model_updates_checked(self, result: dict):
+        self.check_updates_btn.configure(state="normal")
+        if not result.get("ok"):
+            self.log(f"Не удалось проверить обновления: {result.get('error')}")
+            return
+        new_models = result.get("new_models") or []
+        if new_models:
+            self.log(
+                "Найдены новые модели Silero, которых ещё нет в этой программе: "
+                + ", ".join(new_models)
+                + ". Чтобы их использовать, добавьте их в SILERO_MODELS в silero_config.py."
+            )
+            messagebox.showinfo(
+                "Обновления моделей",
+                "Найдены новые версии модели: " + ", ".join(new_models) +
+                "\n\nЧтобы их использовать, нужно добавить их в silero_config.py "
+                "(id и ссылку на модель) — сама программа их пока не скачивает "
+                "автоматически.",
+            )
+        else:
+            self.log(f"Новых моделей нет — используется актуальная ({', '.join(result.get('checked', []))}).")
+
     def _set_offline_voices(self):
         if not self._offline_voices:
             self.refresh_offline_voices()
@@ -359,6 +454,7 @@ class AudiobookApp(tk.Tk):
         silero_like = mode in ("silero", "silero_rest")
         self.model_combo.configure(state="readonly" if silero_like else "disabled")
         self.rest_url_entry.configure(state="normal" if mode == "silero_rest" else "disabled")
+        self.emphasis_check.configure(state="normal" if mode == "silero_rest" else "disabled")
 
         if mode in ("silero", "silero_rest"):
             self._set_silero_voices()
@@ -424,6 +520,11 @@ class AudiobookApp(tk.Tk):
                         int(self.sample_rate_var.get()),
                         play,
                         model_id=self._selected_model_id(),
+                        sentence_break_ms=int(self.sentence_break_var.get()),
+                        paragraph_break_ms=int(self.paragraph_break_var.get()),
+                        comma_break_ms=int(self.comma_break_var.get()),
+                        put_accent=self.accent_var.get(),
+                        put_yo=self.yo_var.get(),
                     )
                 elif mode == "silero_rest":
                     run_silero_rest(
@@ -434,10 +535,10 @@ class AudiobookApp(tk.Tk):
                         int(self.sample_rate_var.get()),
                         play,
                         self.rest_url_var.get().strip(),
-                        320,
-                        550,
-                        180,
-                        True,
+                        int(self.sentence_break_var.get()),
+                        int(self.paragraph_break_var.get()),
+                        int(self.comma_break_var.get()),
+                        emphasize=self.emphasis_var.get(),
                         model_id=self._selected_model_id(),
                     )
                 else:
