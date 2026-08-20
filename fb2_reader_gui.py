@@ -24,7 +24,9 @@ from fb2_reader import (
 from silero_config import (
     DEFAULT_SILERO_MODEL,
     SILERO_MODELS,
+    add_model_to_config,
     check_for_model_updates,
+    fetch_package_url,
     speaker_choices,
 )
 
@@ -407,26 +409,71 @@ class AudiobookApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_model_updates_checked(self, result: dict):
-        self.check_updates_btn.configure(state="normal")
         if not result.get("ok"):
+            self.check_updates_btn.configure(state="normal")
             self.log(f"Не удалось проверить обновления: {result.get('error')}")
             return
         new_models = result.get("new_models") or []
-        if new_models:
+        if not new_models:
+            self.check_updates_btn.configure(state="normal")
+            self.log(f"Новых моделей нет — используется актуальная ({', '.join(result.get('checked', []))}).")
+            return
+
+        self.log("Найдены новые модели Silero, которых ещё нет в этой программе: " + ", ".join(new_models))
+        add_now = messagebox.askyesno(
+            "Обновления моделей",
+            "Найдены новые версии модели: " + ", ".join(new_models) +
+            "\n\nДобавить их автоматически в программу прямо сейчас?\n\n"
+            "Ссылка на файл модели будет взята из GitHub, а список голосов "
+            f"по умолчанию скопирован от «{DEFAULT_SILERO_MODEL}» — если у "
+            "новой модели голоса другие, это будет видно сразу при первой "
+            "попытке озвучить ими (лишний голос просто не сработает, "
+            "программа не сломается). Изменение сохранится в silero_config.py "
+            "и останется после перезапуска.",
+        )
+        if not add_now:
+            self.check_updates_btn.configure(state="normal")
+            return
+
+        self.log("Добавляю новые модели…")
+
+        def worker():
+            added, failed = [], []
+            for model_id in new_models:
+                url = fetch_package_url(model_id)
+                if not url:
+                    failed.append(model_id)
+                    continue
+                try:
+                    add_model_to_config(model_id, url)
+                    added.append(model_id)
+                except OSError as e:
+                    failed.append(f"{model_id} ({e})")
+            self.after(0, lambda: self._on_models_added(added, failed))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_models_added(self, added: list, failed: list):
+        self.check_updates_btn.configure(state="normal")
+        if added:
+            # SILERO_MODELS уже обновлён add_model_to_config — перечитываем
+            # списки моделей в интерфейсе, чтобы новые модели сразу
+            # появились в выпадающем списке без перезапуска программы
+            self._model_keys = list(SILERO_MODELS.keys())
+            self._model_labels = [SILERO_MODELS[k]["title"] for k in self._model_keys]
+            self.model_combo.configure(values=self._model_labels)
             self.log(
-                "Найдены новые модели Silero, которых ещё нет в этой программе: "
-                + ", ".join(new_models)
-                + ". Чтобы их использовать, добавьте их в SILERO_MODELS в silero_config.py."
+                f"Добавлены модели: {', '.join(added)}. Теперь доступны в списке «Модель» "
+                "(файл silero_config.py обновлён, менять руками не нужно). "
+                "Проверьте список голосов для новой модели при первой озвучке."
             )
             messagebox.showinfo(
-                "Обновления моделей",
-                "Найдены новые версии модели: " + ", ".join(new_models) +
-                "\n\nЧтобы их использовать, нужно добавить их в silero_config.py "
-                "(id и ссылку на модель) — сама программа их пока не скачивает "
-                "автоматически.",
+                "Модели добавлены", "Добавлены модели: " + ", ".join(added) +
+                "\n\nОни уже доступны в списке «Модель»."
             )
-        else:
-            self.log(f"Новых моделей нет — используется актуальная ({', '.join(result.get('checked', []))}).")
+        if failed:
+            self.log(f"Не удалось добавить: {', '.join(failed)}")
+            messagebox.showerror("Модели", "Не удалось добавить: " + ", ".join(failed))
 
     def _set_offline_voices(self):
         if not self._offline_voices:

@@ -5,11 +5,18 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # Последняя русская модель Silero (август 2026): v5_5_ru
 DEFAULT_SILERO_MODEL = "v5_5_ru"
 
 SILERO_MODELS: dict[str, dict] = {
+    "v3_1_ru": {
+        "title": 'Silero v3_1_ru (добавлено автоматически)',
+        "package_url": 'https://models.silero.ai/models/tts/ru/v3_1_ru.pt',
+        "local_file": 'silero_model_v3_1_ru.pt',
+        "speakers": ('aidar', 'baya', 'kseniya', 'xenia', 'eugene'),
+    },
     "v5_5_ru": {
         "title": "Silero v5.5 — последняя (ударения, омографы, вопросы)",
         "package_url": "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
@@ -160,6 +167,89 @@ def check_for_model_updates(timeout: float = 8.0) -> dict:
 
     new_models = sorted(set(main_ids) - set(SILERO_MODELS.keys()))
     return {"ok": True, "new_models": new_models, "checked": main_ids}
+
+
+def fetch_package_url(model_id: str, timeout: float = 8.0) -> str | None:
+    """Скачивает models.yml ещё раз и достаёт прямую ссылку на .pt-файл
+    (поле 'package:') для конкретной модели model_id из раздела ru:.
+    Возвращает None, если модель не найдена или сеть недоступна."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(MODELS_YML_URL, headers={"User-Agent": "fb2_reader"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            yml_text = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+
+    ru_block = _find_ru_tts_block(yml_text)
+    if not ru_block:
+        return None
+
+    # блок конкретной модели: от "    <id>:" до следующего ключа с тем же
+    # отступом (4 пробела) или до конца раздела
+    m = re.search(
+        rf"^    {re.escape(model_id)}:\s*\n(.*?)(?=^    \S|\Z)",
+        ru_block, re.S | re.M,
+    )
+    if not m:
+        return None
+    pm = re.search(r"package:\s*'([^']+)'", m.group(1))
+    return pm.group(1) if pm else None
+
+
+def add_model_to_config(model_id: str, package_url: str, speakers=None, title: str | None = None) -> None:
+    """Добавляет новую модель в SILERO_MODELS — сразу в памяти (программа
+    может использовать её без перезапуска) и дописывает такой же блок в
+    сам файл silero_config.py на диске, чтобы модель осталась насовсем.
+
+    speakers, если не заданы, берутся из DEFAULT_SILERO_MODEL — это
+    разумное предположение для соседних версий той же линейки (v5.x),
+    но при необходимости список голосов для новой модели можно поправить
+    вручную — она просто окажется отдельным блоком в SILERO_MODELS.
+    """
+    if model_id in SILERO_MODELS:
+        return  # уже есть — ничего не делаем
+
+    if speakers is None:
+        speakers = SILERO_MODELS[DEFAULT_SILERO_MODEL]["speakers"]
+    speakers = tuple(speakers)
+    if title is None:
+        title = f"Silero {model_id} (добавлено автоматически)"
+    local_file = f"silero_model_{model_id}.pt"
+
+    SILERO_MODELS[model_id] = {
+        "title": title,
+        "package_url": package_url,
+        "local_file": local_file,
+        "speakers": speakers,
+    }
+
+    this_file = Path(__file__)
+    try:
+        src = this_file.read_text(encoding="utf-8")
+    except OSError:
+        return  # в памяти модель всё равно уже добавлена, файл просто не тронем
+
+    if f'"{model_id}":' in src:
+        return  # уже была дописана раньше (например, в прошлый запуск)
+
+    block = (
+        f'    "{model_id}": {{\n'
+        f'        "title": {title!r},\n'
+        f'        "package_url": {package_url!r},\n'
+        f'        "local_file": {local_file!r},\n'
+        f'        "speakers": {speakers!r},\n'
+        f'    }},\n'
+    )
+    marker = "SILERO_MODELS: dict[str, dict] = {\n"
+    idx = src.find(marker)
+    if idx == -1:
+        return
+    insert_at = idx + len(marker)
+    new_src = src[:insert_at] + block + src[insert_at:]
+    this_file.write_text(new_src, encoding="utf-8")
 
 
 def load_silero_package(model_id: str = DEFAULT_SILERO_MODEL, device=None):
