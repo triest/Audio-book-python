@@ -5,8 +5,12 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -67,6 +71,7 @@ class AudiobookApp(tk.Tk):
         self._worker: threading.Thread | None = None
         self._stop_requested = False
         self._offline_voices: list[dict] = []
+        self._rest_proc: subprocess.Popen | None = None
 
         self._build_ui()
         self._bind_events()
@@ -210,6 +215,15 @@ class AudiobookApp(tk.Tk):
         self.rest_url_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
 
         row += 1
+        self.auto_start_rest_var = tk.BooleanVar(value=True)
+        self.auto_start_rest_check = ttk.Checkbutton(
+            settings,
+            text="Запускать сервис Silero REST автоматически (без консоли)",
+            variable=self.auto_start_rest_var,
+        )
+        self.auto_start_rest_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+
+        row += 1
         ttk.Label(settings, text="Скорость (offline):").grid(row=row, column=0, sticky="w", pady=4)
         self.rate_var = tk.IntVar(value=170)
         self.rate_spin = ttk.Spinbox(settings, from_=80, to=300, textvariable=self.rate_var, width=8)
@@ -277,8 +291,10 @@ class AudiobookApp(tk.Tk):
             side="right"
         )
 
-        self.progress = ttk.Progressbar(right, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(0, 6))
+        self.progress = ttk.Progressbar(right, mode="determinate", maximum=1000, value=0)
+        self.progress.pack(fill="x", pady=(2, 2))
+        self.progress_label = ttk.Label(right, text="", foreground="#555")
+        self.progress_label.pack(fill="x", pady=(0, 6))
 
         log_frame = ttk.LabelFrame(right, text="Журнал", padding=6)
         log_frame.pack(fill="both", expand=True)
@@ -501,6 +517,7 @@ class AudiobookApp(tk.Tk):
         silero_like = mode in ("silero", "silero_rest")
         self.model_combo.configure(state="readonly" if silero_like else "disabled")
         self.rest_url_entry.configure(state="normal" if mode == "silero_rest" else "disabled")
+        self.auto_start_rest_check.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.emphasis_check.configure(state="normal" if mode == "silero_rest" else "disabled")
 
         if mode in ("silero", "silero_rest"):
@@ -527,9 +544,114 @@ class AudiobookApp(tk.Tk):
         self.start_btn.configure(state=state)
         self.stop_btn.configure(state="normal" if busy else "disabled")
         if busy:
-            self.progress.start(12)
+            self.progress.configure(value=0)
+            self.progress_label.configure(text="Подготовка…")
         else:
-            self.progress.stop()
+            self.progress.configure(value=0)
+            self.progress_label.configure(text="")
+
+    def _on_synthesis_progress(self, chapter_pos: int, chapters_total: int,
+                                fragment_done: int, fragments_total: int):
+        """Колбэк из run_silero/run_silero_rest/run_online/run_offline —
+        считает реальный процент выполнения (не "бегающую" полоску) и
+        обновляет прогресс-бар и подпись под ним. Вызывается из рабочего
+        потока, поэтому обновление виджетов идёт через self.after."""
+        chapters_total = max(1, chapters_total)
+        fragments_total = max(1, fragments_total)
+        fraction = ((chapter_pos - 1) + (fragment_done / fragments_total)) / chapters_total
+        fraction = min(1.0, max(0.0, fraction))
+        percent = fraction * 100
+
+        def update():
+            self.progress.configure(value=fraction * 1000)
+            self.progress_label.configure(
+                text=f"Глава {chapter_pos}/{chapters_total} · фрагмент {fragment_done}/{fragments_total} "
+                     f"· {percent:.0f}%"
+            )
+
+        self.after(0, update)
+
+    @staticmethod
+    def _rest_url_is_local(url: str) -> bool:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+        return host in ("localhost", "127.0.0.1", "::1", "")
+
+    @staticmethod
+    def _ping_rest_service(url: str, timeout: float = 1.5) -> bool:
+        """Проверяет, отвечает ли уже сервис Silero REST по этому адресу.
+        Любой ответ сервера (даже 404 на несуществующий путь) значит, что
+        сервис поднят — ошибка нас интересует только на уровне соединения
+        (сервис не запущен / порт никто не слушает)."""
+        try:
+            urllib.request.urlopen(url.rstrip("/") + "/docs", timeout=timeout)
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def _ensure_rest_service_running(self, rest_url: str, ready_timeout: float = 600.0) -> bool:
+        """Запускает silero_rest_service.py в фоне (без консоли пользователя)
+        и ждёт, пока он не начнёт отвечать на rest_url. При первом запуске
+        сервис может несколько минут скачивать модель — поэтому таймаут
+        большой, а в журнал периодически пишется, что процесс ещё идёт."""
+        if self._rest_proc is None or self._rest_proc.poll() is not None:
+            service_path = Path(__file__).resolve().parent / "silero_rest_service.py"
+            if not service_path.exists():
+                self.after(0, lambda: self.log(f"Не найден файл сервиса: {service_path}"))
+                return False
+            try:
+                popen_kwargs = dict(
+                    cwd=str(service_path.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                if sys.platform == "win32":
+                    # без отдельного окна консоли для сервиса
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                self._rest_proc = subprocess.Popen(
+                    [sys.executable, str(service_path)], **popen_kwargs
+                )
+            except Exception as e:
+                self.after(0, lambda: self.log(f"Не удалось запустить сервис Silero REST: {e}"))
+                return False
+
+            def pump_output():
+                proc = self._rest_proc
+                if proc is None or proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.after(0, lambda l=line: self.log("  [сервис Silero REST] " + l))
+
+            threading.Thread(target=pump_output, daemon=True).start()
+
+        deadline = time.time() + ready_timeout
+        last_notice = 0.0
+        while time.time() < deadline:
+            if self._ping_rest_service(rest_url):
+                self.after(0, lambda: self.log("Сервис Silero REST запущен и готов принимать запросы."))
+                return True
+            if self._rest_proc is not None and self._rest_proc.poll() is not None:
+                self.after(0, lambda: self.log(
+                    f"Сервис Silero REST завершился сам собой (код {self._rest_proc.returncode}) "
+                    "во время запуска — см. сообщения [сервис Silero REST] выше."
+                ))
+                return False
+            if time.time() - last_notice > 15:
+                last_notice = time.time()
+                self.after(0, lambda: self.log(
+                    "…сервис Silero REST ещё запускается (при первом запуске может скачивать "
+                    "модель, это может занять несколько минут)…"
+                ))
+            time.sleep(1.0)
+
+        self.after(0, lambda: self.log("Сервис Silero REST не успел запуститься за отведённое время."))
+        return False
 
     def request_stop(self):
         self._stop_requested = True
@@ -557,7 +679,8 @@ class AudiobookApp(tk.Tk):
             sys.stdout = TextRedirector(self.log_text)
             try:
                 if mode == "online":
-                    run_online(self.chapters, outdir, play, start, voice_lang="ru")
+                    run_online(self.chapters, outdir, play, start, voice_lang="ru",
+                               on_progress=self._on_synthesis_progress)
                 elif mode == "silero":
                     run_silero(
                         self.chapters,
@@ -572,8 +695,22 @@ class AudiobookApp(tk.Tk):
                         comma_break_ms=int(self.comma_break_var.get()),
                         put_accent=self.accent_var.get(),
                         put_yo=self.yo_var.get(),
+                        on_progress=self._on_synthesis_progress,
                     )
                 elif mode == "silero_rest":
+                    rest_url = self.rest_url_var.get().strip()
+                    if self.auto_start_rest_var.get() and self._rest_url_is_local(rest_url):
+                        if not self._ping_rest_service(rest_url):
+                            self.after(0, lambda: self.log(
+                                "Сервис Silero REST не отвечает — запускаю его автоматически "
+                                "(без отдельной консоли)…"
+                            ))
+                            if not self._ensure_rest_service_running(rest_url):
+                                raise RuntimeError(
+                                    "Не удалось автоматически запустить сервис Silero REST. "
+                                    "Подробности — в журнале выше. Можно также запустить его "
+                                    "вручную (см. README) или выбрать режим «Silero (локально)»."
+                                )
                     run_silero_rest(
                         self.chapters,
                         outdir,
@@ -581,12 +718,13 @@ class AudiobookApp(tk.Tk):
                         self._selected_silero_speaker(),
                         int(self.sample_rate_var.get()),
                         play,
-                        self.rest_url_var.get().strip(),
+                        rest_url,
                         int(self.sentence_break_var.get()),
                         int(self.paragraph_break_var.get()),
                         int(self.comma_break_var.get()),
                         emphasize=self.emphasis_var.get(),
                         model_id=self._selected_model_id(),
+                        on_progress=self._on_synthesis_progress,
                     )
                 else:
                     run_offline(
@@ -595,6 +733,7 @@ class AudiobookApp(tk.Tk):
                         int(self.rate_var.get()),
                         "",
                         voice_id=self._selected_offline_voice_id(),
+                        on_progress=self._on_synthesis_progress,
                     )
                 if not self._stop_requested:
                     self.after(0, lambda: self.log("--- Озвучка завершена ---"))
@@ -639,6 +778,16 @@ class AudiobookApp(tk.Tk):
         if self._worker and self._worker.is_alive():
             if not messagebox.askyesno("Выход", "Озвучка ещё идёт. Закрыть приложение?"):
                 return
+        if self._rest_proc is not None and self._rest_proc.poll() is None:
+            if messagebox.askyesno(
+                "Сервис Silero REST",
+                "Сервис Silero REST был запущен этой программой и всё ещё работает "
+                "в фоне. Остановить его тоже?",
+            ):
+                try:
+                    self._rest_proc.terminate()
+                except Exception:
+                    pass
         self.destroy()
 
 

@@ -381,11 +381,20 @@ def play_file(path: Path):
         pygame.time.Clock().tick(10)
 
 
-def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str):
+def _relevant_total(chapters, start: int) -> int:
+    """Сколько глав реально будет обработано, начиная с --start — нужно
+    для прогресс-бара, чтобы он всегда доходил от 0 до 100%, а не
+    останавливался на середине, если озвучка начинается не с первой главы."""
+    return max(1, len(chapters) - max(0, start - 1))
+
+
+def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, on_progress=None):
     outdir.mkdir(parents=True, exist_ok=True)
+    total = _relevant_total(chapters, start)
     for idx, (title, text) in enumerate(chapters, 1):
         if idx < start:
             continue
+        pos = idx - start + 1
         fname = f"{idx:03d}_{sanitize_filename(title)}.mp3"
         out_path = outdir / fname
         fingerprint = _params_fingerprint(text, mode="online", lang=voice_lang)
@@ -394,10 +403,16 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str):
             if play:
                 print("  Проигрывание...")
                 play_file(out_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
             continue
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
+        if on_progress:
+            on_progress(pos, total, 0, 1)
         synth_online(text, out_path, lang=voice_lang, desc=f"Гл.{idx}")
         _save_fingerprint(out_path, fingerprint)
+        if on_progress:
+            on_progress(pos, total, 1, 1)
         if play:
             print("  Проигрывание...")
             play_file(out_path)
@@ -458,7 +473,7 @@ def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms:
 def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: int, play: bool,
                model_id: str = DEFAULT_SILERO_MODEL, sentence_break_ms: int = 320,
                paragraph_break_ms: int = 550, comma_break_ms: int = 180,
-               put_accent: bool = True, put_yo: bool = True):
+               put_accent: bool = True, put_yo: bool = True, on_progress=None):
     """Озвучка через Silero TTS — нейросетевой русский голос, локально.
     По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
 
@@ -475,6 +490,11 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     место в тексте и не сломать порядок остальных фрагментов), с явным
     сообщением в лог. Раньше такие фрагменты просто выбрасывались, из-за
     чего в готовой озвучке появлялись заметные пропуски.
+
+    on_progress(chapter_pos, chapters_total, fragment_done, fragments_total),
+    если передан, вызывается после каждого фрагмента (и один раз в начале
+    главы) — используется GUI для настоящего прогресс-бара вместо
+    "бегающей" неопределённой полоски.
     """
     import numpy as np
     import wave
@@ -529,9 +549,12 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                       f"{part_text[:80]!r}…")
                 return np.zeros(int(sample_rate * silence_seconds), dtype=np.float32)
 
+    total = _relevant_total(chapters, start)
+
     for idx, (title, text) in enumerate(chapters, 1):
         if idx < start:
             continue
+        pos = idx - start + 1
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
 
@@ -546,6 +569,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             if play:
                 print("  Проигрывание...")
                 play_file(out_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
             continue
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
@@ -556,15 +581,21 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             max_chars=max_chars,
         )
         audio_parts = []
-        skipped = 0
+        segs_total = len(segments) or 1
+        if on_progress:
+            on_progress(pos, total, 0, segs_total)
 
-        for part_text, pause_ms in tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."):
+        for seg_i, (part_text, pause_ms) in enumerate(tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1):
             if not part_text.strip():
+                if on_progress:
+                    on_progress(pos, total, seg_i, segs_total)
                 continue
             audio = synth_with_fallback(part_text, idx, title)
             audio_parts.append(audio)
             if pause_ms > 0:
                 audio_parts.append(np.zeros(int(sample_rate * pause_ms / 1000), dtype=np.float32))
+            if on_progress:
+                on_progress(pos, total, seg_i, segs_total)
 
         if not audio_parts:
             continue
@@ -684,7 +715,7 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
 def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rate: int,
                      play: bool, rest_url: str, sentence_break_ms: int, paragraph_break_ms: int,
                      comma_break_ms: int, emphasize: bool = True, max_len: int = 700,
-                     model_id: str = DEFAULT_SILERO_MODEL):
+                     model_id: str = DEFAULT_SILERO_MODEL, on_progress=None):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -813,9 +844,12 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             pcm = wf.readframes(n)
             return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
 
+    total = _relevant_total(chapters, start)
+
     for idx, (title, text) in enumerate(chapters, 1):
         if idx < start:
             continue
+        pos = idx - start + 1
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
 
@@ -829,6 +863,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             if play:
                 print("  Проигрывание...")
                 play_file(out_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
             continue
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю (silero_rest): {title} -> {fname}")
@@ -836,13 +872,20 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         chunks = _split_paragraphs_for_ssml(text, max_len)
         pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
         audio_parts = []
+        chunks_total = len(chunks) or 1
+        if on_progress:
+            on_progress(pos, total, 0, chunks_total)
 
         for chunk_no, chunk in enumerate(tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."), 1):
             if not chunk.strip():
+                if on_progress:
+                    on_progress(pos, total, chunk_no, chunks_total)
                 continue
             audio = synth_chunk(chunk, chunk_no, idx, title)
             audio_parts.append(audio)
             audio_parts.append(pause)
+            if on_progress:
+                on_progress(pos, total, chunk_no, chunks_total)
 
         if not audio_parts:
             continue
@@ -889,7 +932,7 @@ def list_offline_voices():
     return result
 
 
-def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str = ""):
+def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str = "", on_progress=None):
     import pyttsx3
     engine = pyttsx3.init()
     engine.setProperty("rate", rate)
@@ -912,12 +955,18 @@ def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str 
               "звучать будет на голосе по умолчанию (может звучать неразборчиво).\n"
               "На Linux установите: sudo apt install espeak-ng espeak-ng-data")
 
+    total = _relevant_total(chapters, start)
     for idx, (title, text) in enumerate(chapters, 1):
         if idx < start:
             continue
+        pos = idx - start + 1
         print(f"\n[{idx}/{len(chapters)}] {title}")
+        if on_progress:
+            on_progress(pos, total, 0, 1)
         engine.say(text)
         engine.runAndWait()
+        if on_progress:
+            on_progress(pos, total, 1, 1)
 
 
 # --------------------------------------------------------------------------
