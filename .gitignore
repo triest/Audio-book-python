@@ -12,12 +12,25 @@
 /audiobook_output
 /pepel-pobedy
 
-# Локальные настройки GUI — может содержать API-ключ Yandex SpeechKit,
-# НЕ должен попадать в git.
+# Локальные настройки GUI — может содержать API-ключ Yandex SpeechKit и
+# Anthropic (для определения говорящих в диалогах), НЕ должен попадать в git.
 fb2_reader_settings.json
+
+# Словарь "персонаж -> голос" для конкретной книги (см. атрибуцию
+# говорящих через Claude API) — данные конкретного прогона, не для git.
+dialogue_characters.json
 
 # Логи, кэш Python, файлы IDE
 *.log
 __pycache__/
 *.pyc
 .idea/
+
+# Локальное виртуальное окружение, которое ставит install.bat / run_gui.bat
+# — у каждого своё, в репозитории не нужно.
+.venv/
+
+# Результаты сборки build_exe.bat (PyInstaller) — тоже большие, не для git.
+build/
+dist/
+*.spec

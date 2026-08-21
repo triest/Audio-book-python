@@ -162,9 +162,14 @@ TTS_MODES = {
     "offline": "Системный TTS (pyttsx3, без интернета)",
 }
 
-# Голоса Yandex SpeechKit (v1, ru-RU) на момент добавления — актуальный
-# список стоит сверять в консоли Yandex Cloud, он время от времени
-# пополняется новыми дикторами.
+# Голоса Yandex SpeechKit (v1) на момент добавления — актуальный список
+# стоит сверять в консоли Yandex Cloud, он время от времени пополняется
+# новыми дикторами. Почти все голоса — ru-RU, но "lera" — украинский
+# диктор и требует lang=uk-UK; если отправить его с lang=ru-RU, Yandex
+# отвечает HTTP 400 (несовпадение voice/lang — самая частая причина этой
+# ошибки, когда с ключом и балансом всё в порядке). Поэтому lang для
+# запроса выбирается автоматически по голосу (см. YANDEX_VOICE_LANGS),
+# а не задаётся вручную.
 YANDEX_VOICES = {
     "alena": "Алёна (жен., нейтральный)",
     "filipp": "Филипп (муж., нейтральный)",
@@ -175,6 +180,18 @@ YANDEX_VOICES = {
     "zahar": "Захар (муж.)",
     "lera": "Лера (жен., укр.)",
 }
+
+# lang, обязательный для каждого голоса (Yandex требует точное совпадение
+# voice/lang — иначе 400 Bad Request). У всех голосов, кроме lera, это
+# ru-RU; для lera — uk-UK (украинский).
+YANDEX_VOICE_LANGS = {
+    "lera": "uk-UK",
+}
+YANDEX_DEFAULT_LANG = "ru-RU"
+
+
+def yandex_lang_for_voice(voice: str) -> str:
+    return YANDEX_VOICE_LANGS.get(voice, YANDEX_DEFAULT_LANG)
 
 
 # --------------------------------------------------------------------------
@@ -387,6 +404,561 @@ def split_text(text: str, max_len: int):
     return chunks
 
 
+_DIALOGUE_LINE_RE = re.compile(r"^[\-–—]\s")  # -, – или — в начале абзаца
+
+
+def _split_dialogue_paragraphs(text: str):
+    """Делит текст главы на абзацы (по \\n — так парсер fb2 разделяет
+    <p>/<v>/... — см. iter_text) и помечает, какие из них похожи на
+    реплику прямой речи: в русской прозе реплика почти всегда начинается
+    с тире ("— Пойдём, — сказал он."). Это не точное определение "кто
+    говорит" (для этого нужен полноценный NLP-анализ), а простая эвристика
+    для разбивки: пусть хотя бы соседние реплики звучат разными голосами,
+    а не одним и тем же монотонным диктором все 20+ часов книги."""
+    paras = [p for p in text.split("\n") if p.strip()]
+    return [(p, bool(_DIALOGUE_LINE_RE.match(p))) for p in paras]
+
+
+def _group_paragraphs_by_voice(text: str, main_voice, dialogue_voices):
+    """Делит текст главы на блоки (голос, текст_блока).
+
+    Если dialogue_voices пуст/не задан — весь текст один блок с main_voice
+    (без изменений).
+
+    Если задан — реплики (абзацы, начинающиеся с тире) по очереди
+    озвучиваются голосами из dialogue_voices (первая реплика — первым
+    голосом из списка, вторая — вторым, и так по кругу), а весь остальной
+    текст (авторская речь) — main_voice. Соседние абзацы одного и того же
+    голоса (повествование) склеиваются в один блок, чтобы не плодить
+    лишние обращения к TTS; каждая реплика — отдельный блок (даже если
+    голос совпал бы со следующей), чтобы между репликами оставался
+    естественный разрыв.
+
+    Используется и для Yandex (там же режется на max_chars), и для Silero
+    (там же режется на предложения/паузы через _segments_with_pauses) —
+    сама логика разбивки на "чья это реплика" не зависит от режима TTS."""
+    if not dialogue_voices:
+        return [(main_voice, text)]
+
+    paras = _split_dialogue_paragraphs(text)
+    grouped = []  # [[voice, [paragraphs], is_dialogue], ...]
+    di = 0
+    for para, is_dialogue in paras:
+        if is_dialogue:
+            voice = dialogue_voices[di % len(dialogue_voices)]
+            di += 1
+            grouped.append([voice, [para], True])
+        else:
+            if grouped and grouped[-1][0] == main_voice and not grouped[-1][2]:
+                grouped[-1][1].append(para)
+            else:
+                grouped.append([main_voice, [para], False])
+
+    return [(voice, "\n".join(para_list)) for voice, para_list, _is_dialogue in grouped]
+
+
+def _chunk_voice_groups(groups, max_chars: int):
+    """Режет уже построенные группы (голос, текст_группы) на куски по
+    max_chars — используется для Yandex/gTTS, где ограничение просто на
+    длину запроса, в отличие от Silero, где куски ещё и по паузам на
+    знаках препинания (см. run_silero)."""
+    result = []
+    for voice, group_text in groups:
+        for chunk in split_text(group_text, max_chars):
+            if chunk.strip():
+                result.append((chunk, voice))
+    return result
+
+
+# --------------------------------------------------------------------------
+# Атрибуция реплик по говорящему через LLM (Claude API) — необязательная,
+# платная надстройка над простым чередованием голосов из
+# _group_paragraphs_by_voice: вместо "первая реплика первым голосом, вторая
+# вторым и по кругу" здесь модель читает главу и определяет, ПЕРСОНАЖ
+# говорит каждую реплику, а голос закрепляется за именем персонажа на всю
+# книгу (через сохраняемый на диске словарь), а не только на одну главу.
+# --------------------------------------------------------------------------
+
+# Два варианта поставщика атрибуции — платный (Anthropic Claude) и
+# бесплатный (Google Gemini, есть щедрый бесплатный уровень без привязки
+# карты — см. ATTRIBUTION_PROVIDERS ниже и подсказку в GUI). По умолчанию
+# используется бесплатный Gemini.
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
+GEMINI_GENERATE_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+YANDEXGPT_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+ATTRIBUTION_PROVIDERS = {
+    "yandexgpt": {
+        "title": "YandexGPT (бесплатный лимит, тот же ключ/каталог, что и SpeechKit)",
+        "default_model": "yandexgpt-lite",
+        "key_hint": "Работает из России без VPN, доступен грант на бесплатные запросы в "
+                     "Yandex Cloud. Можно использовать тот же API-ключ и Folder ID, что и "
+                     "для Yandex SpeechKit выше (скопируйте их сюда, если ещё не заполнено) "
+                     "— консоль: yandex.cloud/ru/docs/ai-studio/quickstart.",
+    },
+    "gemini": {
+        "title": "Google Gemini (бесплатно, ключ на aistudio.google.com)",
+        "default_model": "gemini-2.5-flash-lite",
+        "key_hint": "Бесплатный ключ: aistudio.google.com/apikey (карта не нужна). Из России "
+                     "доступ у Google часто нестабилен/заблокирован из-за санкций — если не "
+                     "работает, попробуйте YandexGPT. На бесплатном уровне Google может "
+                     "использовать запросы для улучшения своих продуктов.",
+    },
+    "anthropic": {
+        "title": "Anthropic Claude (платно, ключ на console.anthropic.com)",
+        "default_model": "claude-haiku-4-5",
+        "key_hint": "Платный ключ: console.anthropic.com/settings/keys (нужна привязанная "
+                     "иностранная карта — из России оплатить напрямую обычно нельзя).",
+    },
+}
+DEFAULT_ATTRIBUTION_PROVIDER = "yandexgpt"
+DEFAULT_ATTRIBUTION_MODEL = ATTRIBUTION_PROVIDERS[DEFAULT_ATTRIBUTION_PROVIDER]["default_model"]
+
+_ATTRIBUTION_TOOL_SCHEMA = {
+    "name": "report_speakers",
+    "description": "Сообщает, кто произносит каждую реплику прямой речи главы, по порядку.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Имя говорящего для каждой реплики прямой речи, в порядке "
+                                "появления в тексте. Одно каноничное имя на персонажа "
+                                "(например, всегда 'Иван Петров', не то 'Иван', то 'он'). "
+                                "'unknown', если по контексту не понятно, кто говорит.",
+            },
+        },
+        "required": ["results"],
+    },
+}
+
+
+def _attribution_dialogue_count(text: str) -> int:
+    paras = _split_dialogue_paragraphs(text)
+    return sum(1 for _p, is_d in paras if is_d)
+
+
+def _attribution_prompt(text: str, dialogue_count: int) -> str:
+    return (
+        "Ниже — глава книги на русском языке. Определи, кто произносит каждую реплику "
+        "прямой речи (абзацы, начинающиеся с тире «—», «-» или «–»).\n\n"
+        "Верни ответ вызовом инструмента report_speakers с полем results — списком имён "
+        "говорящих строго в том порядке, в котором реплики встречаются в тексте (первая "
+        "реплика — первый элемент списка). Количество элементов должно ТОЧНО совпадать с "
+        f"количеством реплик в тексте ({dialogue_count} шт.) — не пропускай и не добавляй лишних.\n\n"
+        "Для одного и того же персонажа всегда используй одно и то же каноничное имя "
+        "(например, всегда 'Иван Петров', а не то 'Иван', то 'он', то 'Петров') — это "
+        "нужно, чтобы закрепить за персонажем один голос на всю книгу. Если по контексту "
+        "невозможно понять, кто говорит — используй значение 'unknown'.\n\n"
+        "--- ТЕКСТ ГЛАВЫ ---\n" + text
+    )
+
+
+def _normalize_attribution_results(results, dialogue_count: int, log_fn=None) -> list:
+    results = [str(r).strip() or "unknown" for r in (results or [])]
+    if len(results) != dialogue_count:
+        if log_fn:
+            log_fn(f"Внимание: модель вернула {len(results)} имён вместо {dialogue_count} "
+                   "реплик — выравниваю список (лишнее обрезаю/недостающее заполняю 'unknown').")
+        if len(results) < dialogue_count:
+            results = results + ["unknown"] * (dialogue_count - len(results))
+        else:
+            results = results[:dialogue_count]
+    return results
+
+
+def attribute_speakers_anthropic(text: str, api_key: str, model: str, log_fn=None) -> list:
+    """Спрашивает у Anthropic Claude API, кто произносит каждую реплику
+    прямой речи в тексте главы. Возвращает список имён — по одному на
+    каждую реплику, в порядке их появления в тексте.
+
+    Требует отдельный платный API-ключ Anthropic (console.anthropic.com) —
+    это не тот же ключ, что использует сама программа Claude/Cowork, и не
+    связан с Yandex SpeechKit."""
+    import requests
+    import json as _json
+
+    dialogue_count = _attribution_dialogue_count(text)
+    if dialogue_count == 0:
+        return []
+
+    if not api_key:
+        raise ValueError(
+            "Не указан API-ключ Anthropic для атрибуции говорящих. Получить его можно на "
+            "https://console.anthropic.com/settings/keys — это отдельный (платный) ключ, не "
+            "связанный с самой программой Claude."
+        )
+
+    prompt = _attribution_prompt(text, dialogue_count)
+    if log_fn:
+        log_fn(f"Атрибуция говорящих через Anthropic {model}: {dialogue_count} реплик, "
+               f"{len(text)} симв. текста главы...")
+
+    resp = requests.post(
+        ANTHROPIC_MESSAGES_URL,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": 4096,
+            "tools": [_ATTRIBUTION_TOOL_SCHEMA],
+            "tool_choice": {"type": "tool", "name": "report_speakers"},
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        body = resp.text[:1000]
+        if log_fn:
+            log_fn(f"Anthropic API ответил HTTP {resp.status_code}: {body}")
+        raise RuntimeError(
+            f"Anthropic API вернул ошибку HTTP {resp.status_code}: {body[:500]}\n"
+            "  Проверьте API-ключ и баланс на https://console.anthropic.com/ . "
+            f"Если ошибка про модель {model!r} — актуальные названия моделей "
+            "смотрите на https://docs.claude.com/en/docs/about-claude/models и "
+            "укажите вручную в настройках атрибуции."
+        )
+
+    data = resp.json()
+    results = None
+    for block in data.get("content", []):
+        if block.get("type") == "tool_use" and block.get("name") == "report_speakers":
+            results = (block.get("input") or {}).get("results")
+            break
+
+    if not isinstance(results, list):
+        raise RuntimeError(
+            f"Anthropic API не вернул ожидаемый список говорящих (ответ: {_json.dumps(data)[:500]})"
+        )
+
+    return _normalize_attribution_results(results, dialogue_count, log_fn)
+
+
+def attribute_speakers_gemini(text: str, api_key: str, model: str, log_fn=None) -> list:
+    """То же самое, но через бесплатный уровень Google Gemini API
+    (aistudio.google.com/apikey — ключ бесплатный, карта не нужна).
+    Использует function calling (аналог tool_use у Anthropic) с той же
+    схемой report_speakers, чтобы результат был структурированным JSON, а
+    не текстом, который надо парсить руками."""
+    import requests
+    import json as _json
+
+    dialogue_count = _attribution_dialogue_count(text)
+    if dialogue_count == 0:
+        return []
+
+    if not api_key:
+        raise ValueError(
+            "Не указан API-ключ Google Gemini для атрибуции говорящих. Получить бесплатный "
+            "ключ можно на https://aistudio.google.com/apikey — карта не требуется."
+        )
+
+    prompt = _attribution_prompt(text, dialogue_count)
+    if log_fn:
+        log_fn(f"Атрибуция говорящих через Gemini {model}: {dialogue_count} реплик, "
+               f"{len(text)} симв. текста главы...")
+
+    gemini_schema = {
+        "name": "report_speakers",
+        "description": _ATTRIBUTION_TOOL_SCHEMA["description"],
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "results": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": _ATTRIBUTION_TOOL_SCHEMA["input_schema"]["properties"]["results"]["description"],
+                },
+            },
+            "required": ["results"],
+        },
+    }
+
+    resp = requests.post(
+        GEMINI_GENERATE_URL_TMPL.format(model=model),
+        params={"key": api_key},
+        headers={"content-type": "application/json"},
+        json={
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "tools": [{"function_declarations": [gemini_schema]}],
+            "tool_config": {"function_calling_config": {"mode": "ANY",
+                                                          "allowed_function_names": ["report_speakers"]}},
+        },
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        body = resp.text[:1000]
+        if log_fn:
+            log_fn(f"Gemini API ответил HTTP {resp.status_code}: {body}")
+        raise RuntimeError(
+            f"Gemini API вернул ошибку HTTP {resp.status_code}: {body[:500]}\n"
+            "  Проверьте API-ключ на https://aistudio.google.com/apikey (и не превышена ли "
+            "дневная бесплатная квота — она сбрасывается раз в сутки). "
+            f"Если ошибка про модель {model!r} — актуальные названия моделей "
+            "смотрите на https://ai.google.dev/gemini-api/docs/models и "
+            "укажите вручную в настройках атрибуции."
+        )
+
+    data = resp.json()
+    results = None
+    for cand in data.get("candidates", []):
+        for part in (cand.get("content") or {}).get("parts", []):
+            fc = part.get("functionCall")
+            if fc and fc.get("name") == "report_speakers":
+                results = (fc.get("args") or {}).get("results")
+                break
+        if results is not None:
+            break
+
+    if not isinstance(results, list):
+        raise RuntimeError(
+            f"Gemini API не вернул ожидаемый список говорящих (ответ: {_json.dumps(data)[:500]})"
+        )
+
+    return _normalize_attribution_results(results, dialogue_count, log_fn)
+
+
+def _extract_json_array(raw_text: str):
+    """Достаёт из текстового ответа модели JSON-массив строк, даже если
+    модель обернула его в markdown-код (```json ... ```) или добавила
+    пояснения до/после. Нужен для YandexGPT, у которого нет отдельного
+    режима принудительного вызова инструмента (в отличие от Anthropic/
+    Gemini) — там приходится просить вернуть JSON текстом и парсить его."""
+    import json as _json
+    import re as _re
+
+    m = _re.search(r"\[.*\]", raw_text, flags=_re.DOTALL)
+    if not m:
+        return None
+    try:
+        parsed = _json.loads(m.group(0))
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def attribute_speakers_yandexgpt(text: str, api_key: str, model: str, folder_id: str = "",
+                                  log_fn=None) -> list:
+    """То же самое через YandexGPT (Yandex Cloud AI Studio) — работает из
+    России без VPN, есть бесплатный грант на запросы; можно использовать
+    тот же API-ключ и Folder ID, что и для Yandex SpeechKit. У YandexGPT
+    нет строгого function calling, поэтому просим вернуть JSON текстом и
+    парсим его сами (см. _extract_json_array)."""
+    import requests
+    import json as _json
+
+    dialogue_count = _attribution_dialogue_count(text)
+    if dialogue_count == 0:
+        return []
+
+    if not api_key:
+        raise ValueError(
+            "Не указан API-ключ YandexGPT для атрибуции говорящих. Можно использовать тот же "
+            "ключ, что и для Yandex SpeechKit выше, либо получить отдельный на "
+            "https://yandex.cloud/ru/docs/ai-studio/quickstart"
+        )
+    if not folder_id:
+        raise ValueError(
+            "Не указан Folder ID для YandexGPT — можно использовать тот же Folder ID, что и "
+            "для Yandex SpeechKit выше."
+        )
+
+    prompt = (
+        _attribution_prompt(text, dialogue_count) +
+        "\n\nВерни ОТВЕТ СТРОГО в виде JSON-массива строк, без каких-либо пояснений, "
+        "markdown-разметки или текста до/после — только сам массив, например: "
+        '["Иван Петров", "unknown", "Мария"]'
+    )
+    if log_fn:
+        log_fn(f"Атрибуция говорящих через YandexGPT {model}: {dialogue_count} реплик, "
+               f"{len(text)} симв. текста главы...")
+
+    model_uri = f"gpt://{folder_id}/{model}"
+    resp = requests.post(
+        YANDEXGPT_COMPLETION_URL,
+        headers={
+            "Authorization": f"Api-Key {api_key}",
+            "content-type": "application/json",
+        },
+        json={
+            "modelUri": model_uri,
+            "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": "4000"},
+            "messages": [{"role": "user", "text": prompt}],
+        },
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        body = resp.text[:1000]
+        if log_fn:
+            log_fn(f"YandexGPT API ответил HTTP {resp.status_code}: {body}")
+        raise RuntimeError(
+            f"YandexGPT API вернул ошибку HTTP {resp.status_code}: {body[:500]}\n"
+            "  Проверьте API-ключ и Folder ID (тот же, что и для SpeechKit, либо отдельный "
+            "с ролью ai.languageModels.user) на https://console.yandex.cloud/ . "
+            f"Если ошибка про модель {model!r} — актуальные названия моделей смотрите на "
+            "https://yandex.cloud/ru/docs/ai-studio/concepts/generation/models"
+        )
+
+    data = resp.json()
+    try:
+        raw_text = data["result"]["alternatives"][0]["message"]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(
+            f"YandexGPT API не вернул ожидаемый текст ответа (ответ: {_json.dumps(data)[:500]})"
+        )
+
+    results = _extract_json_array(raw_text)
+    if results is None:
+        raise RuntimeError(
+            f"YandexGPT вернул ответ, из которого не удалось извлечь список говорящих "
+            f"(ответ модели: {raw_text[:500]})"
+        )
+
+    return _normalize_attribution_results(results, dialogue_count, log_fn)
+
+
+def attribute_speakers_llm(text: str, api_key: str, model: str = DEFAULT_ATTRIBUTION_MODEL,
+                            provider: str = DEFAULT_ATTRIBUTION_PROVIDER, log_fn=None,
+                            folder_id: str = "") -> list:
+    """Диспетчер: вызывает attribute_speakers_yandexgpt (по умолчанию,
+    работает из РФ без VPN), attribute_speakers_gemini (бесплатно, но
+    часто недоступен из РФ) или attribute_speakers_anthropic (платно), в
+    зависимости от provider — см. ATTRIBUTION_PROVIDERS."""
+    if provider == "yandexgpt":
+        return attribute_speakers_yandexgpt(text, api_key, model, folder_id=folder_id, log_fn=log_fn)
+    if provider == "anthropic":
+        return attribute_speakers_anthropic(text, api_key, model, log_fn=log_fn)
+    return attribute_speakers_gemini(text, api_key, model, log_fn=log_fn)
+
+
+def _make_file_logger(outdir: Path, filename: str):
+    """Возвращает log(message) — пишет и в консоль/GUI (через print,
+    перехватываемый TextRedirector), и в файл рядом с аудио, чтобы можно
+    было потом посмотреть подробности (например, ответы LLM-атрибуции)."""
+    import time as _time
+    log_path = outdir / filename
+
+    def log(message: str):
+        line = f"{_time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        print(f"  {message}")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    return log
+
+
+def _character_map_path(outdir: Path) -> Path:
+    return outdir / "dialogue_characters.json"
+
+
+def _load_character_voice_map(outdir: Path) -> dict:
+    """Словарь {имя_персонажа: голос}, сохраняемый рядом с аудио — так
+    один и тот же персонаж получает один и тот же голос во всех главах
+    книги, а не только внутри одной главы. Можно открыть и поправить
+    руками между запусками (например, если атрибуция ошиблась с полом
+    голоса для персонажа)."""
+    path = _character_map_path(outdir)
+    if not path.exists():
+        return {}
+    try:
+        import json as _json
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_character_voice_map(outdir: Path, mapping: dict):
+    path = _character_map_path(outdir)
+    try:
+        import json as _json
+        path.write_text(_json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _group_paragraphs_by_speaker_names(text: str, main_voice, dialogue_voices,
+                                        speaker_names: list, character_voice_map: dict):
+    """Как _group_paragraphs_by_voice, но голос реплики выбирается не по
+    круговому чередованию, а по имени говорящего (speaker_names[i] — имя
+    для i-й по счёту реплики в тексте, см. attribute_speakers_llm):
+    каждому новому имени закрепляется следующий свободный голос из
+    dialogue_voices (и запоминается в character_voice_map — на будущие
+    главы и перезапуски), 'unknown'/непонятные реплики просто чередуются
+    между собой отдельным счётчиком, чтобы не путать с реальными именами."""
+    paras = _split_dialogue_paragraphs(text)
+    grouped = []  # [[voice, [paragraphs], is_dialogue], ...]
+    di = 0
+    unknown_i = 0
+    for para, is_dialogue in paras:
+        if is_dialogue:
+            name = speaker_names[di] if di < len(speaker_names) else "unknown"
+            di += 1
+            name_key = name.strip().lower()
+            if not name_key or name_key == "unknown":
+                voice = dialogue_voices[unknown_i % len(dialogue_voices)]
+                unknown_i += 1
+            elif name_key in character_voice_map:
+                voice = character_voice_map[name_key]
+            else:
+                voice = dialogue_voices[len(character_voice_map) % len(dialogue_voices)]
+                character_voice_map[name_key] = voice
+            grouped.append([voice, [para], True])
+        else:
+            if grouped and grouped[-1][0] == main_voice and not grouped[-1][2]:
+                grouped[-1][1].append(para)
+            else:
+                grouped.append([main_voice, [para], False])
+
+    return [(voice, "\n".join(para_list)) for voice, para_list, _is_dialogue in grouped]
+
+
+def resolve_voice_groups(text: str, main_voice, dialogue_voices, outdir: Path,
+                          attribution=None, log_fn=None):
+    """Единая точка входа для всех run_*: строит список (голос, текст
+    группы) для главы. Без dialogue_voices — весь текст одним main_voice.
+    С dialogue_voices, но без attribution — простое чередование реплик по
+    кругу (см. _group_paragraphs_by_voice), как раньше. С attribution —
+    {"api_key":..., "model":...} — реплики атрибутируются через Claude API
+    (attribute_speakers_llm), и один и тот же персонаж получает один и тот
+    же голос по всей книге (словарь сохраняется в outdir/dialogue_characters.json).
+    При любой ошибке атрибуции (нет ключа, сеть, лимиты) — тихо откатывается
+    на простое чередование, чтобы не срывать всю озвучку из-за LLM."""
+    if not dialogue_voices:
+        return [(main_voice, text)]
+    if not attribution:
+        return _group_paragraphs_by_voice(text, main_voice, dialogue_voices)
+
+    try:
+        speaker_names = attribute_speakers_llm(
+            text, attribution.get("api_key", ""), attribution.get("model", DEFAULT_ATTRIBUTION_MODEL),
+            provider=attribution.get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
+            folder_id=attribution.get("folder_id", ""),
+            log_fn=log_fn,
+        )
+    except Exception as e:
+        if log_fn:
+            log_fn(f"Атрибуция говорящих не удалась ({e}) — использую обычное чередование голосов.")
+        return _group_paragraphs_by_voice(text, main_voice, dialogue_voices)
+
+    character_voice_map = _load_character_voice_map(outdir)
+    groups = _group_paragraphs_by_speaker_names(
+        text, main_voice, dialogue_voices, speaker_names, character_voice_map
+    )
+    _save_character_voice_map(outdir, character_voice_map)
+    if log_fn:
+        named = ", ".join(sorted(character_voice_map.keys()))
+        log_fn(f"Персонажи с закреплённым голосом на сейчас: {named or '(пока нет)'}")
+    return groups
+
+
 def play_file(path: Path):
     """Проигрывает готовый аудиофайл.
 
@@ -444,11 +1016,62 @@ def play_file(path: Path):
         pygame.time.Clock().tick(10)
 
 
-def _relevant_total(chapters, start: int) -> int:
-    """Сколько глав реально будет обработано, начиная с --start — нужно
-    для прогресс-бара, чтобы он всегда доходил от 0 до 100%, а не
-    останавливался на середине, если озвучка начинается не с первой главы."""
-    return max(1, len(chapters) - max(0, start - 1))
+def _parse_chapters_spec(spec: str):
+    """Разбирает строку вида "1,3,5-7" в список номеров глав (1-based).
+    Пустая строка -> None (значит, использовать --start как раньше)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    result = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a.strip()), int(b.strip())
+            if a > b:
+                a, b = b, a
+            result.update(range(a, b + 1))
+        else:
+            result.add(int(part))
+    return sorted(result)
+
+
+def _select_chapters(chapters, start: int = 1, chapter_indices=None, char_ranges=None):
+    """Отбирает главы для озвучки — либо все, начиная с --start (старое
+    поведение по умолчанию), либо только перечисленные в chapter_indices
+    (1-based номера глав, в любом порядке — результат всё равно идёт по
+    порядку книги; start в этом случае игнорируется). Это то, что стоит
+    за выбором конкретных глав в GUI (можно выделить несколько
+    несоседних глав вместо диапазона).
+
+    char_ranges — необязательный словарь {номер_главы: (от_символа,
+    до_символа)}, чтобы озвучить не главу целиком, а кусок её текста
+    (например, только середину — если в остальном всё уже устраивает).
+    Название такой главы дополняется пометкой "(фрагмент)", чтобы файл
+    не путался с озвучкой главы целиком и не перезаписывал её.
+
+    Возвращает список (номер_главы, заголовок, текст) в порядке книги —
+    именно по нему потом идёт прогресс-бар (его длина — это "всего глав"
+    для текущего запуска)."""
+    if chapter_indices:
+        wanted = sorted({i for i in chapter_indices if 1 <= i <= len(chapters)})
+    else:
+        wanted = [i for i in range(1, len(chapters) + 1) if i >= start]
+
+    result = []
+    for idx in wanted:
+        title, text = chapters[idx - 1]
+        if char_ranges and idx in char_ranges:
+            a, b = char_ranges[idx]
+            a = max(0, min(a, len(text)))
+            b = max(a, min(b, len(text)))
+            if a > 0 or b < len(text):
+                text = text[a:b]
+                title = f"{title} (фрагмент)"
+        result.append((idx, title, text))
+    return result
 
 
 YANDEX_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
@@ -456,7 +1079,7 @@ YANDEX_MAX_CHARS = 4900  # лимит SpeechKit — 5000 символов на �
 
 
 def synth_yandex_chunk(text: str, api_key: str, folder_id: str, voice: str, lang: str,
-                        speed: float, emotion: str, audio_format: str) -> bytes:
+                        speed: float, emotion: str, audio_format: str, log_fn=None) -> bytes:
     """Один запрос к Yandex SpeechKit (REST), возвращает содержимое аудио
     (mp3 по умолчанию). Поднимает исключение с понятным текстом при ошибке
     (неверный ключ, кончились деньги/лимит и т.п.).
@@ -466,7 +1089,12 @@ def synth_yandex_chunk(text: str, api_key: str, folder_id: str, voice: str, lang
     каталог, в котором создан аккаунт, и folderId можно не передавать.
     Указывать его нужно только для другого, более редкого способа
     авторизации (IAM-токен пользовательского аккаунта), который этот
-    скрипт не использует."""
+    скрипт не использует.
+
+    log_fn(message), если передан, получает подробности каждого запроса
+    (все параметры, кроме самого ключа — он в логе не пишется) и полный
+    ответ сервера при ошибке — используется, чтобы разобраться в причине
+    HTTP 400/403 и т.п., когда простого сообщения об ошибке недостаточно."""
     import urllib.request
     import urllib.parse
     import urllib.error
@@ -489,6 +1117,17 @@ def synth_yandex_chunk(text: str, api_key: str, folder_id: str, voice: str, lang
     if emotion:
         params["emotion"] = emotion
 
+    if log_fn:
+        # По просьбе пользователя пишем полный запрос целиком, включая
+        # API-ключ, — для диагностики. ВНИМАНИЕ: значит, файл лога
+        # (yandex_client.log) содержит секретный ключ в открытом виде —
+        # не отправляйте его никому и не коммитьте в git (он уже добавлен
+        # в .gitignore рядом с fb2_reader_settings.json).
+        full_params = dict(params)
+        full_params["text"] = f"[{len(text)} симв.] {text[:80]!r}…" if len(text) > 80 else text
+        log_fn(f"Запрос к Yandex SpeechKit: {full_params} "
+               f"(Authorization: Api-Key {api_key})")
+
     data = urllib.parse.urlencode(params).encode("utf-8")
     req = urllib.request.Request(
         YANDEX_TTS_URL,
@@ -499,38 +1138,124 @@ def synth_yandex_chunk(text: str, api_key: str, folder_id: str, voice: str, lang
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"Yandex SpeechKit вернул ошибку HTTP {e.code}: {body}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Не удалось связаться с Yandex SpeechKit: {e.reason}") from e
+    import http.client
+    import socket
+    import time as _time
+
+    retries = 3
+    last_incomplete = None
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return resp.read()
+        except (http.client.IncompleteRead, socket.timeout, ConnectionError) as e:
+            # Соединение оборвалось/протухло не долетев до конца ответа
+            # (обрыв сети, антивирус/прокси режет длинные ответы,
+            # Dropbox/файрвол вмешивается и т.п.) — сам сервис Yandex тут
+            # обычно ни при чём, это НЕ ошибка синтеза. Пробуем ещё раз с
+            # той же главой.
+            last_incomplete = e
+            if isinstance(e, http.client.IncompleteRead):
+                got = len(e.partial) if e.partial else 0
+                detail = f"получено {got} байт из {e.expected or '?'}"
+            else:
+                detail = f"{type(e).__name__}: {e}"
+            if log_fn:
+                log_fn(f"Обрыв соединения при получении ответа ({detail}), "
+                       f"попытка {attempt}/{retries}...")
+            if attempt < retries:
+                _time.sleep(3.0)
+                continue
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if log_fn:
+                log_fn(f"Yandex SpeechKit ответил HTTP {e.code}, полный текст ответа: {body}")
+            raise RuntimeError(
+                f"Yandex SpeechKit вернул ошибку HTTP {e.code}: {body[:500]}\n"
+                "  Частые причины: неверный/просроченный API-ключ, не подключён "
+                "платёжный аккаунт, закончилась пробная квота, либо у сервисного "
+                "аккаунта нет роли ai.speechkit-tts.user. Проверить ключ, баланс и "
+                "роли можно в консоли Yandex Cloud: https://console.yandex.cloud/ "
+                "(раздел Billing — баланс/лимиты, IAM — роли сервисного аккаунта). "
+                "Список кодов ошибок SpeechKit: "
+                "https://yandex.cloud/ru/docs/speechkit/tts/request\n"
+                f"  Полный текст ответа записан в лог рядом с аудио (yandex_client.log)."
+            ) from e
+        except urllib.error.URLError as e:
+            if log_fn:
+                log_fn(f"Не удалось связаться с Yandex SpeechKit: {e.reason}")
+            raise RuntimeError(f"Не удалось связаться с Yandex SpeechKit: {e.reason}") from e
+
+    # Все retries исчерпаны, каждый раз обрыв на IncompleteRead
+    raise RuntimeError(
+        f"Не удалось получить полный ответ от Yandex SpeechKit после {retries} попыток "
+        f"(соединение обрывается на середине ответа: {last_incomplete}). Обычно это "
+        "сеть/антивирус/прокси, а не сам SpeechKit — проверьте интернет-соединение, "
+        "или, если антивирус агрессивно проверяет трафик, добавьте исключение для "
+        "python.exe/этой программы."
+    ) from last_incomplete
 
 
 def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, folder_id: str,
-               voice: str = "alena", lang: str = "ru-RU", speed: float = 1.0,
-               emotion: str = "", on_progress=None):
+               voice: str = "alena", lang: str = "", speed: float = 1.0,
+               emotion: str = "", on_progress=None, chapter_indices=None, char_ranges=None,
+               dialogue_voices=None, attribution=None):
     """Озвучка через облачный Yandex SpeechKit. Требует интернет, ключ и
     Folder ID на каждый запуск, платный после пробного периода (см.
     README). Текст режется на куски по YANDEX_MAX_CHARS (лимит SpeechKit —
     5000 символов на запрос) и склеивается через pydub, если он
-    установлен, иначе сохраняется частями."""
+    установлен, иначе сохраняется частями.
+
+    chapter_indices/char_ranges — см. _select_chapters: позволяют
+    озвучить только выбранные главы (не обязательно подряд) и/или кусок
+    конкретной главы вместо неё целиком.
+
+    dialogue_voices — необязательный список голосов (ключи YANDEX_VOICES),
+    которыми по очереди озвучиваются реплики прямой речи (абзацы,
+    начинающиеся с тире), чтобы диалоги не звучали одним и тем же
+    монотонным голосом на протяжении всей книги — см. _build_voiced_segments.
+    Остальной текст (авторская речь) по-прежнему звучит голосом voice."""
+    import time as _time
+
+    # lang должен точно соответствовать голосу (см. YANDEX_VOICE_LANGS) —
+    # если передан явный lang, отличающийся от нужного для voice, это,
+    # скорее всего, ошибка настройки (например, украинский голос lera с
+    # lang=ru-RU), которая иначе приводит к неочевидной HTTP 400 —
+    # используем правильный lang для голоса всегда, чтобы не наступать на
+    # эти грабли.
+    correct_lang = yandex_lang_for_voice(voice)
+    if lang and lang != correct_lang:
+        print(f"Внимание: голосу {voice!r} нужен lang={correct_lang!r}, "
+              f"а не {lang!r} — использую {correct_lang!r}, иначе Yandex "
+              f"ответит ошибкой HTTP 400 (несовпадение voice/lang).")
+    lang = correct_lang
+
     outdir.mkdir(parents=True, exist_ok=True)
-    total = _relevant_total(chapters, start)
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
     audio_format = "mp3"
 
-    for idx, (title, text) in enumerate(chapters, 1):
-        if idx < start:
-            continue
-        pos = idx - start + 1
+    log_path = outdir / "yandex_client.log"
+
+    def log(message: str):
+        line = f"{_time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        print(f"  {message}")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    for pos, (idx, title, text) in enumerate(selection, 1):
         fname = f"{idx:03d}_{sanitize_filename(title)}.mp3"
         out_path = outdir / fname
 
         fingerprint = _params_fingerprint(
             text, mode="yandex", voice=voice, lang=lang, speed=speed,
             emotion=emotion, format=audio_format,
+            dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
+            attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {fname}")
@@ -543,16 +1268,22 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю (Yandex SpeechKit): {title} -> {fname}")
 
-        chunks = split_text(text, YANDEX_MAX_CHARS)
-        chunks_total = len(chunks) or 1
+        voice_groups = resolve_voice_groups(text, voice, dialogue_voices, outdir,
+                                             attribution=attribution, log_fn=log)
+        segments = _chunk_voice_groups(voice_groups, YANDEX_MAX_CHARS)
+        chunks_total = len(segments) or 1
         if on_progress:
             on_progress(pos, total, 0, chunks_total)
 
         chunk_bytes = []
-        for chunk_no, chunk in enumerate(tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."), 1):
+        for chunk_no, (chunk, seg_voice) in enumerate(
+            tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
+        ):
             if chunk.strip():
+                seg_lang = yandex_lang_for_voice(seg_voice)
                 data = synth_yandex_chunk(
-                    chunk, api_key, folder_id, voice, lang, speed, emotion, audio_format
+                    chunk, api_key, folder_id, seg_voice, seg_lang, speed, emotion, audio_format,
+                    log_fn=log,
                 )
                 chunk_bytes.append(data)
             if on_progress:
@@ -586,13 +1317,23 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
 
 
-def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, on_progress=None):
+def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, on_progress=None,
+               chapter_indices=None, char_ranges=None, dialogue_voices=None):
+    """voice_lang — язык для gTTS (Google Translate TTS). dialogue_voices
+    здесь принимается только для единообразия сигнатуры с другими
+    режимами — у gTTS нет отдельных русских голосов (только один голос на
+    язык), поэтому реально разные голоса для диалогов он дать не может;
+    если параметр передан непустым, просто печатается предупреждение."""
+    if dialogue_voices:
+        print("Внимание: Google TTS (режим online) не поддерживает несколько "
+              "разных русских голосов — вся книга озвучится одним голосом, "
+              "как обычно. Для разных голосов на диалогах используйте режим "
+              "Silero (локально, бесплатно) или Yandex SpeechKit.")
     outdir.mkdir(parents=True, exist_ok=True)
-    total = _relevant_total(chapters, start)
-    for idx, (title, text) in enumerate(chapters, 1):
-        if idx < start:
-            continue
-        pos = idx - start + 1
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
+    for pos, (idx, title, text) in enumerate(selection, 1):
         fname = f"{idx:03d}_{sanitize_filename(title)}.mp3"
         out_path = outdir / fname
         fingerprint = _params_fingerprint(text, mode="online", lang=voice_lang)
@@ -671,7 +1412,8 @@ def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms:
 def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: int, play: bool,
                model_id: str = DEFAULT_SILERO_MODEL, sentence_break_ms: int = 320,
                paragraph_break_ms: int = 550, comma_break_ms: int = 180,
-               put_accent: bool = True, put_yo: bool = True, on_progress=None):
+               put_accent: bool = True, put_yo: bool = True, on_progress=None,
+               chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None):
     """Озвучка через Silero TTS — нейросетевой русский голос, локально.
     По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
 
@@ -693,6 +1435,11 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     если передан, вызывается после каждого фрагмента (и один раз в начале
     главы) — используется GUI для настоящего прогресс-бара вместо
     "бегающей" неопределённой полоски.
+
+    dialogue_speakers — необязательный список голосов Silero (из
+    speakers_for_model(model_id)), которыми по очереди озвучиваются реплики
+    прямой речи (абзацы, начинающиеся с тире) — см. _group_paragraphs_by_voice.
+    Остальной текст (авторская речь) звучит голосом speaker, как обычно.
     """
     import numpy as np
     import wave
@@ -701,6 +1448,14 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     if speaker not in allowed:
         print(f"Голос {speaker!r} недоступен для {model_id}, использую xenia")
         speaker = "xenia" if "xenia" in allowed else allowed[0]
+    if dialogue_speakers:
+        bad = [s for s in dialogue_speakers if s not in allowed]
+        dialogue_speakers = [s for s in dialogue_speakers if s in allowed]
+        if bad:
+            print(f"Голоса {bad} недоступны для {model_id}, пропускаю их в чередовании диалогов.")
+        if not dialogue_speakers:
+            print("Не осталось ни одного голоса для диалогов после проверки — "
+                  "диалоги озвучиваются основным голосом, как обычно.")
 
     print(f"Загружаю модель Silero TTS {model_id} (при первом запуске — скачивание)...")
     model = load_silero_model(model_id)
@@ -709,25 +1464,25 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
     max_chars = 350
 
-    def synth_one(part_text: str):
+    def synth_one(part_text: str, part_speaker: str):
         """Один вызов модели. Бросает исключение при неудаче."""
         return model.apply_tts(
             text=part_text,
-            speaker=speaker,
+            speaker=part_speaker,
             sample_rate=sample_rate,
             put_accent=put_accent,
             put_yo=put_yo,
         ).numpy()
 
-    def synth_with_fallback(part_text: str, idx: int, title: str) -> "np.ndarray":
+    def synth_with_fallback(part_text: str, idx: int, title: str, part_speaker: str) -> "np.ndarray":
         """Синтезирует один фрагмент с повтором и делением пополам при
         ошибке; в самом крайнем случае возвращает тишину вместо исключения."""
         try:
-            return synth_one(part_text)
+            return synth_one(part_text, part_speaker)
         except Exception as e1:
             print(f"  [Гл.{idx} «{title}»] ошибка синтеза фрагмента ({e1}), повторяю…")
             try:
-                return synth_one(part_text)
+                return synth_one(part_text, part_speaker)
             except Exception as e2:
                 words = part_text.split()
                 if len(words) > 3:
@@ -735,8 +1490,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                     left, right = " ".join(words[:mid]), " ".join(words[mid:])
                     print(f"  [Гл.{idx} «{title}»] повтор не помог ({e2}), делю фрагмент пополам и пробую снова…")
                     try:
-                        left_audio = synth_with_fallback(left, idx, title)
-                        right_audio = synth_with_fallback(right, idx, title)
+                        left_audio = synth_with_fallback(left, idx, title, part_speaker)
+                        right_audio = synth_with_fallback(right, idx, title, part_speaker)
                         gap = np.zeros(int(sample_rate * 0.12), dtype=np.float32)
                         return np.concatenate([left_audio, gap, right_audio])
                     except Exception:
@@ -747,12 +1502,11 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                       f"{part_text[:80]!r}…")
                 return np.zeros(int(sample_rate * silence_seconds), dtype=np.float32)
 
-    total = _relevant_total(chapters, start)
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
 
-    for idx, (title, text) in enumerate(chapters, 1):
-        if idx < start:
-            continue
-        pos = idx - start + 1
+    for pos, (idx, title, text) in enumerate(selection, 1):
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
 
@@ -761,6 +1515,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             sample_rate=sample_rate, max_chars=max_chars,
             sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
             comma_break_ms=comma_break_ms, put_accent=put_accent, put_yo=put_yo,
+            dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
+            attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -773,22 +1529,36 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
 
-        segments = _segments_with_pauses(
-            text, sentence_break_ms=sentence_break_ms,
-            paragraph_break_ms=paragraph_break_ms, comma_break_ms=comma_break_ms,
-            max_chars=max_chars,
+        # Группируем по голосу (диалоги/повествование, см. dialogue_speakers,
+        # и/или LLM-атрибуция по персонажам, см. attribution), затем каждую
+        # группу — как раньше, на куски по знакам препинания с паузами.
+        # Результат — плоский список (текст, пауза, голос).
+        voice_groups = resolve_voice_groups(
+            text, speaker, dialogue_speakers, outdir, attribution=attribution,
+            log_fn=_make_file_logger(outdir, "silero_client.log"),
         )
+        segments = []
+        for group_voice, group_text in voice_groups:
+            for part_text, pause_ms in _segments_with_pauses(
+                group_text, sentence_break_ms=sentence_break_ms,
+                paragraph_break_ms=paragraph_break_ms, comma_break_ms=comma_break_ms,
+                max_chars=max_chars,
+            ):
+                segments.append((part_text, pause_ms, group_voice))
+
         audio_parts = []
         segs_total = len(segments) or 1
         if on_progress:
             on_progress(pos, total, 0, segs_total)
 
-        for seg_i, (part_text, pause_ms) in enumerate(tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1):
+        for seg_i, (part_text, pause_ms, seg_speaker) in enumerate(
+            tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
+        ):
             if not part_text.strip():
                 if on_progress:
                     on_progress(pos, total, seg_i, segs_total)
                 continue
-            audio = synth_with_fallback(part_text, idx, title)
+            audio = synth_with_fallback(part_text, idx, title, seg_speaker)
             audio_parts.append(audio)
             if pause_ms > 0:
                 audio_parts.append(np.zeros(int(sample_rate * pause_ms / 1000), dtype=np.float32))
@@ -913,7 +1683,8 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
 def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rate: int,
                      play: bool, rest_url: str, sentence_break_ms: int, paragraph_break_ms: int,
                      comma_break_ms: int, emphasize: bool = True, max_len: int = 700,
-                     model_id: str = DEFAULT_SILERO_MODEL, on_progress=None):
+                     model_id: str = DEFAULT_SILERO_MODEL, on_progress=None,
+                     chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -939,6 +1710,13 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     import requests
     import numpy as np
     import wave as wave_mod
+
+    if dialogue_speakers:
+        allowed = speakers_for_model(model_id)
+        bad = [s for s in dialogue_speakers if s not in allowed]
+        dialogue_speakers = [s for s in dialogue_speakers if s in allowed]
+        if bad:
+            print(f"Голоса {bad} недоступны для {model_id}, пропускаю их в чередовании диалогов.")
 
     rest_url = rest_url.rstrip("/")
     ssml_endpoint = f"{rest_url}/getssmlwav"
@@ -991,7 +1769,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                 raise e
         raise last_exc
 
-    def synth_via_ssml(plain_text_chunk: str) -> bytes:
+    def synth_via_ssml(plain_text_chunk: str, chunk_speaker: str) -> bytes:
         ssml = text_to_ssml(
             plain_text_chunk,
             sentence_break_ms=sentence_break_ms,
@@ -1001,7 +1779,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         )
         resp = _get_with_retry(ssml_endpoint, {
             "text_to_speech": ssml,
-            "speaker": speaker,
+            "speaker": chunk_speaker,
             "sample_rate": sample_rate,
             "raw_ssml": "true",
         })
@@ -1010,22 +1788,23 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             log(f"сервис использовал упрощённый вариант синтеза: {level}")
         return resp.content
 
-    def synth_via_plain_text(plain_text_chunk: str) -> bytes:
+    def synth_via_plain_text(plain_text_chunk: str, chunk_speaker: str) -> bytes:
         resp = _get_with_retry(plain_endpoint, {
             "text_to_speech": plain_text_chunk,
-            "speaker": speaker,
+            "speaker": chunk_speaker,
             "sample_rate": sample_rate,
         })
         return resp.content
 
-    def synth_chunk(plain_text_chunk: str, chunk_no: int, idx: int, title: str) -> "np.ndarray":
+    def synth_chunk(plain_text_chunk: str, chunk_no: int, idx: int, title: str,
+                     chunk_speaker: str) -> "np.ndarray":
         try:
-            wav_bytes = synth_via_ssml(plain_text_chunk)
+            wav_bytes = synth_via_ssml(plain_text_chunk, chunk_speaker)
         except Exception as e_ssml:
             log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] SSML-синтез не удался "
                 f"({_error_detail(e_ssml)}), пробую обычный текст без SSML...")
             try:
-                wav_bytes = synth_via_plain_text(plain_text_chunk)
+                wav_bytes = synth_via_plain_text(plain_text_chunk, chunk_speaker)
                 log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] синтез обычным текстом удался")
             except Exception as e_plain:
                 log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] ОШИБКА: не удалось синтезировать "
@@ -1042,12 +1821,11 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             pcm = wf.readframes(n)
             return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
 
-    total = _relevant_total(chapters, start)
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
 
-    for idx, (title, text) in enumerate(chapters, 1):
-        if idx < start:
-            continue
-        pos = idx - start + 1
+    for pos, (idx, title, text) in enumerate(selection, 1):
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
 
@@ -1055,6 +1833,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             text, mode="silero_rest", model=model_id, speaker=speaker, sample_rate=sample_rate,
             sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
             comma_break_ms=comma_break_ms, emphasize=emphasize, max_len=max_len,
+            dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
+            attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -1067,19 +1847,31 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю (silero_rest): {title} -> {fname}")
 
-        chunks = _split_paragraphs_for_ssml(text, max_len)
+        # Группируем по голосу (диалоги/повествование и/или LLM-атрибуция
+        # по персонажам, см. attribution), затем каждую группу — как
+        # раньше, на куски под SSML-лимит max_len.
+        voice_groups = resolve_voice_groups(text, speaker, dialogue_speakers, outdir,
+                                             attribution=attribution, log_fn=log)
+        chunks = []  # [(текст, голос), ...]
+        for group_voice, group_text in voice_groups:
+            for chunk in _split_paragraphs_for_ssml(group_text, max_len):
+                if chunk.strip():
+                    chunks.append((chunk, group_voice))
+
         pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
         audio_parts = []
         chunks_total = len(chunks) or 1
         if on_progress:
             on_progress(pos, total, 0, chunks_total)
 
-        for chunk_no, chunk in enumerate(tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."), 1):
+        for chunk_no, (chunk, chunk_voice) in enumerate(
+            tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."), 1
+        ):
             if not chunk.strip():
                 if on_progress:
                     on_progress(pos, total, chunk_no, chunks_total)
                 continue
-            audio = synth_chunk(chunk, chunk_no, idx, title)
+            audio = synth_chunk(chunk, chunk_no, idx, title, chunk_voice)
             audio_parts.append(audio)
             audio_parts.append(pause)
             if on_progress:
@@ -1130,7 +1922,14 @@ def list_offline_voices():
     return result
 
 
-def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str = "", on_progress=None):
+def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str = "", on_progress=None,
+                 chapter_indices=None, char_ranges=None, dialogue_voice_ids=None, attribution=None,
+                 outdir: Path = None):
+    """outdir здесь используется только для сохранения словаря "персонаж ->
+    голос" при dialogue_voice_ids + attribution (offline-режим ничего не
+    пишет на диск сам по себе — говорит вслух сразу) — если не передан,
+    берётся текущая папка."""
+    outdir = outdir or Path(".")
     import pyttsx3
     engine = pyttsx3.init()
     engine.setProperty("rate", rate)
@@ -1153,18 +1952,46 @@ def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str 
               "звучать будет на голосе по умолчанию (может звучать неразборчиво).\n"
               "На Linux установите: sudo apt install espeak-ng espeak-ng-data")
 
-    total = _relevant_total(chapters, start)
-    for idx, (title, text) in enumerate(chapters, 1):
-        if idx < start:
-            continue
-        pos = idx - start + 1
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
+    for pos, (idx, title, text) in enumerate(selection, 1):
         print(f"\n[{idx}/{len(chapters)}] {title}")
+        if not dialogue_voice_ids:
+            if on_progress:
+                on_progress(pos, total, 0, 1)
+            engine.say(text)
+            engine.runAndWait()
+            if on_progress:
+                on_progress(pos, total, 1, 1)
+            continue
+
+        # Разные голоса для диалогов: группируем по голосу (см.
+        # resolve_voice_groups — простое чередование и/или LLM-атрибуция по
+        # персонажам) и переключаем голос движка перед каждой группой —
+        # say()/runAndWait() читает синхронно, поэтому можно спокойно
+        # менять voice между вызовами.
+        voice_groups = resolve_voice_groups(text, chosen or "", dialogue_voice_ids, outdir,
+                                             attribution=attribution,
+                                             log_fn=_make_file_logger(outdir, "offline_client.log"))
+        groups_total = len(voice_groups) or 1
         if on_progress:
-            on_progress(pos, total, 0, 1)
-        engine.say(text)
-        engine.runAndWait()
-        if on_progress:
-            on_progress(pos, total, 1, 1)
+            on_progress(pos, total, 0, groups_total)
+        for g_i, (group_voice, group_text) in enumerate(voice_groups, 1):
+            try:
+                engine.setProperty("voice", group_voice or chosen)
+            except Exception as e:
+                print(f"  Не удалось переключить голос на {group_voice!r} ({e}), "
+                      f"использую текущий.")
+            engine.say(group_text)
+            engine.runAndWait()
+            if on_progress:
+                on_progress(pos, total, g_i, groups_total)
+        # возвращаем основной голос на случай следующей главы без диалогов
+        try:
+            engine.setProperty("voice", chosen)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -1186,12 +2013,24 @@ def main():
                      help="папка для сохранения аудио (online и silero режимы)")
     ap.add_argument("--play", action="store_true",
                      help="сразу проигрывать главы после озвучки (online и silero режимы)")
-    ap.add_argument("--start", type=int, default=1, help="с какой главы начать (1 = с начала)")
+    ap.add_argument("--start", type=int, default=1, help="с какой главы начать (1 = с начала; "
+                     "игнорируется, если указан --chapters)")
+    ap.add_argument("--chapters", type=str, default="",
+                     help="озвучить только перечисленные главы вместо диапазона от --start, "
+                          "например: \"1,3,5-7\" (номера с 1, можно вперемешку с диапазонами)")
     ap.add_argument("--rate", type=int, default=170, help="скорость речи для offline-режима (слов/мин)")
     ap.add_argument("--voice", type=str, default="", help="подсказка имени голоса для offline-режима")
     ap.add_argument("--speaker", type=str, default="xenia",
                      help="голос Silero: aidar, baya, kseniya, xenia, eugene "
                           "(random — только для --model v4_ru)")
+    ap.add_argument("--dialogue-speakers", type=str, default="",
+                     help="список голосов Silero через запятую (например: aidar,eugene,baya) — "
+                          "если задан, реплики диалогов (абзацы, начинающиеся с тире) будут по "
+                          "очереди озвучены этими голосами вместо основного --speaker (режимы "
+                          "silero и silero_rest); по умолчанию не задано — один голос на книгу")
+    ap.add_argument("--dialogue-voice-ids", type=str, default="",
+                     help="список системных голосов (id, через запятую) для диалогов в "
+                          "offline-режиме — см. --voice/список системных голосов в GUI")
     ap.add_argument("--model", type=str, default=DEFAULT_SILERO_MODEL,
                      choices=list(SILERO_MODELS.keys()),
                      help="модель Silero для silero/silero_rest "
@@ -1231,9 +2070,34 @@ def main():
                           "good, neutral, evil")
     ap.add_argument("--yandex-speed", type=float, default=1.0,
                      help="скорость речи Yandex SpeechKit, от 0.1 до 3.0 (по умолчанию 1.0)")
+    ap.add_argument("--yandex-dialogue-voices", type=str, default="",
+                     help="список голосов через запятую (например: jane,filipp,zahar) — если "
+                          "задан, реплики диалогов (абзацы, начинающиеся с тире) будут по "
+                          "очереди озвучены этими голосами вместо голоса --yandex-voice, "
+                          "чтобы диалоги не звучали одним монотонным голосом; по умолчанию "
+                          "не задано — вся книга одним голосом, как раньше")
     ap.add_argument("--check-model-updates", action="store_true",
                      help="проверить на GitHub, не появилась ли более новая модель "
                           "Silero для русского языка, и выйти")
+    ap.add_argument("--attribution-provider", type=str, default=DEFAULT_ATTRIBUTION_PROVIDER,
+                     choices=list(ATTRIBUTION_PROVIDERS.keys()),
+                     help="сервис для определения, какой персонаж говорит каждую реплику "
+                          "диалога: yandexgpt (работает из РФ без VPN, есть бесплатный лимит), "
+                          "gemini (Google, бесплатно, но часто недоступен из РФ) или anthropic "
+                          f"(Claude, платно). По умолчанию {DEFAULT_ATTRIBUTION_PROVIDER}.")
+    ap.add_argument("--attribution-api-key", type=str, default="",
+                     help="API-ключ для выбранного --attribution-provider (для yandexgpt можно "
+                          "использовать тот же ключ, что и --yandex-api-key); можно также "
+                          "задать переменной окружения ANTHROPIC_API_KEY, GEMINI_API_KEY или "
+                          "YANDEX_API_KEY. Без него голоса для диалогов просто чередуются по "
+                          "кругу (--dialogue-*), без привязки к конкретному персонажу.")
+    ap.add_argument("--attribution-model", type=str, default="",
+                     help="модель для определения говорящего (по умолчанию — модель, "
+                          "рекомендованная для выбранного --attribution-provider); актуальные "
+                          "названия моделей см. в документации соответствующего сервиса")
+    ap.add_argument("--attribution-folder-id", type=str, default="",
+                     help="Folder ID для провайдера yandexgpt — можно использовать тот же, что "
+                          "и --yandex-folder-id; для gemini/anthropic не нужен")
     args = ap.parse_args()
 
     if args.check_model_updates:
@@ -1280,25 +2144,55 @@ def main():
             args.speaker = "xenia" if "xenia" in allowed else allowed[0]
             print(f"Использую голос: {args.speaker}")
 
+    chapter_indices = _parse_chapters_spec(args.chapters)
+    if chapter_indices:
+        bad = [i for i in chapter_indices if not (1 <= i <= len(chapters))]
+        if bad:
+            ap.error(f"--chapters: нет таких глав: {', '.join(str(i) for i in bad)} "
+                      f"(всего глав: {len(chapters)})")
+
+    dialogue_speakers = [v.strip() for v in args.dialogue_speakers.split(",") if v.strip()] or None
+    dialogue_voice_ids = [v.strip() for v in args.dialogue_voice_ids.split(",") if v.strip()] or None
+
+    attribution_provider = args.attribution_provider or DEFAULT_ATTRIBUTION_PROVIDER
+    attribution_api_key = args.attribution_api_key or os.environ.get("YANDEX_API_KEY", "") \
+        or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    attribution_model = args.attribution_model or ATTRIBUTION_PROVIDERS[attribution_provider]["default_model"]
+    attribution_folder_id = args.attribution_folder_id or args.yandex_folder_id
+    attribution = {
+        "api_key": attribution_api_key, "model": attribution_model,
+        "provider": attribution_provider, "folder_id": attribution_folder_id,
+    } if attribution_api_key else None
+
     if args.mode == "online":
-        run_online(chapters, args.outdir, args.play, args.start, voice_lang="ru")
+        run_online(chapters, args.outdir, args.play, args.start, voice_lang="ru",
+                   chapter_indices=chapter_indices, dialogue_voices=dialogue_speakers)
         print(f"\nГотово. Файлы сохранены в: {args.outdir.resolve()}")
     elif args.mode == "silero":
         run_silero(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                    model_id=args.model, sentence_break_ms=args.sentence_break_ms,
                    paragraph_break_ms=args.paragraph_break_ms, comma_break_ms=args.comma_break_ms,
-                   put_accent=not args.no_accent, put_yo=not args.no_yo)
+                   put_accent=not args.no_accent, put_yo=not args.no_yo,
+                   chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
+                   attribution=attribution)
     elif args.mode == "silero_rest":
         run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                          args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,
-                         args.comma_break_ms, emphasize=not args.no_emphasis, model_id=args.model)
+                         args.comma_break_ms, emphasize=not args.no_emphasis, model_id=args.model,
+                         chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
+                         attribution=attribution)
     elif args.mode == "yandex":
         api_key = args.yandex_api_key or os.environ.get("YANDEX_API_KEY", "")
         folder_id = args.yandex_folder_id or os.environ.get("YANDEX_FOLDER_ID", "")
+        dialogue_voices = [v.strip() for v in args.yandex_dialogue_voices.split(",") if v.strip()] or None
         run_yandex(chapters, args.outdir, args.start, args.play, api_key, folder_id,
-                   voice=args.yandex_voice, speed=args.yandex_speed, emotion=args.yandex_emotion)
+                   voice=args.yandex_voice, speed=args.yandex_speed, emotion=args.yandex_emotion,
+                   chapter_indices=chapter_indices, dialogue_voices=dialogue_voices,
+                   attribution=attribution)
     else:
-        run_offline(chapters, args.start, args.rate, args.voice, voice_id=args.voice)
+        run_offline(chapters, args.start, args.rate, args.voice, voice_id=args.voice,
+                    chapter_indices=chapter_indices, dialogue_voice_ids=dialogue_voice_ids,
+                    attribution=attribution, outdir=args.outdir)
 
 
 if __name__ == "__main__":
