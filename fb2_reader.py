@@ -157,10 +157,20 @@ SILERO_SPEAKERS = speaker_choices(DEFAULT_SILERO_MODEL)
 TTS_MODES = {
     "silero": "Silero (локально, лучшее качество)",
     "silero_rest": "Silero REST (через сервис, SSML-паузы)",
+    "cosyvoice": "CosyVoice (локально, GPU, клонирование голоса)",
     "yandex": "Yandex SpeechKit (облако, платно, нужен API-ключ)",
     "online": "Google TTS (нужен интернет)",
     "offline": "Системный TTS (pyttsx3, без интернета)",
 }
+
+# CosyVoice — отдельный сервис (см. cosyvoice_rest_service.py, ставится
+# отдельным install_cosyvoice.bat в свою .venv_cosyvoice, несовместимую по
+# версиям torch/numpy с обычным .venv) — программа обращается к нему по
+# HTTP, как к Silero REST. У CosyVoice нет готовых голосов "из коробки":
+# вместо этого сервис хранит именованные "профили голоса" (короткий образец
+# аудио + его текст), которыми можно клонировать любой голос — список
+# профилей запрашивается у сервиса через /voices.
+COSYVOICE_DEFAULT_REST_URL = "http://localhost:5011"
 
 # Голоса Yandex SpeechKit (v1) на момент добавления — актуальный список
 # стоит сверять в консоли Yandex Cloud, он время от времени пополняется
@@ -315,6 +325,21 @@ def parse_fb2(path: Path):
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|]', "", name)
     return name.strip()[:80] or "chapter"
+
+
+_HAS_LETTER_RE = re.compile(r"\w", re.UNICODE)
+
+
+def _text_has_speakable_content(text: str) -> bool:
+    """True, если в тексте есть хотя бы одна буква/цифра — т.е. есть что
+    озвучивать. Фрагменты вроде "* * *" (разделитель сцен, часто
+    встречается в fb2-книгах между сценами внутри главы) состоят только из
+    астерисков/пробелов — движки TTS (особенно Silero) на таком тексте
+    падают с непонятной ошибкой ("not enough values to unpack" и т.п.),
+    хотя по сути там просто нечего произносить. Такие фрагменты вместо
+    отправки в TTS сразу заменяются на короткую тишину — без ошибок и
+    лишних сетевых запросов."""
+    return bool(_HAS_LETTER_RE.search(text))
 
 
 # --------------------------------------------------------------------------
@@ -1199,7 +1224,7 @@ def synth_yandex_chunk(text: str, api_key: str, folder_id: str, voice: str, lang
 def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, folder_id: str,
                voice: str = "alena", lang: str = "", speed: float = 1.0,
                emotion: str = "", on_progress=None, chapter_indices=None, char_ranges=None,
-               dialogue_voices=None, attribution=None):
+               dialogue_voices=None, attribution=None, should_stop=None, play_fn=None):
     """Озвучка через облачный Yandex SpeechKit. Требует интернет, ключ и
     Folder ID на каждый запуск, платный после пробного периода (см.
     README). Текст режется на куски по YANDEX_MAX_CHARS (лимит SpeechKit —
@@ -1248,6 +1273,9 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
             pass
 
     for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
         fname = f"{idx:03d}_{sanitize_filename(title)}.mp3"
         out_path = outdir / fname
 
@@ -1261,7 +1289,7 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {fname}")
             if play:
                 print("  Проигрывание...")
-                play_file(out_path)
+                (play_fn or play_file)(out_path)
             if on_progress:
                 on_progress(pos, total, 1, 1)
             continue
@@ -1279,7 +1307,7 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
         for chunk_no, (chunk, seg_voice) in enumerate(
             tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
         ):
-            if chunk.strip():
+            if chunk.strip() and _text_has_speakable_content(chunk):
                 seg_lang = yandex_lang_for_voice(seg_voice)
                 data = synth_yandex_chunk(
                     chunk, api_key, folder_id, seg_voice, seg_lang, speed, emotion, audio_format,
@@ -1312,13 +1340,14 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
 
         if play:
             print("  Проигрывание...")
-            play_file(out_path)
+            (play_fn or play_file)(out_path)
 
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
 
 
 def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, on_progress=None,
-               chapter_indices=None, char_ranges=None, dialogue_voices=None):
+               chapter_indices=None, char_ranges=None, dialogue_voices=None, should_stop=None,
+               play_fn=None):
     """voice_lang — язык для gTTS (Google Translate TTS). dialogue_voices
     здесь принимается только для единообразия сигнатуры с другими
     режимами — у gTTS нет отдельных русских голосов (только один голос на
@@ -1334,6 +1363,9 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, 
                                   char_ranges=char_ranges)
     total = len(selection) or 1
     for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
         fname = f"{idx:03d}_{sanitize_filename(title)}.mp3"
         out_path = outdir / fname
         fingerprint = _params_fingerprint(text, mode="online", lang=voice_lang)
@@ -1341,7 +1373,7 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, 
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {fname}")
             if play:
                 print("  Проигрывание...")
-                play_file(out_path)
+                (play_fn or play_file)(out_path)
             if on_progress:
                 on_progress(pos, total, 1, 1)
             continue
@@ -1354,7 +1386,7 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, 
             on_progress(pos, total, 1, 1)
         if play:
             print("  Проигрывание...")
-            play_file(out_path)
+            (play_fn or play_file)(out_path)
 
 
 _LOCAL_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
@@ -1413,7 +1445,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                model_id: str = DEFAULT_SILERO_MODEL, sentence_break_ms: int = 320,
                paragraph_break_ms: int = 550, comma_break_ms: int = 180,
                put_accent: bool = True, put_yo: bool = True, on_progress=None,
-               chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None):
+               chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None,
+               should_stop=None, play_fn=None):
     """Озвучка через Silero TTS — нейросетевой русский голос, локально.
     По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
 
@@ -1477,6 +1510,10 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     def synth_with_fallback(part_text: str, idx: int, title: str, part_speaker: str) -> "np.ndarray":
         """Синтезирует один фрагмент с повтором и делением пополам при
         ошибке; в самом крайнем случае возвращает тишину вместо исключения."""
+        if not _text_has_speakable_content(part_text):
+            # разделитель сцен вроде "* * *" — нечего озвучивать, просто
+            # короткая пауза вместо него, без обращения к TTS
+            return np.zeros(int(sample_rate * 0.4), dtype=np.float32)
         try:
             return synth_one(part_text, part_speaker)
         except Exception as e1:
@@ -1507,6 +1544,9 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     total = len(selection) or 1
 
     for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
 
@@ -1522,7 +1562,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
             if play:
                 print("  Проигрывание...")
-                play_file(out_path)
+                (play_fn or play_file)(out_path)
             if on_progress:
                 on_progress(pos, total, 1, 1)
             continue
@@ -1580,7 +1620,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
         if play:
             print("  Проигрывание...")
-            play_file(out_path)
+            (play_fn or play_file)(out_path)
 
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
 
@@ -1684,7 +1724,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                      play: bool, rest_url: str, sentence_break_ms: int, paragraph_break_ms: int,
                      comma_break_ms: int, emphasize: bool = True, max_len: int = 700,
                      model_id: str = DEFAULT_SILERO_MODEL, on_progress=None,
-                     chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None):
+                     chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None,
+                     should_stop=None, play_fn=None):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -1798,6 +1839,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
 
     def synth_chunk(plain_text_chunk: str, chunk_no: int, idx: int, title: str,
                      chunk_speaker: str) -> "np.ndarray":
+        if not _text_has_speakable_content(plain_text_chunk):
+            # разделитель сцен вроде "* * *" — нечего озвучивать, просто
+            # короткая пауза вместо него, без обращения к сервису
+            return np.zeros(int(sample_rate * 0.4), dtype=np.float32)
         try:
             wav_bytes = synth_via_ssml(plain_text_chunk, chunk_speaker)
         except Exception as e_ssml:
@@ -1826,6 +1871,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     total = len(selection) or 1
 
     for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
         out_path = outdir / fname
 
@@ -1840,7 +1888,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
             if play:
                 print("  Проигрывание...")
-                play_file(out_path)
+                (play_fn or play_file)(out_path)
             if on_progress:
                 on_progress(pos, total, 1, 1)
             continue
@@ -1892,7 +1940,208 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
 
         if play:
             print("  Проигрывание...")
-            play_file(out_path)
+            (play_fn or play_file)(out_path)
+
+    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+    print(f"Подробный лог ошибок (если были): {log_path.resolve()}")
+
+
+def cosyvoice_list_voices(rest_url: str) -> list:
+    """Запрашивает у сервиса cosyvoice_rest_service.py список загруженных
+    профилей голоса (см. cosyvoice_rest_service.py: POST /add_voice их
+    добавляет, GET /voices — перечисляет). Возвращает [] и не бросает
+    исключение, если сервис недоступен — вызывающий код (GUI) сам решает,
+    как это показать пользователю."""
+    import requests
+    try:
+        resp = requests.get(f"{rest_url.rstrip('/')}/voices", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("voices", [])
+    except Exception:
+        return []
+
+
+def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: int,
+                   play: bool, rest_url: str, sentence_break_ms: int = 250,
+                   paragraph_break_ms: int = 450, comma_break_ms: int = 120,
+                   max_len: int = 400, on_progress=None,
+                   chapter_indices=None, char_ranges=None, dialogue_voices=None, attribution=None,
+                   should_stop=None, play_fn=None):
+    """Озвучка через локальный сервис cosyvoice_rest_service.py (CosyVoice2,
+    работает на GPU) — см. install_cosyvoice.bat/README для установки в
+    отдельное окружение .venv_cosyvoice. В отличие от Silero/Yandex, у
+    CosyVoice нет готовых голосов "из коробки" — вместо этого сервис хранит
+    именованные "профили голоса" (короткий образец аудио + его текст),
+    voice — имя одного из них (см. cosyvoice_list_voices/эндпоинт /voices).
+
+    dialogue_voices здесь — список ИМЁН профилей (а не голосов Silero/
+    Yandex), по которым чередуются реплики диалогов — работает точно так
+    же, как dialogue_speakers/dialogue_voices в других режимах, включая
+    LLM-атрибуцию по персонажам (attribution).
+
+    Паузы между предложениями/абзацами/запятыми (sentence_break_ms,
+    paragraph_break_ms, comma_break_ms) — CosyVoice, в отличие от
+    silero_rest, не понимает SSML, так что паузы вставляются вручную:
+    текст режется на куски по пунктуации через _segments_with_pauses (как
+    в локальном режиме silero), и после каждого куска в готовое аудио
+    добавляется настоящая тишина нужной длины — а не фиксированные 0.3 сек
+    между любыми кусками, как было раньше."""
+    import io
+    import time
+    import traceback as tb_module
+    import requests
+    import numpy as np
+    import wave as wave_mod
+
+    rest_url = rest_url.rstrip("/")
+    endpoint = f"{rest_url}/getwav"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    log_path = outdir / "cosyvoice_client.log"
+
+    def log(message: str):
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        print(f"  {message}")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def _error_detail(exc: Exception) -> str:
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            try:
+                return f"HTTP {resp.status_code}: {resp.json().get('detail', resp.text)[:500]}"
+            except Exception:
+                return f"HTTP {resp.status_code}: {resp.text[:500]}"
+        return f"{type(exc).__name__}: {exc}"
+
+    def _get_with_retry(params: dict, retries: int = 3, backoff_s: float = 5.0):
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                # CosyVoice-синтез заметно медленнее Silero даже на GPU
+                # (секунды на фразу) — таймаут увеличен с запасом.
+                resp = requests.get(endpoint, params=params, timeout=600)
+                resp.raise_for_status()
+                return resp
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                if attempt < retries:
+                    log(f"сервис недоступен ({type(e).__name__}), попытка {attempt}/{retries}, "
+                        f"жду {backoff_s:.0f} сек и пробую снова...")
+                    time.sleep(backoff_s)
+            except requests.exceptions.HTTPError as e:
+                raise e
+        raise last_exc
+
+    def synth_chunk(plain_text_chunk: str, chunk_no: int, idx: int, title: str,
+                     chunk_voice: str) -> "np.ndarray":
+        if not _text_has_speakable_content(plain_text_chunk):
+            return np.zeros(int(sample_rate * 0.1), dtype=np.float32)
+        try:
+            resp = _get_with_retry({
+                "text_to_speech": plain_text_chunk,
+                "voice": chunk_voice,
+                "sample_rate": sample_rate,
+            })
+        except Exception as e:
+            log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] ОШИБКА: не удалось синтезировать "
+                f"({_error_detail(e)}). Вставляю тишину вместо фрагмента, чтобы не потерять "
+                f"место в главе — ЭТО НЕ НОРМАЛЬНО, проверьте логи сервиса CosyVoice "
+                f"(cosyvoice_rest_service.log в папке CosyVoice) — обычно причина в том, "
+                f"что модель или голосовой профиль не загрузились при старте сервиса.")
+            log("Полный traceback последней ошибки:\n" + tb_module.format_exc())
+            silence_seconds = max(1.0, min(8.0, len(plain_text_chunk) / 15))
+            return np.zeros(int(sample_rate * silence_seconds), dtype=np.float32)
+
+        with wave_mod.open(io.BytesIO(resp.content), "rb") as wf:
+            n = wf.getnframes()
+            pcm = wf.readframes(n)
+            audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
+        if audio.size == 0 or float(np.abs(audio).max()) < 1e-4:
+            log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] ПРЕДУПРЕЖДЕНИЕ: сервис вернул "
+                f"пустой или практически беззвучный WAV (без ошибки HTTP) — если это "
+                f"повторяется на каждом фрагменте, скорее всего профиль голоса "
+                f"{chunk_voice!r} не загрузился на сервисе (см. cosyvoice_rest_service.log).")
+        return audio
+
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
+
+    for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
+        fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
+        out_path = outdir / fname
+
+        fingerprint = _params_fingerprint(
+            text, mode="cosyvoice", voice=voice, sample_rate=sample_rate, max_len=max_len,
+            sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
+            comma_break_ms=comma_break_ms,
+            dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
+            attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
+        )
+        if _is_already_done(out_path, fingerprint):
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
+            if play:
+                print("  Проигрывание...")
+                (play_fn or play_file)(out_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
+            continue
+
+        print(f"[{idx}/{len(chapters)}] Озвучиваю (CosyVoice): {title} -> {fname}")
+
+        voice_groups = resolve_voice_groups(text, voice, dialogue_voices, outdir,
+                                             attribution=attribution, log_fn=log)
+        # Как и в локальном режиме silero: режем на куски по пунктуации и
+        # для каждого куска сразу знаем длину паузы (мс) ПОСЛЕ него.
+        segments = []  # [(текст, пауза_мс, профиль_голоса), ...]
+        for group_voice, group_text in voice_groups:
+            for part_text, pause_ms in _segments_with_pauses(
+                group_text, sentence_break_ms=sentence_break_ms,
+                paragraph_break_ms=paragraph_break_ms, comma_break_ms=comma_break_ms,
+                max_chars=max_len,
+            ):
+                if part_text.strip():
+                    segments.append((part_text, pause_ms, group_voice))
+
+        audio_parts = []
+        segs_total = len(segments) or 1
+        if on_progress:
+            on_progress(pos, total, 0, segs_total)
+
+        for seg_i, (part_text, pause_ms, seg_voice) in enumerate(
+            tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
+        ):
+            audio = synth_chunk(part_text, seg_i, idx, title, seg_voice)
+            audio_parts.append(audio)
+            if pause_ms > 0:
+                audio_parts.append(np.zeros(int(sample_rate * pause_ms / 1000), dtype=np.float32))
+            if on_progress:
+                on_progress(pos, total, seg_i, segs_total)
+
+        if not audio_parts:
+            continue
+
+        full_audio = np.concatenate(audio_parts)
+        with wave_mod.open(str(out_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            pcm = (full_audio * 32767).astype(np.int16).tobytes()
+            wf.writeframes(pcm)
+
+        _save_fingerprint(out_path, fingerprint)
+
+        if play:
+            print("  Проигрывание...")
+            (play_fn or play_file)(out_path)
 
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
     print(f"Подробный лог ошибок (если были): {log_path.resolve()}")
@@ -1924,7 +2173,7 @@ def list_offline_voices():
 
 def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str = "", on_progress=None,
                  chapter_indices=None, char_ranges=None, dialogue_voice_ids=None, attribution=None,
-                 outdir: Path = None):
+                 outdir: Path = None, should_stop=None):
     """outdir здесь используется только для сохранения словаря "персонаж ->
     голос" при dialogue_voice_ids + attribution (offline-режим ничего не
     пишет на диск сам по себе — говорит вслух сразу) — если не передан,
@@ -1956,6 +2205,9 @@ def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str 
                                   char_ranges=char_ranges)
     total = len(selection) or 1
     for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
         print(f"\n[{idx}/{len(chapters)}] {title}")
         if not dialogue_voice_ids:
             if on_progress:
@@ -2002,11 +2254,14 @@ def main():
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
     ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
     ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
-    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "yandex"], default="silero",
+    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "cosyvoice", "yandex"],
+                     default="silero",
                      help="silero = нейросетевой голос локально через torch.hub; "
                           "silero_rest = синтез через Silero-REST-Service с интонационными паузами "
                           "(SSML: паузы на запятых/тире, границах предложений и абзацев, интонация "
-                          "вопросов/восклицаний); yandex = облачный Yandex SpeechKit (платно, нужны "
+                          "вопросов/восклицаний); cosyvoice = локальный сервис CosyVoice (GPU, "
+                          "клонирование голоса по образцу — см. install_cosyvoice.bat); "
+                          "yandex = облачный Yandex SpeechKit (платно, нужны "
                           "--yandex-api-key и --yandex-folder-id); online = gTTS (интернет); "
                           "offline = pyttsx3 (без интернета)")
     ap.add_argument("--outdir", type=Path, default=Path("audiobook_output"),
@@ -2040,8 +2295,22 @@ def main():
     ap.add_argument("--list", action="store_true", help="только показать список глав и выйти")
     ap.add_argument("--rest-url", type=str, default="http://localhost:5010",
                      help="адрес Silero-REST-Service для режима silero_rest")
+    ap.add_argument("--cosyvoice-rest-url", type=str, default=COSYVOICE_DEFAULT_REST_URL,
+                     help="адрес сервиса cosyvoice_rest_service.py для режима cosyvoice "
+                          f"(по умолчанию {COSYVOICE_DEFAULT_REST_URL})")
+    ap.add_argument("--cosyvoice-voice", type=str, default="default",
+                     help="имя профиля голоса CosyVoice (см. GET /voices сервиса) — по умолчанию "
+                          "'default', встроенный образец, который ставит install_cosyvoice.bat")
+    ap.add_argument("--cosyvoice-dialogue-voices", type=str, default="",
+                     help="список имён профилей голоса CosyVoice через запятую — если задан, "
+                          "реплики диалогов по очереди озвучиваются этими профилями вместо "
+                          "--cosyvoice-voice (режим cosyvoice)")
+    ap.add_argument("--cosyvoice-max-len", type=int, default=400,
+                     help="макс. длина куска текста за один вызов CosyVoice, символов "
+                          "(по умолчанию 400 — CosyVoice медленнее Silero, куски короче удобнее "
+                          "для прогресса/повторов при сбое)")
     ap.add_argument("--sentence-break-ms", type=int, default=320,
-                     help="пауза между предложениями в silero/silero_rest-режимах (мс)")
+                     help="пауза между предложениями в silero/silero_rest/cosyvoice-режимах (мс)")
     ap.add_argument("--paragraph-break-ms", type=int, default=550,
                      help="пауза между абзацами в silero/silero_rest-режимах (мс)")
     ap.add_argument("--comma-break-ms", type=int, default=180,
@@ -2181,6 +2450,14 @@ def main():
                          args.comma_break_ms, emphasize=not args.no_emphasis, model_id=args.model,
                          chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
                          attribution=attribution)
+    elif args.mode == "cosyvoice":
+        cosyvoice_dialogue_voices = [v.strip() for v in args.cosyvoice_dialogue_voices.split(",") if v.strip()] or None
+        run_cosyvoice(chapters, args.outdir, args.start, args.cosyvoice_voice, args.sample_rate, args.play,
+                      args.cosyvoice_rest_url, sentence_break_ms=args.sentence_break_ms,
+                      paragraph_break_ms=args.paragraph_break_ms, comma_break_ms=args.comma_break_ms,
+                      max_len=args.cosyvoice_max_len,
+                      chapter_indices=chapter_indices, dialogue_voices=cosyvoice_dialogue_voices,
+                      attribution=attribution)
     elif args.mode == "yandex":
         api_key = args.yandex_api_key or os.environ.get("YANDEX_API_KEY", "")
         folder_id = args.yandex_folder_id or os.environ.get("YANDEX_FOLDER_ID", "")

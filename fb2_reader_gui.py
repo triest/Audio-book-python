@@ -21,9 +21,12 @@ from fb2_reader import (
     DEFAULT_ATTRIBUTION_MODEL, ATTRIBUTION_PROVIDERS, DEFAULT_ATTRIBUTION_PROVIDER,
     TTS_MODES,
     YANDEX_VOICES,
+    COSYVOICE_DEFAULT_REST_URL,
+    cosyvoice_list_voices,
     list_offline_voices,
     parse_fb2,
     play_file,
+    run_cosyvoice,
     run_offline,
     run_online,
     run_silero,
@@ -41,8 +44,121 @@ from silero_config import (
 )
 
 
+def _app_dir() -> Path:
+    """Папка, где лежит программа. В обычном запуске (python fb2_reader_gui.py)
+    это папка со скриптом. В собранной PyInstaller-версии (.exe) __file__
+    указывает на временную папку распаковки, которая меняется при каждом
+    запуске — поэтому там нужно брать папку, где лежит сам .exe."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _make_logs_dir() -> Path:
+    """Отдельная папка "logs" рядом с программой — куда пишется файл
+    журнала. Если её почему-то не удаётся создать там (например, программа
+    лежит в защищённой системной папке без прав на запись — на некоторых
+    компьютерах это Program Files), используем временную папку системы как
+    запасной вариант, чтобы журнал всё равно куда-то писался, а не терялся
+    молча."""
+    primary = _app_dir() / "logs"
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        probe = primary / ".write_test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return primary
+    except Exception:
+        import tempfile
+        fallback = Path(tempfile.gettempdir()) / "fb2_reader_logs"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return fallback
+
+
+LOGS_DIR = _make_logs_dir()
+LOG_FILE_PATH = LOGS_DIR / "fb2_reader_gui.log"
+_log_file_handle = None
+_log_file_open_failed = False
+
+
+LOG_FILE_MAX_BYTES = 2_000_000  # ~2 МБ — после этого старый файл переносится в .1, чтобы не расти бесконечно
+
+# Должно совпадать с SERVICE_VERSION в cosyvoice_rest_service.py. Программа
+# сверяет его через /health и, если уже запущенный сервис отвечает старой
+# версией, сама перезапускает его - иначе после обновления файлов сервис
+# продолжал бы молча работать со старым кодом, пока пользователь не
+# перезапустит компьютер вручную (именно так сломалось удаление голосов).
+COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.4"
+
+# Движки синтеза, которые умеет запускать cosyvoice_rest_service.py (см. его
+# ENGINE/TTS_ENGINE) - код (ключ словаря) идёт в переменную окружения
+# TTS_ENGINE процесса сервиса и сравнивается со значением, которое сервис
+# сам сообщает в /health ("engine"), человекочитаемая подпись - то, что
+# видит пользователь в выпадающем списке на вкладке «Голоса CosyVoice».
+COSYVOICE_ENGINE_LABELS = {
+    "f5": "F5-TTS-Russian (рекомендуется)",
+    "xtts": "XTTS-v2 (запасной)",
+}
+COSYVOICE_ENGINE_CODES = {label: code for code, label in COSYVOICE_ENGINE_LABELS.items()}
+COSYVOICE_DEFAULT_ENGINE = "f5"
+
+
+def _write_log_file(s: str):
+    """Дублирует всё, что попадает в окно «Журнал» (и вообще все ошибки —
+    см. _install_error_logging), в текстовый файл в папке logs/ рядом с
+    программой — окно журнала в tkinter не всегда удобно копировать мышью,
+    а из обычного файла (Блокнотом или чем угодно) можно скопировать что
+    угодно без проблем.
+
+    Файл ДОПИСЫВАЕТСЯ между запусками программы (а не перезаписывается с
+    нуля каждый раз) — раньше он открывался в режиме "w" (перезапись), из-за
+    чего при каждом новом запуске программы весь журнал предыдущего запуска
+    стирался; если ошибка случалась в одном запуске, а посмотреть файл
+    получалось только после следующего — важные строки уже пропадали.
+    Теперь только при СТАРТЕ программы, если файл вырос больше ~2 МБ, он
+    переименовывается в fb2_reader_gui.log.1 (затирая предыдущий .1) — так
+    файл не растёт бесконечно, но и не обнуляется просто от перезапуска."""
+    global _log_file_handle, _log_file_open_failed
+    if _log_file_handle is None:
+        try:
+            if LOG_FILE_PATH.exists() and LOG_FILE_PATH.stat().st_size > LOG_FILE_MAX_BYTES:
+                rotated = LOG_FILE_PATH.with_suffix(LOG_FILE_PATH.suffix + ".1")
+                try:
+                    rotated.unlink(missing_ok=True)
+                    LOG_FILE_PATH.rename(rotated)
+                except Exception:
+                    pass  # не критично - просто продолжим дописывать в тот же файл
+            _log_file_handle = open(LOG_FILE_PATH, "a", encoding="utf-8", buffering=1)
+            _log_file_handle.write(f"\n=== Запуск программы: {LOG_FILE_PATH} ===\n")
+        except Exception:
+            _log_file_handle = False  # не удалось открыть — больше не пробуем
+            _log_file_open_failed = True
+    if _log_file_handle:
+        try:
+            _log_file_handle.write(s)
+        except Exception:
+            pass
+
+
+def _log_exception_to_file(context: str, exc_info=None):
+    """Пишет в файл журнала полный traceback (не только текст ошибки) —
+    используется и глобальным обработчиком необработанных исключений, и
+    отдельными местами в коде, где ошибка перехватывается вручную (запуск
+    сервисов, сетевые запросы и т.п.), чтобы для диагностики всегда было
+    видно, что именно произошло и где."""
+    import traceback
+    if exc_info is None:
+        exc_info = sys.exc_info()
+    tb_text = "".join(traceback.format_exception(*exc_info)) if exc_info[0] else ""
+    _write_log_file(f"\n--- ОШИБКА ({context}) ---\n{tb_text}\n")
+
+
 class TextRedirector(io.TextIOBase):
-    """Перенаправляет print() в текстовое поле GUI."""
+    """Перенаправляет print() в текстовое поле GUI (и дублирует в файл
+    журнала — см. _write_log_file)."""
 
     def __init__(self, widget: tk.Text, tag: str = "log"):
         self.widget = widget
@@ -51,6 +167,7 @@ class TextRedirector(io.TextIOBase):
     def write(self, s: str) -> int:
         if not s:
             return 0
+        _write_log_file(s)
         self.widget.after(0, self._append, s)
         return len(s)
 
@@ -64,16 +181,6 @@ class TextRedirector(io.TextIOBase):
         pass
 
 
-def _app_dir() -> Path:
-    """Папка, где лежит программа. В обычном запуске (python fb2_reader_gui.py)
-    это папка со скриптом. В собранной PyInstaller-версии (.exe) __file__
-    указывает на временную папку распаковки, которая меняется при каждом
-    запуске — поэтому там нужно брать папку, где лежит сам .exe."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
 SETTINGS_PATH = _app_dir() / "fb2_reader_settings.json"
 
 # Какие поля запоминаются между запусками программы (имя атрибута-переменной
@@ -81,6 +188,7 @@ SETTINGS_PATH = _app_dir() / "fb2_reader_settings.json"
 SETTINGS_FIELDS = [
     "mode_var", "model_var", "start_var", "outdir_var", "play_var",
     "sample_rate_var", "rest_url_var", "auto_start_rest_var", "rate_var",
+    "cosyvoice_rest_url_var", "cosyvoice_engine_var",
     "sentence_break_var", "paragraph_break_var", "comma_break_var",
     "accent_var", "yo_var", "emphasis_var",
     "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
@@ -125,7 +233,31 @@ class AudiobookApp(tk.Tk):
         self._worker: threading.Thread | None = None
         self._stop_requested = False
         self._offline_voices: list[dict] = []
+        self._cosyvoice_voices: list[str] = []
         self._rest_proc: subprocess.Popen | None = None
+        self._cosyvoice_proc: subprocess.Popen | None = None
+        self._mixer_ready = False
+
+        # Запоминаем последнюю папку, открытую в каждом отдельном диалоге
+        # выбора файла/папки (книга, папка вывода, образец голоса CosyVoice
+        # и т.п.) - каждый ключ своей собственный, независимо от остальных,
+        # чтобы не приходилось каждый раз заново переходить в нужную папку.
+        # Сохраняется в fb2_reader_settings.json вместе с остальными
+        # настройками (см. _load_settings/_save_settings).
+        self._last_dirs: dict = {}
+
+        # --- состояние встроенного плеера ---
+        self._player_path: Path | None = None
+        self._player_duration = 0.0     # секунд
+        self._player_position = 0.0     # секунд — сохранённая позиция (когда не играет)
+        self._player_state = "stopped"  # "stopped" | "paused" | "playing"
+        self._player_play_wall_start = 0.0
+        self._player_seek_dragging = False
+        self._player_tick_job: str | None = None
+        self._player_block_event: threading.Event | None = None
+        self._player_load_token = 0     # чтобы отбросить устаревший расчёт длительности,
+                                         # если пользователь успел выбрать другую главу
+        self._player_updating_scale = False  # True, пока сама программа двигает ползунок
 
         self._build_ui()
         self._bind_events()
@@ -155,6 +287,9 @@ class AudiobookApp(tk.Tk):
                 var.set(data[name])
             except Exception:
                 pass
+        last_dirs = data.get("_last_dirs")
+        if isinstance(last_dirs, dict):
+            self._last_dirs = {str(k): str(v) for k, v in last_dirs.items()}
         # mode_var/model_var могли поменяться — обновить зависящие от них
         # виджеты (список голосов, доступность полей и т.п.)
         self._on_model_changed()
@@ -176,6 +311,7 @@ class AudiobookApp(tk.Tk):
                 data[name] = var.get()
             except Exception:
                 pass
+        data["_last_dirs"] = self._last_dirs
         try:
             SETTINGS_PATH.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -188,7 +324,16 @@ class AudiobookApp(tk.Tk):
         if "vista" in style.theme_names():
             style.theme_use("vista")
 
-        outer = ttk.Frame(self, padding=10)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+
+        main_tab = ttk.Frame(self.notebook)
+        self.notebook.add(main_tab, text="Озвучка")
+
+        voices_tab = ttk.Frame(self.notebook)
+        self.notebook.add(voices_tab, text="Голоса CosyVoice")
+
+        outer = ttk.Frame(main_tab, padding=10)
         outer.pack(fill="both", expand=True)
 
         # --- верх: выбор файла ---
@@ -278,9 +423,45 @@ class AudiobookApp(tk.Tk):
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(btn_row, text="Остановить", command=self.request_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(btn_row, text="Прослушать выбранную главу", command=self.play_selected_chapter).pack(
-            side="right"
+
+        # --- встроенный плеер: играет уже озвученную главу (выбранную в
+        # списке слева) или очередную главу сразу после её озвучки (если
+        # включено "Проигрывать после озвучки каждой главы"). Раньше
+        # проигрывание шло через системный проигрыватель/winsound без
+        # какой-либо возможности остановить, поставить на паузу или
+        # перемотать — теперь звук идёт через pygame.mixer, которым можно
+        # управлять прямо отсюда: кнопка play/пауза, стоп и полоса
+        # прокрутки (перемотка кликом/перетаскиванием).
+        player_frame = ttk.LabelFrame(right, text="Проигрывание", padding=(8, 4))
+        player_frame.pack(side="bottom", fill="x", pady=(0, 6))
+
+        self.player_title_label = ttk.Label(player_frame, text="Глава не выбрана", foreground="#555")
+        self.player_title_label.pack(anchor="w", fill="x")
+
+        player_seek_row = ttk.Frame(player_frame)
+        player_seek_row.pack(fill="x", pady=(4, 0))
+        self.player_pos_var = tk.DoubleVar(value=0.0)
+        self.player_scale = ttk.Scale(
+            player_seek_row, from_=0, to=1, orient="horizontal",
+            variable=self.player_pos_var, command=self._on_player_scale_move, state="disabled",
         )
+        self.player_scale.pack(side="left", fill="x", expand=True)
+        self.player_scale.bind("<ButtonPress-1>", self._on_player_seek_start)
+        self.player_scale.bind("<ButtonRelease-1>", self._on_player_seek_commit)
+        self.player_time_label = ttk.Label(player_seek_row, text="", width=12, anchor="e")
+        self.player_time_label.pack(side="left", padx=(6, 0))
+
+        player_controls_row = ttk.Frame(player_frame)
+        player_controls_row.pack(fill="x", pady=(4, 0))
+        self.player_play_btn = ttk.Button(
+            player_controls_row, text="▶ Играть", command=self._player_play_pause,
+            state="disabled", width=12,
+        )
+        self.player_play_btn.pack(side="left")
+        self.player_stop_btn = ttk.Button(
+            player_controls_row, text="⏹ Стоп", command=self._player_stop, state="disabled", width=10,
+        )
+        self.player_stop_btn.pack(side="left", padx=(6, 0))
 
         self.progress_label = ttk.Label(right, text="", foreground="#555")
         self.progress_label.pack(side="bottom", fill="x", pady=(0, 6))
@@ -290,8 +471,22 @@ class AudiobookApp(tk.Tk):
         log_frame = ttk.LabelFrame(right, text="Журнал", padding=6)
         log_frame.pack(side="bottom", fill="both", expand=True, pady=(8, 0))
 
-        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled", font=("Consolas", 9))
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_buttons_row = ttk.Frame(log_frame)
+        log_buttons_row.pack(side="bottom", fill="x", pady=(4, 0))
+        ttk.Button(
+            log_buttons_row, text="Копировать всё", command=self._copy_log_to_clipboard
+        ).pack(side="left")
+        ttk.Button(
+            log_buttons_row, text="Открыть файл журнала", command=self._open_log_file
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            log_buttons_row, text=f"Файл: logs\\{LOG_FILE_PATH.name}", foreground="#555"
+        ).pack(side="left", padx=(10, 0))
+
+        log_text_row = ttk.Frame(log_frame)
+        log_text_row.pack(side="top", fill="both", expand=True)
+        self.log_text = tk.Text(log_text_row, height=10, wrap="word", state="disabled", font=("Consolas", 9))
+        log_scroll = ttk.Scrollbar(log_text_row, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
@@ -435,6 +630,17 @@ class AudiobookApp(tk.Tk):
             variable=self.auto_start_rest_var,
         )
         self.auto_start_rest_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+
+        self.cosyvoice_rest_url_var = tk.StringVar(value=COSYVOICE_DEFAULT_REST_URL)
+        self.cosyvoice_engine_var = tk.StringVar(value=COSYVOICE_ENGINE_LABELS[COSYVOICE_DEFAULT_ENGINE])
+        row += 1
+        self.cosyvoice_tab_hint = ttk.Label(
+            settings,
+            text="Список голосов и добавление нового голоса из аудиофайла — "
+                 "на вкладке «Голоса CosyVoice» вверху окна.",
+            foreground="#555", wraplength=280, justify="left",
+        )
+        self.cosyvoice_tab_hint.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
         row += 1
         self.rate_label = ttk.Label(settings, text="Скорость (offline):")
@@ -656,7 +862,7 @@ class AudiobookApp(tk.Tk):
 
         # --- интонация: паузы по знакам препинания, ударения, усиление ---
         intonation = self._intonation_frame = ttk.LabelFrame(
-            right_scroll, text="Интонация и паузы (silero / silero_rest)", padding=10
+            right_scroll, text="Интонация и паузы (silero / silero_rest / cosyvoice)", padding=10
         )
         intonation.pack(fill="x", pady=(8, 0))
 
@@ -683,15 +889,19 @@ class AudiobookApp(tk.Tk):
 
         irow += 1
         self.accent_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(intonation, text="Расставлять ударения автоматически", variable=self.accent_var).grid(
-            row=irow, column=0, columnspan=2, sticky="w", pady=3
+        self.accent_check = ttk.Checkbutton(
+            intonation, text="Расставлять ударения автоматически (только silero/silero_rest)",
+            variable=self.accent_var,
         )
+        self.accent_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
         self.yo_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(intonation, text='Заменять "е" на "ё" где нужно', variable=self.yo_var).grid(
-            row=irow, column=0, columnspan=2, sticky="w", pady=3
+        self.yo_check = ttk.Checkbutton(
+            intonation, text='Заменять "е" на "ё" где нужно (только silero/silero_rest)',
+            variable=self.yo_var,
         )
+        self.yo_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
         self.emphasis_var = tk.BooleanVar(value=True)
@@ -708,32 +918,220 @@ class AudiobookApp(tk.Tk):
         self._populate_silero_voices()
         self._update_mode_dependent_widgets()
 
+        self._build_voices_tab(voices_tab)
+
+    def _build_voices_tab(self, tab: ttk.Frame):
+        """Отдельная вкладка «Голоса CosyVoice»: список уже сохранённых
+        профилей голоса (они хранятся на самом сервисе CosyVoice REST, в
+        cosyvoice_voices.json — сохраняются постоянно и переживают
+        перезапуск программы и сервиса) и форма для добавления нового
+        голоса из аудиофайла — без всплывающего окна, прямо на вкладке."""
+        pad = ttk.Frame(tab, padding=10)
+        pad.pack(fill="both", expand=True)
+
+        ttk.Label(
+            pad,
+            text="Голоса, склонированные из аудиофайлов для режима CosyVoice. "
+                 "Каждый добавленный голос сохраняется на сервисе CosyVoice "
+                 "(в cosyvoice_voices.json рядом с моделью) и остаётся доступен "
+                 "после перезапуска программы и компьютера — его не нужно "
+                 "добавлять заново.",
+            wraplength=680, justify="left", foreground="#555",
+        ).pack(anchor="w", pady=(0, 10))
+
+        url_row = ttk.Frame(pad)
+        url_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(url_row, text="Адрес сервиса CosyVoice:").pack(side="left")
+        self.cosyvoice_rest_url_entry = add_context_menu(
+            ttk.Entry(url_row, textvariable=self.cosyvoice_rest_url_var, width=32)
+        )
+        self.cosyvoice_rest_url_entry.pack(side="left", padx=(6, 0))
+        self.cosyvoice_refresh_btn = ttk.Button(
+            url_row, text="Обновить список", command=self.refresh_cosyvoice_voices
+        )
+        self.cosyvoice_refresh_btn.pack(side="left", padx=(6, 0))
+
+        engine_row = ttk.Frame(pad)
+        engine_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(engine_row, text="Движок синтеза:").pack(side="left")
+        self.cosyvoice_engine_combo = ttk.Combobox(
+            engine_row, textvariable=self.cosyvoice_engine_var, state="readonly",
+            width=34, values=list(COSYVOICE_ENGINE_LABELS.values()),
+        )
+        self.cosyvoice_engine_combo.pack(side="left", padx=(6, 0))
+        self.cosyvoice_engine_combo.bind("<<ComboboxSelected>>", self._on_cosyvoice_engine_changed)
+        ttk.Label(
+            pad,
+            text="F5-TTS-Russian обучена именно на русской речи — рекомендуется. "
+                 "XTTS-v2 — запасной вариант (мультиязычная, ударения на русском менее "
+                 "точные). Голоса, которые вы уже добавили, работают с обоими движками "
+                 "без повторного добавления — переклонировать не нужно. Смена движка "
+                 "перезапускает сервис CosyVoice (может занять время на загрузку модели).",
+            wraplength=680, justify="left", foreground="#555",
+        ).pack(anchor="w", pady=(0, 10))
+
+        body = ttk.Panedwindow(pad, orient="horizontal")
+        body.pack(fill="both", expand=True)
+
+        # --- слева: список уже сохранённых голосов ---
+        list_frame = ttk.LabelFrame(body, text="Сохранённые голоса", padding=8)
+        body.add(list_frame, weight=1)
+
+        list_row = ttk.Frame(list_frame)
+        list_row.pack(fill="both", expand=True)
+        self.cosyvoice_voices_listbox = tk.Listbox(list_row, exportselection=False, height=14)
+        cv_list_scroll = ttk.Scrollbar(list_row, orient="vertical", command=self.cosyvoice_voices_listbox.yview)
+        self.cosyvoice_voices_listbox.configure(yscrollcommand=cv_list_scroll.set)
+        self.cosyvoice_voices_listbox.pack(side="left", fill="both", expand=True)
+        cv_list_scroll.pack(side="right", fill="y")
+
+        ttk.Label(
+            list_frame,
+            text="Голос, выбранный здесь, используется как основной, если на "
+                 "вкладке «Озвучка» стоит режим CosyVoice.",
+            wraplength=280, foreground="#555", justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        self._cv_delete_btn = ttk.Button(
+            list_frame, text="Удалить выбранный голос",
+            command=self._delete_selected_cosyvoice_voice,
+        )
+        self._cv_delete_btn.pack(anchor="w", pady=(6, 0))
+
+        # --- справа: добавление нового голоса из аудио ---
+        add_frame = ttk.LabelFrame(body, text="Добавить голос из аудиофайла", padding=8)
+        body.add(add_frame, weight=1)
+
+        ttk.Label(
+            add_frame,
+            text="Короткая (3-10 сек) чистая запись голоса без музыки и шума — "
+                 "например, фрагмент записи любимого диктора.",
+            wraplength=300, foreground="#555", justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(add_frame, text="Аудиофайл:").grid(row=1, column=0, sticky="w", pady=4)
+        self._cv_add_audio_path_var = tk.StringVar()
+        add_context_menu(
+            ttk.Entry(add_frame, textvariable=self._cv_add_audio_path_var, width=26)
+        ).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Button(add_frame, text="…", width=3, command=self._browse_cosyvoice_audio).grid(
+            row=1, column=2, padx=(4, 0), pady=4
+        )
+
+        ttk.Label(add_frame, text="Имя голоса:").grid(row=2, column=0, sticky="w", pady=4)
+        self._cv_add_name_var = tk.StringVar()
+        add_context_menu(
+            ttk.Entry(add_frame, textvariable=self._cv_add_name_var, width=26)
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
+
+        ttk.Label(add_frame, text="Текст записи:").grid(row=3, column=0, sticky="nw", pady=4)
+        self._cv_add_text_widget = tk.Text(add_frame, width=26, height=4, wrap="word")
+        self._cv_add_text_widget.grid(row=3, column=1, columnspan=2, sticky="ew", pady=4)
+
+        self._cv_transcribe_btn = ttk.Button(
+            add_frame, text="Распознать текст (по аудио)", command=self._transcribe_cosyvoice_audio,
+        )
+        self._cv_transcribe_btn.grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 4))
+
+        ttk.Label(
+            add_frame,
+            text="Движок клонирования голоса — F5-TTS-Russian (обучена именно на русской "
+                 "речи). Текст записи желателен для лучшего клонирования — если оставить "
+                 "пустым, сервис сам распознает его при первом использовании голоса. Для "
+                 "лучшего результата берите 6-15 секунд чистой речи одного голоса без "
+                 "музыки и шума.",
+            wraplength=300, foreground="#555", justify="left",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        self._cv_add_status_label = ttk.Label(add_frame, text="", foreground="#555", wraplength=300, justify="left")
+        self._cv_add_status_label.grid(row=6, column=0, columnspan=3, sticky="w")
+
+        self._cv_add_btn = ttk.Button(add_frame, text="Добавить голос", command=self._add_cosyvoice_voice_from_tab)
+        self._cv_add_btn.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        add_frame.columnconfigure(1, weight=1)
+
+        self.cosyvoice_voices_listbox.bind("<<ListboxSelect>>", self._on_cosyvoice_voices_listbox_select)
+
+        self._refresh_cosyvoice_voices_listbox()
+
     def _bind_events(self):
         self.mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_changed())
         self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def log(self, message: str):
+        _write_log_file(message + "\n")
         self.log_text.configure(state="normal")
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _copy_log_to_clipboard(self):
+        """Копирует весь текст журнала в буфер обмена одной кнопкой — на
+        случай, если выделение мышью в самом окне журнала работает
+        неудобно (так бывает в некоторых версиях tkinter, когда текст в
+        поле переведён в состояние "только для чтения")."""
+        text = self.log_text.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.log("(Весь журнал скопирован в буфер обмена.)")
+
+    def _open_log_file(self):
+        """Открывает файл журнала (fb2_reader_gui.log рядом с программой)
+        в обычной программе для просмотра текста, откуда его можно
+        свободно выделять и копировать — в отличие от окна журнала внутри
+        программы."""
+        if _log_file_handle:
+            try:
+                _log_file_handle.flush()
+            except Exception:
+                pass
+        if not LOG_FILE_PATH.exists():
+            messagebox.showinfo("Файл журнала", f"Файл ещё не создан: {LOG_FILE_PATH}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(LOG_FILE_PATH))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(LOG_FILE_PATH)])
+            else:
+                subprocess.Popen(["xdg-open", str(LOG_FILE_PATH)])
+        except Exception as e:
+            messagebox.showerror("Файл журнала", f"Не удалось открыть файл:\n{LOG_FILE_PATH}\n\n{e}")
+
+    def _get_last_dir(self, key: str) -> str:
+        """Последняя папка, открытая в диалоге с этим ключом (свой для
+        каждого отдельного диалога — книга, папка вывода, образец голоса и
+        т.п.), или пустая строка, если такого диалога ещё не открывали."""
+        return self._last_dirs.get(key, "")
+
+    def _remember_last_dir(self, key: str, path: str):
+        d = os.path.dirname(path) if os.path.isfile(path) or not os.path.isdir(path) else path
+        if d:
+            self._last_dirs[key] = d
+
     def browse_book(self):
         path = filedialog.askopenfilename(
             title="Выберите FB2-книгу",
+            initialdir=self._get_last_dir("book") or None,
             filetypes=[
                 ("FB2 книги", "*.fb2 *.fb2.zip *.zip"),
                 ("Все файлы", "*.*"),
             ],
         )
         if path:
+            self._remember_last_dir("book", path)
             self.book_var.set(path)
             self.reload_book()
 
     def browse_outdir(self):
-        path = filedialog.askdirectory(title="Папка для сохранения аудио")
+        path = filedialog.askdirectory(
+            title="Папка для сохранения аудио",
+            initialdir=self._get_last_dir("outdir") or None,
+        )
         if path:
+            self._remember_last_dir("outdir", path)
             self.outdir_var.set(path)
 
     def reload_book(self):
@@ -765,6 +1163,7 @@ class AudiobookApp(tk.Tk):
             self.chapters_list.insert("end", f"{i:3d}. {ch_title}  ({len(text)} симв.)")
         self.start_spin.configure(to=max(1, len(chapters)))
         self._on_chapters_selection_change()
+        self.log(f"Загружена книга «{title}» — {len(chapters)} глав.")
 
     def _on_chapters_selection_change(self, event=None):
         """Включает/выключает поля "кусок главы" в зависимости от того,
@@ -793,7 +1192,7 @@ class AudiobookApp(tk.Tk):
                 if len(sel) != 1 else self.char_range_hint.cget("text")
             )
         self.start_var.set(1)
-        self.log(f"Загружена книга «{title}» — {len(chapters)} глав.")
+        self.refresh_player_for_selection()
 
     def _populate_silero_voices(self, model_id: str | None = None):
         if model_id is None:
@@ -937,6 +1336,378 @@ class AudiobookApp(tk.Tk):
         self.voice_combo.configure(values=["Google TTS — русский (выбор голоса недоступен)"], state="disabled")
         self.voice_combo.current(0)
 
+    def _set_cosyvoice_voices(self):
+        if not self._cosyvoice_voices:
+            labels = ["(нет голосов — нажмите «Обновить голоса»)"]
+            self.voice_combo.configure(values=labels, state="disabled")
+            self.voice_combo.current(0)
+            return
+        self.voice_combo.configure(values=list(self._cosyvoice_voices), state="readonly")
+        default_idx = self._cosyvoice_voices.index("default") if "default" in self._cosyvoice_voices else 0
+        self.voice_combo.current(default_idx)
+
+    def refresh_cosyvoice_voices(self):
+        """Запрашивает у сервиса CosyVoice REST текущий список профилей
+        голоса (GET /voices) в фоновом потоке, чтобы не подвешивать окно
+        на время сетевого запроса (сервис может ещё загружать модель)."""
+        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
+        self.cosyvoice_refresh_btn.configure(state="disabled")
+        self.log(f"Запрашиваю список голосов CosyVoice у {rest_url} …")
+
+        def worker():
+            if self._rest_url_is_local(rest_url) and not self._ping_rest_service(rest_url):
+                self.after(0, lambda: self.log(
+                    "Сервис CosyVoice ещё не запущен — запускаю его автоматически…"
+                ))
+                self._ensure_cosyvoice_service_running(rest_url)
+            try:
+                voices = cosyvoice_list_voices(rest_url)
+            except Exception:
+                voices = []
+            self.after(0, lambda: self._on_cosyvoice_voices_fetched(voices))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cosyvoice_voices_fetched(self, voices: list):
+        self.cosyvoice_refresh_btn.configure(state="normal")
+        self._cosyvoice_voices = voices
+        if not voices:
+            self.log(
+                "Не удалось получить голоса CosyVoice — сервис не отвечает или ещё "
+                "загружает модель (первый запуск после старта сервиса может занять "
+                "некоторое время). Убедитесь, что сервис запущен, и попробуйте ещё раз. "
+                "Если это повторяется — смотрите logs\\fb2_reader_gui.log и "
+                "CosyVoice\\cosyvoice_rest_service.log за подробностями."
+            )
+        else:
+            self.log(f"Голоса CosyVoice: {', '.join(voices)}")
+        if self._current_mode() == "cosyvoice":
+            self._set_cosyvoice_voices()
+            self._populate_dialogue_list()
+        self._refresh_cosyvoice_voices_listbox()
+
+    def _selected_cosyvoice_voice(self) -> str:
+        idx = self.voice_combo.current()
+        if idx < 0 or idx >= len(self._cosyvoice_voices):
+            return "default"
+        return self._cosyvoice_voices[idx]
+
+    def _refresh_cosyvoice_voices_listbox(self):
+        """Перезаполняет список на вкладке «Голоса CosyVoice» текущим
+        содержимым self._cosyvoice_voices (обновляется через
+        refresh_cosyvoice_voices / после добавления нового голоса)."""
+        if not hasattr(self, "cosyvoice_voices_listbox"):
+            return
+        self.cosyvoice_voices_listbox.delete(0, "end")
+        for name in self._cosyvoice_voices:
+            self.cosyvoice_voices_listbox.insert("end", name)
+
+    def _on_cosyvoice_voices_listbox_select(self, _event=None):
+        """Выбор голоса в списке на вкладке «Голоса» делает его основным
+        голосом режима CosyVoice на вкладке «Озвучка» (если этот режим
+        сейчас выбран) — чтобы не нужно было переключаться между вкладками
+        и заново искать нужный голос в выпадающем списке."""
+        sel = self.cosyvoice_voices_listbox.curselection()
+        if not sel:
+            return
+        name = self.cosyvoice_voices_listbox.get(sel[0])
+        if self._current_mode() == "cosyvoice" and name in self._cosyvoice_voices:
+            self.voice_combo.current(self._cosyvoice_voices.index(name))
+
+    def _delete_selected_cosyvoice_voice(self):
+        """Удаляет выбранный в списке на вкладке «Голоса CosyVoice» профиль
+        голоса — и на сервисе (cosyvoice_voices.json + сам WAV-файл), и в
+        списке в программе. Голос "default" (ставится при установке из
+        штатного примера CosyVoice) тоже можно удалить, если он не нужен —
+        программа не делает для него исключения."""
+        sel = self.cosyvoice_voices_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Удалить голос", "Сначала выберите голос в списке слева.")
+            return
+        name = self.cosyvoice_voices_listbox.get(sel[0])
+        if not messagebox.askyesno(
+            "Удалить голос",
+            f"Удалить голос «{name}»? Это действие нельзя отменить — "
+            "образец придётся добавлять заново, если он снова понадобится.",
+        ):
+            return
+
+        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
+        self._cv_delete_btn.configure(state="disabled")
+
+        def worker():
+            try:
+                if self._rest_url_is_local(rest_url):
+                    self.after(0, lambda: self.log(
+                        "Проверяю сервис CosyVoice (при необходимости запущу/перезапущу "
+                        "его автоматически)…"
+                    ))
+                    if not self._ensure_cosyvoice_service_running(rest_url):
+                        raise RuntimeError(
+                            "Не удалось автоматически запустить сервис CosyVoice — "
+                            "подробности в журнале выше и в logs\\fb2_reader_gui.log."
+                        )
+                import requests
+                from urllib.parse import quote
+                resp = requests.delete(f"{rest_url}/voices/{quote(name)}", timeout=30)
+                if resp.status_code != 200:
+                    detail = resp.json().get("detail", resp.text) if resp.content else resp.text
+                    raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
+                data = resp.json()
+                self.after(0, lambda: self._on_cosyvoice_voice_deleted(data))
+            except Exception as e:
+                _log_exception_to_file("удаление голоса CosyVoice")
+                err = str(e)
+                self.after(0, lambda t=err: self._on_cosyvoice_voice_delete_failed(t))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cosyvoice_voice_deleted(self, data: dict):
+        self._cv_delete_btn.configure(state="normal")
+        self._cosyvoice_voices = data.get("voices") or []
+        self._refresh_cosyvoice_voices_listbox()
+        self.log(f"Голос «{data.get('name')}» удалён.")
+        if self._current_mode() == "cosyvoice":
+            self._set_cosyvoice_voices()
+            self._populate_dialogue_list()
+
+    def _on_cosyvoice_voice_delete_failed(self, err: str):
+        self._cv_delete_btn.configure(state="normal")
+        messagebox.showerror("Удалить голос", f"Не удалось удалить голос:\n{err}")
+        self.log(f"Не удалось удалить голос CosyVoice: {err}")
+
+    def _browse_cosyvoice_audio(self):
+        path = filedialog.askopenfilename(
+            title="Выберите аудиофайл с образцом голоса",
+            initialdir=self._get_last_dir("cosyvoice_audio") or None,
+            filetypes=[
+                ("Аудио", "*.wav *.mp3 *.flac *.ogg *.m4a"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if path:
+            self._remember_last_dir("cosyvoice_audio", path)
+            self._cv_add_audio_path_var.set(path)
+            if not self._cv_add_name_var.get().strip():
+                self._cv_add_name_var.set(Path(path).stem)
+
+    def _transcribe_cosyvoice_audio(self):
+        """Отправляет выбранный аудиофайл сервису CosyVoice (POST
+        /transcribe) на распознавание речи через Whisper и подставляет
+        результат в поле «Текст записи» — чтобы не печатать транскрипт
+        образца вручную. Модель Whisper для распознавания (~500 МБ)
+        скачивается сервисом один раз при первом использовании этой кнопки
+        и дальше берётся из кэша."""
+        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
+        audio_path = self._cv_add_audio_path_var.get().strip()
+        if not audio_path:
+            messagebox.showwarning("Распознать текст", "Сначала выберите аудиофайл с образцом голоса.")
+            return
+
+        self._cv_transcribe_btn.configure(state="disabled")
+        self._cv_add_status_label.configure(
+            text="Готовлю файл к отправке на распознавание…"
+        )
+        # Помимо маленькой подписи под кнопкой (её легко не заметить),
+        # дублируем происходящее в основной журнал — включая периодические
+        # "ещё работаю" сообщения с указанием текущего этапа, пока идёт
+        # сам запрос, чтобы не выглядело, будто программа зависла (первый
+        # запуск с загрузкой модели распознавания может занимать пару
+        # минут без какого-либо ответа).
+        try:
+            size_kb = Path(audio_path).stat().st_size / 1024
+        except Exception:
+            size_kb = 0
+        self.log(f"Распознаю текст образца «{Path(audio_path).name}» ({size_kb:.0f} КБ) через Whisper…")
+
+        stop_ticker = threading.Event()
+
+        def _fmt_elapsed(sec: int) -> str:
+            return f"{sec // 60} мин {sec % 60:02d} сек" if sec >= 60 else f"{sec} сек"
+
+        def ticker():
+            waited = 0
+            while not stop_ticker.wait(10.0):
+                waited += 10
+                if waited <= 30:
+                    stage = "отправляю файл на сервис / сервис ещё может качать модель Whisper (~500 МБ, разово)"
+                else:
+                    stage = "модель Whisper распознаёт речь"
+                self.after(0, lambda w=waited, s=stage: self.log(
+                    f"…распознавание ещё идёт ({_fmt_elapsed(w)}): {s}…"
+                ))
+
+        threading.Thread(target=ticker, daemon=True).start()
+
+        def worker():
+            try:
+                if self._rest_url_is_local(rest_url):
+                    if not self._ensure_cosyvoice_service_running(rest_url):
+                        raise RuntimeError(
+                            "Не удалось запустить сервис CosyVoice — подробности в файле "
+                            f"журнала (logs\\{LOG_FILE_PATH.name}) и в самом окне «Журнал» выше."
+                        )
+                import requests
+                self.after(0, lambda: self.log("Отправляю аудиофайл на сервис…"))
+                try:
+                    with open(audio_path, "rb") as f:
+                        resp = requests.post(
+                            f"{rest_url}/transcribe",
+                            files={"audio": (Path(audio_path).name, f)},
+                            timeout=300,
+                        )
+                except requests.exceptions.ConnectionError as ce:
+                    _log_exception_to_file("подключение к сервису CosyVoice (/transcribe)")
+                    raise RuntimeError(
+                        f"Не удалось подключиться к сервису CosyVoice по адресу {rest_url}."
+                    ) from ce
+                if resp.status_code != 200:
+                    detail = resp.json().get("detail", resp.text) if resp.content else resp.text
+                    raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
+                text = resp.json().get("text", "")
+                self.after(0, lambda: self._on_cosyvoice_audio_transcribed(text))
+            except Exception as e:
+                _log_exception_to_file("распознавание речи CosyVoice")
+                err = str(e)
+                self.after(0, lambda t=err: self._on_cosyvoice_transcribe_failed(t))
+            finally:
+                stop_ticker.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cosyvoice_audio_transcribed(self, text: str):
+        self._cv_transcribe_btn.configure(state="normal")
+        if text:
+            self._cv_add_text_widget.delete("1.0", "end")
+            self._cv_add_text_widget.insert("1.0", text)
+            self._cv_add_status_label.configure(text=f"Готово: распознано {len(text)} симв. — проверьте и поправьте при необходимости.")
+            self.log(f"Текст распознан ({len(text)} символов): {text}")
+        else:
+            self._cv_add_status_label.configure(text="Не удалось распознать текст (пустой результат) — впишите вручную.")
+            self.log("Распознавание вернуло пустой текст — впишите текст образца вручную.")
+
+    def _on_cosyvoice_transcribe_failed(self, err: str):
+        self._cv_transcribe_btn.configure(state="normal")
+        self._cv_add_status_label.configure(text=f"Ошибка распознавания: {err}")
+        self.log(f"ОШИБКА распознавания текста CosyVoice: {err}")
+        messagebox.showerror("Распознать текст — ошибка", err)
+
+    def _add_cosyvoice_voice_from_tab(self):
+        """Отправляет форму добавления голоса на вкладке «Голоса CosyVoice»
+        сервису CosyVoice REST (POST /add_voice) — добавленный голос
+        сохраняется на сервисе постоянно (cosyvoice_voices.json) и остаётся
+        доступен после перезапуска, поэтому его достаточно добавить один
+        раз."""
+        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
+        audio_path = self._cv_add_audio_path_var.get().strip()
+        name = self._cv_add_name_var.get().strip()
+        text = self._cv_add_text_widget.get("1.0", "end").strip()
+
+        if not audio_path:
+            messagebox.showwarning("Добавить голос", "Выберите аудиофайл с образцом голоса.")
+            return
+        if not name:
+            messagebox.showwarning("Добавить голос", "Введите имя для нового голоса.")
+            return
+        # Движок клонирования (XTTS-v2) сам тексту образца не требует —
+        # клонирует по одному только аудио. Текст здесь используется
+        # исключительно для истории/справки, поэтому пустое поле больше не
+        # блокируется предупреждением (было актуально для прежнего движка
+        # CosyVoice, у которого без текста образца включался режим
+        # "cross-lingual", не понимавший русский язык).
+
+        self._cv_add_btn.configure(state="disabled")
+        self._cv_add_status_label.configure(text="Отправляю запись сервису CosyVoice, подождите…")
+        try:
+            size_kb = Path(audio_path).stat().st_size / 1024
+        except Exception:
+            size_kb = 0
+        self.log(f"Добавляю голос «{name}» ({Path(audio_path).name}, {size_kb:.0f} КБ)…")
+
+        stop_ticker = threading.Event()
+
+        def _fmt_elapsed(sec: int) -> str:
+            return f"{sec // 60} мин {sec % 60:02d} сек" if sec >= 60 else f"{sec} сек"
+
+        def ticker():
+            waited = 0
+            while not stop_ticker.wait(10.0):
+                waited += 10
+                self.after(0, lambda w=waited: self.log(
+                    f"…добавление голоса «{name}» ещё идёт ({_fmt_elapsed(w)}): сервис обрабатывает "
+                    "и клонирует запись (при первом запуске здесь же может ещё загружаться модель CosyVoice)…"
+                ))
+
+        threading.Thread(target=ticker, daemon=True).start()
+
+        def worker():
+            try:
+                if self._rest_url_is_local(rest_url) and not self._ping_rest_service(rest_url):
+                    self.after(0, lambda: self._cv_add_status_label.configure(
+                        text="Сервис CosyVoice ещё не запущен — запускаю автоматически…"
+                    ))
+                    self.after(0, lambda: self.log("Сервис CosyVoice ещё не запущен — запускаю автоматически…"))
+                    if not self._ensure_cosyvoice_service_running(rest_url):
+                        raise RuntimeError(
+                            "Не удалось запустить сервис CosyVoice — подробности в файле "
+                            f"журнала (logs\\{LOG_FILE_PATH.name}) и в самом окне «Журнал» выше."
+                        )
+                import requests
+                self.after(0, lambda: self.log("Сервис запущен, отправляю аудиофайл и текст…"))
+                try:
+                    with open(audio_path, "rb") as f:
+                        resp = requests.post(
+                            f"{rest_url}/add_voice",
+                            data={"name": name, "text": text},
+                            files={"audio": (Path(audio_path).name, f)},
+                            timeout=120,
+                        )
+                except requests.exceptions.ConnectionError as ce:
+                    _log_exception_to_file("подключение к сервису CosyVoice (/add_voice)")
+                    raise RuntimeError(
+                        f"Не удалось подключиться к сервису CosyVoice по адресу {rest_url} "
+                        "(соединение отклонено — сервис не запущен или ещё не успел "
+                        "подняться). Проверьте, что install.bat полностью и без ошибок "
+                        "поставил CosyVoice (папки CosyVoice\\ и .venv_cosyvoice должны "
+                        "существовать), и посмотрите файл журнала на подробности."
+                    ) from ce
+                if resp.status_code != 200:
+                    detail = resp.json().get("detail", resp.text) if resp.content else resp.text
+                    _write_log_file(f"\n--- /add_voice вернул {resp.status_code} ---\n{detail}\n")
+                    raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
+                data = resp.json()
+                self.after(0, lambda: self._on_cosyvoice_voice_added_from_tab(data))
+            except Exception as e:
+                _log_exception_to_file("добавление голоса CosyVoice")
+                err = str(e)
+                self.after(0, lambda t=err: self._on_cosyvoice_voice_add_failed_in_tab(t))
+            finally:
+                stop_ticker.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cosyvoice_voice_added_from_tab(self, data: dict):
+        self._cv_add_btn.configure(state="normal")
+        self._cv_add_status_label.configure(text=f"Готово: голос «{data.get('name')}» добавлен.")
+        self._cosyvoice_voices = data.get("voices") or self._cosyvoice_voices
+        self._refresh_cosyvoice_voices_listbox()
+        if self._current_mode() == "cosyvoice":
+            self._set_cosyvoice_voices()
+            self._populate_dialogue_list()
+            if data.get("name") in self._cosyvoice_voices:
+                self.voice_combo.current(self._cosyvoice_voices.index(data["name"]))
+        self.log(f"Голос «{data.get('name')}» добавлен и сохранён — доступен в списке «Голос».")
+        # очищаем форму, чтобы можно было сразу добавить следующий голос
+        self._cv_add_audio_path_var.set("")
+        self._cv_add_name_var.set("")
+        self._cv_add_text_widget.delete("1.0", "end")
+
+    def _on_cosyvoice_voice_add_failed_in_tab(self, error: str):
+        self._cv_add_btn.configure(state="normal")
+        self._cv_add_status_label.configure(text=f"Ошибка: {error}")
+        self.log(f"ОШИБКА добавления голоса CosyVoice: {error}")
+        messagebox.showerror("Добавить голос — ошибка", error)
+
     def _set_yandex_voice_placeholder(self):
         self.voice_combo.configure(values=["см. блок «Yandex SpeechKit» ниже"], state="disabled")
         self.voice_combo.current(0)
@@ -961,6 +1732,7 @@ class AudiobookApp(tk.Tk):
     def _update_mode_dependent_widgets(self):
         mode = self._current_mode()
         silero_like = mode in ("silero", "silero_rest")
+        pauses_supported = mode in ("silero", "silero_rest", "cosyvoice")
         self.model_combo.configure(state="readonly" if silero_like else "disabled")
         self.rest_url_entry.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.auto_start_rest_check.configure(state="normal" if mode == "silero_rest" else "disabled")
@@ -975,19 +1747,28 @@ class AudiobookApp(tk.Tk):
         # не перегружать интерфейс полями, которые всё равно ни на что не
         # влияют в этом режиме.
         self._show_row(self.model_label, self.model_row, show=silero_like)
-        self._show_row(self.sample_rate_label, self.sample_rate_combo, show=silero_like)
+        self._show_row(self.sample_rate_label, self.sample_rate_combo, show=silero_like or mode == "cosyvoice")
         self._show_row(self.rest_url_label, self.rest_url_entry, show=mode == "silero_rest")
         self._show_row(self.auto_start_rest_check, show=mode == "silero_rest")
         self._show_row(self.rate_label, self.rate_spin, show=mode == "offline")
+        self._show_row(self.cosyvoice_tab_hint, show=mode == "cosyvoice")
 
-        # Блок Yandex SpeechKit и блок интонации/пауз (актуален только для
-        # Silero) — целиком показываются/прячутся вместе с рамкой.
+        # Блок Yandex SpeechKit и блок интонации/пауз (для Silero и
+        # CosyVoice — у CosyVoice нет SSML, но паузы вставляются вручную
+        # между кусками текста, см. run_cosyvoice) — целиком показываются/
+        # прячутся вместе с рамкой.
         self._yandex_frame.pack_forget()
         self._intonation_frame.pack_forget()
         if mode == "yandex":
             self._yandex_frame.pack(fill="x", pady=(8, 0))
-        if silero_like:
+        if pauses_supported:
             self._intonation_frame.pack(fill="x", pady=(8, 0))
+        # "Усиливать интонацию «?!»" — это SSML-фича самого Silero REST;
+        # ударения/"ё" — фичи самого Silero — у CosyVoice ничего этого нет,
+        # прячем эти конкретные строки внутри общей рамки интонации.
+        self._show_row(self.accent_check, show=silero_like)
+        self._show_row(self.yo_check, show=silero_like)
+        self._show_row(self.emphasis_check, show=mode == "silero_rest")
 
         if mode in ("silero", "silero_rest"):
             self._set_silero_voices()
@@ -995,6 +1776,10 @@ class AudiobookApp(tk.Tk):
             self._set_offline_voices()
         elif mode == "yandex":
             self._set_yandex_voice_placeholder()
+        elif mode == "cosyvoice":
+            self._set_cosyvoice_voices()
+            if not self._cosyvoice_voices:
+                self.refresh_cosyvoice_voices()
         else:
             self._set_online_voice()
 
@@ -1030,6 +1815,8 @@ class AudiobookApp(tk.Tk):
             return [v["id"] for v in self._offline_voices]
         if mode == "yandex":
             return list(self._yandex_voice_keys)
+        if mode == "cosyvoice":
+            return list(self._cosyvoice_voices)
         return []
 
     def _populate_dialogue_list(self):
@@ -1039,7 +1826,7 @@ class AudiobookApp(tk.Tk):
         несколько голосов (Google TTS — нет)."""
         mode = self._current_mode()
         self.dialogue_list.delete(0, "end")
-        supported = mode in ("silero", "silero_rest", "offline", "yandex")
+        supported = mode in ("silero", "silero_rest", "offline", "yandex", "cosyvoice")
 
         if mode in ("silero", "silero_rest"):
             for k in self._silero_voice_keys:
@@ -1056,6 +1843,11 @@ class AudiobookApp(tk.Tk):
         elif mode == "yandex":
             for k, v in YANDEX_VOICES.items():
                 self.dialogue_list.insert("end", f"{k} — {v}")
+        elif mode == "cosyvoice":
+            for k in self._cosyvoice_voices:
+                self.dialogue_list.insert("end", k)
+            if len(self._cosyvoice_voices) < 2:
+                supported = False
 
         if supported:
             self.dialogue_unavailable_label.pack_forget()
@@ -1141,6 +1933,8 @@ class AudiobookApp(tk.Tk):
             main_voice = self._selected_silero_speaker()
         elif mode == "offline":
             main_voice = self._selected_offline_voice_id()
+        elif mode == "cosyvoice":
+            main_voice = self._selected_cosyvoice_voice()
         else:
             return None
         keys = self._dialogue_voice_keys()
@@ -1239,7 +2033,8 @@ class AudiobookApp(tk.Tk):
                     [sys.executable, str(service_path)], **popen_kwargs
                 )
             except Exception as e:
-                self.after(0, lambda: self.log(f"Не удалось запустить сервис Silero REST: {e}"))
+                err = str(e)
+                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис Silero REST: {t}"))
                 return False
 
             def pump_output():
@@ -1274,6 +2069,295 @@ class AudiobookApp(tk.Tk):
             time.sleep(1.0)
 
         self.after(0, lambda: self.log("Сервис Silero REST не успел запуститься за отведённое время."))
+        return False
+
+    @staticmethod
+    def _cosyvoice_model_loaded(url: str, timeout: float = 3.0) -> bool:
+        """В отличие от _ping_rest_service (который считает сервис рабочим
+        по любому HTTP-ответу), здесь мы проверяем именно то, что модель
+        CosyVoice реально загрузилась И что запущенный сервис - это
+        актуальная версия кода (через отдельный эндпоинт /health).
+
+        Без первой проверки зависший с прошлого раза процесс с ошибкой при
+        загрузке модели выглядел бы для программы как "уже запущен и всё
+        хорошо", и она бы просто продолжала слать в него запросы, каждый
+        раз получая HTTP 500 без единой новой попытки перезапуска.
+
+        Без второй проверки (версия) уже РАБОТАЮЩИЙ (с успешно загруженной
+        моделью) сервис, оставшийся с прошлого запуска программы, считался
+        бы полностью готовым даже после того, как сам файл
+        cosyvoice_rest_service.py обновился на диске — из-за чего новые
+        эндпоинты и исправления молча не действовали бы, пока пользователь
+        не перезапустит компьютер вручную (именно так один раз сломалось
+        удаление голосов: старый процесс просто не знал про /voices/{name})."""
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if not data.get("model_loaded"):
+                    return False
+                # Сверяем строго, включая случай "поля вообще нет" (значит,
+                # это ещё более старая версия сервиса, до появления самой
+                # этой проверки, - тем более пора перезапустить).
+                if data.get("service_version") != COSYVOICE_EXPECTED_SERVICE_VERSION:
+                    return False
+                return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pids_listening_on_port(port: int) -> set:
+        no_window = subprocess.CREATE_NO_WINDOW
+        out = subprocess.check_output(
+            ["netstat", "-ano"], text=True, creationflags=no_window,
+        )
+        pids = set()
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP":
+                local_addr = parts[1]
+                if local_addr.endswith(f":{port}") and "LISTENING" in line.upper():
+                    pid = parts[-1]
+                    if pid.isdigit() and pid != "0":
+                        pids.add(pid)
+        return pids
+
+    @classmethod
+    def _kill_process_on_port(cls, port: int, wait_free_timeout: float = 8.0):
+        """Убивает процесс(ы), слушающие данный TCP-порт на localhost —
+        используется, чтобы наверняка избавиться от зависшего с прошлого
+        раза сервиса CosyVoice (например, оставшегося после того, как
+        программу закрыли не тем способом, или процесс пережил закрытие
+        родителя). Работает через стандартные системные утилиты Windows
+        (netstat/taskkill), без сторонних зависимостей.
+
+        После taskkill Windows не всегда освобождает порт мгновенно —
+        поэтому дальше ждём (опрашивая netstat), пока порт реально не
+        освободится, вместо того чтобы полагаться на фиксированную паузу
+        (слишком короткая пауза раньше приводила к тому, что новый процесс
+        сразу падал с "address already in use", т.к. старый ещё не успел
+        полностью закрыть сокет)."""
+        if sys.platform != "win32":
+            return
+        try:
+            pids = cls._pids_listening_on_port(port)
+            no_window = subprocess.CREATE_NO_WINDOW
+            for pid in pids:
+                subprocess.run(
+                    ["taskkill", "/PID", pid, "/F"],
+                    creationflags=no_window, capture_output=True,
+                )
+            if not pids:
+                return
+            deadline = time.time() + wait_free_timeout
+            while time.time() < deadline:
+                if not cls._pids_listening_on_port(port):
+                    return
+                time.sleep(0.5)
+        except Exception:
+            _log_exception_to_file(f"попытка остановить процесс на порту {port}")
+
+    def _cosyvoice_engine_code(self) -> str:
+        """Внутренний код выбранного движка ("f5"/"xtts") по подписи,
+        выбранной в выпадающем списке — уходит в переменную окружения
+        TTS_ENGINE процесса сервиса."""
+        return COSYVOICE_ENGINE_CODES.get(self.cosyvoice_engine_var.get(), COSYVOICE_DEFAULT_ENGINE)
+
+    def _on_cosyvoice_engine_changed(self, event=None):
+        """При смене движка в выпадающем списке уже запущенный сервис
+        обслуживает запросы старым движком, пока его не перезапустить -
+        останавливаем его здесь же, чтобы следующий запрос сам поднял
+        сервис заново с новым TTS_ENGINE (см. _ensure_cosyvoice_service_running
+        и сверку engine в _cosyvoice_model_loaded)."""
+        if self._cosyvoice_proc is not None and self._cosyvoice_proc.poll() is None:
+            self.log(f"Движок CosyVoice изменён на «{self.cosyvoice_engine_var.get()}» — "
+                      "перезапускаю сервис…")
+            try:
+                rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
+                from urllib.parse import urlparse
+                port = urlparse(rest_url).port or 5011
+            except Exception:
+                port = 5011
+            self._cosyvoice_proc = None
+            threading.Thread(target=lambda: self._kill_process_on_port(port), daemon=True).start()
+
+    def _ensure_cosyvoice_service_running(self, rest_url: str, ready_timeout: float = 900.0) -> bool:
+        """Аналог _ensure_rest_service_running для CosyVoice: запускает
+        cosyvoice_rest_service.py тем интерпретатором, что установлен
+        install_cosyvoice.bat в .venv_cosyvoice (отдельно от основного
+        .venv, т.к. у CosyVoice несовместимый со всем остальным набор
+        зависимостей), без отдельного окна консоли. Первый запуск может
+        занять несколько минут — модель загружается в память GPU."""
+        if getattr(sys, "frozen", False):
+            self.after(0, lambda: self.log(
+                "Автозапуск сервиса CosyVoice недоступен в собранной .exe-версии "
+                "программы. Запустите программу из исходников (run_gui.bat)."
+            ))
+            return False
+
+        cosyvoice_py = _app_dir() / ".venv_cosyvoice" / "Scripts" / "python.exe"
+        if not cosyvoice_py.exists():
+            # на всякий случай также проверяем "не-Windows" раскладку venv
+            alt = _app_dir() / ".venv_cosyvoice" / "bin" / "python"
+            cosyvoice_py = alt if alt.exists() else cosyvoice_py
+        service_dir = _app_dir() / "CosyVoice"
+        service_path = service_dir / "cosyvoice_rest_service.py"
+
+        if not cosyvoice_py.exists() or not service_path.exists():
+            self.after(0, lambda: self.log(
+                "Режим CosyVoice ещё не установлен на этом компьютере. Запустите "
+                "install.bat ещё раз (он теперь заодно ставит и CosyVoice — это "
+                "большая, отдельная от остального загрузка, может занять время)."
+            ))
+            return False
+
+        try:
+            from urllib.parse import urlparse
+            port = urlparse(rest_url).port or 5011
+        except Exception:
+            port = 5011
+        port_retry_done = False
+
+        need_start = self._cosyvoice_proc is None or self._cosyvoice_proc.poll() is not None
+        if not need_start and self._ping_rest_service(rest_url) and not self._cosyvoice_model_loaded(rest_url):
+            # Сервис отвечает (например, остался запущенным с прошлого
+            # раза), но модель CosyVoice у него не загрузилась — такой
+            # "зомби"-процесс нужно принудительно остановить и поднять
+            # заново, иначе программа будет считать его рабочим и получать
+            # HTTP 500 на каждый запрос без единой новой попытки перезапуска.
+            self.after(0, lambda: self.log(
+                "Обнаружен уже запущенный сервис CosyVoice, у которого не загружена "
+                "модель (скорее всего остался с прошлого раза, до недавнего "
+                "исправления) — останавливаю его и запускаю заново…"
+            ))
+            self._cosyvoice_proc = None
+            self._kill_process_on_port(port)
+            time.sleep(1.0)
+            need_start = True
+        if need_start:
+            try:
+                popen_env = dict(os.environ)
+                popen_env["TTS_ENGINE"] = self._cosyvoice_engine_code()
+                popen_kwargs = dict(
+                    cwd=str(service_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=popen_env,
+                )
+                if sys.platform == "win32":
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                self._cosyvoice_proc = subprocess.Popen(
+                    [str(cosyvoice_py), str(service_path)], **popen_kwargs
+                )
+            except Exception as e:
+                _log_exception_to_file("запуск сервиса CosyVoice")
+                err = str(e)
+                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
+                return False
+
+            def pump_output():
+                proc = self._cosyvoice_proc
+                if proc is None or proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.after(0, lambda l=line: self.log("  [сервис CosyVoice] " + l))
+
+            threading.Thread(target=pump_output, daemon=True).start()
+
+        deadline = time.time() + ready_timeout
+        last_notice = 0.0
+        while time.time() < deadline:
+            # ВАЖНО: сначала проверяем, не завершился ли только что нами
+            # же запущенный процесс, и только потом - пинг. Если проверять
+            # в обратном порядке, то в ситуации "старый зомби-процесс всё
+            # ещё держит порт" пинг будет успешно отвечать (это ответ
+            # зомби, а не нашего свежего процесса), и мы никогда не
+            # заметим, что наш новый процесс уже упал с "порт занят".
+            just_exited = self._cosyvoice_proc is not None and self._cosyvoice_proc.poll() is not None
+            if not just_exited and self._ping_rest_service(rest_url):
+                # Сервис отвечает - но это ещё не значит, что модель
+                # загрузилась (uvicorn начинает принимать запросы даже
+                # если startup_event поймал исключение при загрузке модели
+                # - см. _cosyvoice_model_loaded). Дожидаемся именно этого,
+                # а не просто первого ответа сервера.
+                if self._cosyvoice_model_loaded(rest_url):
+                    self.after(0, lambda: self.log("Сервис CosyVoice запущен и готов принимать запросы."))
+                    return True
+                if time.time() - last_notice > 15:
+                    last_notice = time.time()
+                    self.after(0, lambda: self.log(
+                        "Сервис CosyVoice отвечает, но модель ещё не загрузилась (или не "
+                        "смогла загрузиться) — жду… Если это долго не проходит, смотрите "
+                        "подробности в CosyVoice\\cosyvoice_rest_service.log."
+                    ))
+                time.sleep(1.0)
+                continue
+            if just_exited:
+                if not port_retry_done:
+                    # Частый случай: старый ("зомби") процесс ещё не успел
+                    # полностью освободить порт к моменту, когда новый уже
+                    # пытался на него забиндиться ("address already in
+                    # use") - добираем ещё раз, уже с более долгим
+                    # ожиданием освобождения порта, и пробуем один раз ещё.
+                    port_retry_done = True
+                    self.after(0, lambda: self.log(
+                        "Сервис CosyVoice завершился сразу после запуска — возможно, порт "
+                        "ещё не освободился от предыдущего процесса. Пробую ещё раз…"
+                    ))
+                    self._cosyvoice_proc = None
+                    self._kill_process_on_port(port, wait_free_timeout=12.0)
+                    time.sleep(1.0)
+                    try:
+                        popen_env2 = dict(os.environ)
+                        popen_env2["TTS_ENGINE"] = self._cosyvoice_engine_code()
+                        popen_kwargs = dict(
+                            cwd=str(service_dir),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            env=popen_env2,
+                        )
+                        if sys.platform == "win32":
+                            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                        self._cosyvoice_proc = subprocess.Popen(
+                            [str(cosyvoice_py), str(service_path)], **popen_kwargs
+                        )
+
+                        def pump_output2():
+                            proc = self._cosyvoice_proc
+                            if proc is None or proc.stdout is None:
+                                return
+                            for line in proc.stdout:
+                                line = line.rstrip()
+                                if line:
+                                    self.after(0, lambda l=line: self.log("  [сервис CosyVoice] " + l))
+
+                        threading.Thread(target=pump_output2, daemon=True).start()
+                        time.sleep(1.0)
+                        continue
+                    except Exception as e:
+                        _log_exception_to_file("повторный запуск сервиса CosyVoice")
+                        err = str(e)
+                        self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
+                        return False
+                self.after(0, lambda: self.log(
+                    f"Сервис CosyVoice завершился сам собой (код {self._cosyvoice_proc.returncode}) "
+                    "во время запуска — см. сообщения [сервис CosyVoice] выше."
+                ))
+                return False
+            if time.time() - last_notice > 15:
+                last_notice = time.time()
+                self.after(0, lambda: self.log(
+                    "…сервис CosyVoice ещё запускается (модель грузится в память GPU, "
+                    "при первом запуске это может занять несколько минут)…"
+                ))
+            time.sleep(1.0)
+
+        self.after(0, lambda: self.log("Сервис CosyVoice не успел запуститься за отведённое время."))
         return False
 
     def request_stop(self):
@@ -1342,7 +2426,9 @@ class AudiobookApp(tk.Tk):
                     run_online(self.chapters, outdir, play, start, voice_lang="ru",
                                on_progress=self._on_synthesis_progress,
                                chapter_indices=chapter_indices, char_ranges=char_ranges,
-                               dialogue_voices=dialogue_voices)
+                               dialogue_voices=dialogue_voices,
+                               should_stop=lambda: self._stop_requested,
+                               play_fn=self._embedded_play)
                 elif mode == "silero":
                     run_silero(
                         self.chapters,
@@ -1362,6 +2448,8 @@ class AudiobookApp(tk.Tk):
                         char_ranges=char_ranges,
                         dialogue_speakers=dialogue_voices,
                         attribution=attribution,
+                        should_stop=lambda: self._stop_requested,
+                        play_fn=self._embedded_play,
                     )
                 elif mode == "silero_rest":
                     rest_url = self.rest_url_var.get().strip()
@@ -1395,6 +2483,8 @@ class AudiobookApp(tk.Tk):
                         char_ranges=char_ranges,
                         dialogue_speakers=dialogue_voices,
                         attribution=attribution,
+                        should_stop=lambda: self._stop_requested,
+                        play_fn=self._embedded_play,
                     )
                 elif mode == "yandex":
                     run_yandex(
@@ -1411,6 +2501,46 @@ class AudiobookApp(tk.Tk):
                         char_ranges=char_ranges,
                         dialogue_voices=dialogue_voices,
                         attribution=attribution,
+                        should_stop=lambda: self._stop_requested,
+                        play_fn=self._embedded_play,
+                    )
+                elif mode == "cosyvoice":
+                    cv_rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
+                    if self._rest_url_is_local(cv_rest_url):
+                        # Не просто "не отвечает вообще" - вызываем всегда,
+                        # т.к. _ensure_cosyvoice_service_running сам умеет
+                        # отличить "сервис отвечает, но модель не
+                        # загрузилась" (зомби-процесс с прошлого раза) от
+                        # по-настоящему готового сервиса, и перезапускает
+                        # его в первом случае.
+                        self.after(0, lambda: self.log(
+                            "Проверяю сервис CosyVoice (при необходимости запущу/перезапущу "
+                            "его автоматически, без отдельной консоли)…"
+                        ))
+                        if not self._ensure_cosyvoice_service_running(cv_rest_url):
+                            raise RuntimeError(
+                                "Не удалось автоматически запустить сервис CosyVoice. "
+                                "Подробности — в журнале выше и в logs\\fb2_reader_gui.log. "
+                                "Проверьте, что install.bat успешно поставил CosyVoice."
+                            )
+                    run_cosyvoice(
+                        self.chapters,
+                        outdir,
+                        start,
+                        self._selected_cosyvoice_voice(),
+                        int(self.sample_rate_var.get()),
+                        play,
+                        cv_rest_url,
+                        sentence_break_ms=int(self.sentence_break_var.get()),
+                        paragraph_break_ms=int(self.paragraph_break_var.get()),
+                        comma_break_ms=int(self.comma_break_var.get()),
+                        on_progress=self._on_synthesis_progress,
+                        chapter_indices=chapter_indices,
+                        char_ranges=char_ranges,
+                        dialogue_voices=dialogue_voices,
+                        attribution=attribution,
+                        should_stop=lambda: self._stop_requested,
+                        play_fn=self._embedded_play,
                     )
                 else:
                     run_offline(
@@ -1425,45 +2555,362 @@ class AudiobookApp(tk.Tk):
                         dialogue_voice_ids=dialogue_voices,
                         attribution=attribution,
                         outdir=outdir,
+                        should_stop=lambda: self._stop_requested,
                     )
                 if not self._stop_requested:
                     self.after(0, lambda: self.log("--- Озвучка завершена ---"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
-                self.after(0, lambda: self.log(f"ОШИБКА: {e}"))
+                # Важно: захватываем e через значение по умолчанию (e=e), а
+                # не просто по имени из замыкания - Python неявно удаляет
+                # переменную except-блока при выходе из него, и к моменту,
+                # когда self.after() вызовет эту лямбду асинхронно, имя "e"
+                # снаружи уже не будет существовать (NameError).
+                err_text = str(e)
+                self.after(0, lambda t=err_text: messagebox.showerror("Ошибка", t))
+                self.after(0, lambda t=err_text: self.log(f"ОШИБКА: {t}"))
             finally:
                 sys.stdout = old_stdout
                 self.after(0, lambda: self._set_busy(False))
+                self.after(0, self.refresh_player_for_selection)
 
         self._worker = threading.Thread(target=worker, daemon=True)
         self._worker.start()
 
-    def play_selected_chapter(self):
-        if not self.chapters:
-            messagebox.showwarning("Проигрывание", "Сначала загрузите книгу.")
-            return
-        sel = self.chapters_list.curselection()
-        if not sel:
-            messagebox.showinfo("Проигрывание", "Выберите главу в списке.")
-            return
-        idx = sel[0] + 1
-        title, _ = self.chapters[idx - 1]
+    # --- встроенный плеер (pygame.mixer) ------------------------------------
+    #
+    # Единое состояние плеера используется в двух сценариях: (1) ручное
+    # прослушивание уже озвученной главы, выбранной в списке слева —
+    # трек подгружается автоматически при выборе главы (см.
+    # _on_chapters_selection_change), кнопка "Играть" включается только
+    # если для выбранной главы уже есть аудиофайл; (2) автопроигрывание
+    # сразу после озвучки очередной главы (галочка "Проигрывать после
+    # озвучки каждой главы") — передаётся в run_* как play_fn и блокирует
+    # вызвавший поток (поток озвучки), пока не доиграет или не нажали
+    # "Стоп" — так же, как раньше, только теперь управляемо.
+    #
+    # Модель позиции: play/pause не используют pygame.mixer.music.pause(),
+    # а всегда останавливают и заново запускают трек с нужной позиции
+    # (play(start=позиция)) — это немного грубее, чем настоящая пауза, но
+    # одинаково надёжно работает и для WAV, и для MP3, и делает перемотку
+    # (тот же механизм) тривиальной. Для WAV сама SDL_mixer не всегда
+    # умеет начинать не с начала — тогда перемотка/возобновление тихо
+    # срабатывает как проигрывание с начала (ограничение библиотеки, не
+    # ошибка программы).
+
+    def _ensure_mixer(self):
+        """Лениво импортирует и инициализирует pygame.mixer — только когда
+        реально понадобилось проигрывание, чтобы не тормозить запуск
+        программы. Возвращает модуль pygame или None, если pygame не
+        установлен (тогда используется запасной вариант — системный
+        проигрыватель, без кнопок и перемотки)."""
+        try:
+            import pygame
+        except ImportError:
+            return None
+        except Exception as e:
+            # На некоторых системах модуль ставится, но не импортируется
+            # (например, не хватает системной DLL) — это не обычный
+            # "не установлен", покажем причину, чтобы было понятнее, что
+            # чинить.
+            err = f"{type(e).__name__}: {e}"
+            self.after(0, lambda t=err: self.log(f"pygame не загрузился ({t})"))
+            return None
+        if not self._mixer_ready:
+            try:
+                pygame.mixer.init()
+                self._mixer_ready = True
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda t=err: self.log(f"Не удалось инициализировать аудио (pygame.mixer): {t}"))
+                return None
+        return pygame
+
+    @staticmethod
+    def _fmt_player_time(seconds: float) -> str:
+        seconds = max(0, int(seconds or 0))
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def _audio_duration_seconds(self, path: Path) -> float:
+        """Длительность аудиофайла в секундах — точно для WAV (заголовок
+        файла), приблизительно для остальных форматов через pydub (если
+        установлен; иначе 0 — плеер тогда просто не покажет полосу
+        прокрутки, но проигрывание всё равно работает)."""
+        try:
+            if path.suffix.lower() == ".wav":
+                import wave
+                with wave.open(str(path), "rb") as wf:
+                    return wf.getnframes() / float(wf.getframerate())
+            from pydub import AudioSegment
+            return len(AudioSegment.from_file(str(path))) / 1000.0
+        except Exception:
+            return 0.0
+
+    def _get_chapter_audio_path(self, idx: int, title: str) -> Path | None:
         outdir = Path(self.outdir_var.get().strip() or "audiobook_output")
         from fb2_reader import sanitize_filename
+        for ext in (".wav", ".mp3"):
+            p = outdir / f"{idx:03d}_{sanitize_filename(title)}{ext}"
+            if p.exists():
+                return p
+        return None
 
-        ext = ".wav" if self._current_mode() in ("silero", "silero_rest") else ".mp3"
-        fname = f"{idx:03d}_{sanitize_filename(title)}{ext}"
-        path = outdir / fname
-        if not path.exists():
-            alt_ext = ".mp3" if ext == ".wav" else ".wav"
-            path = outdir / f"{idx:03d}_{sanitize_filename(title)}{alt_ext}"
-        if not path.exists():
-            messagebox.showwarning("Проигрывание", f"Аудиофайл не найден:\n{path}\n\nСначала озвучьте главу.")
+    def refresh_player_for_selection(self):
+        """Подгружает в плеер аудио выбранной в списке главы, если оно уже
+        есть — кнопка "Играть" включается, только если файл найден.
+        Вызывается при выборе главы в списке и после завершения озвучки
+        (чтобы свежесозданный файл сразу стал доступен для прослушивания).
+        Ничего не делает, пока идёт активное проигрывание/автопроигрывание
+        (чтобы не оборвать его сменой выделения)."""
+        if self._player_state == "playing" and self._player_block_event is not None:
+            return  # идёт автопроигрывание после синтеза — не перебиваем
+        sel = self.chapters_list.curselection()
+        path = None
+        if len(sel) == 1 and self.chapters:
+            idx = sel[0] + 1
+            title, _ = self.chapters[idx - 1]
+            path = self._get_chapter_audio_path(idx, title)
+        if path is None:
+            self._clear_player()
             return
+        if path == self._player_path:
+            return  # уже загружен этот же файл — не сбрасываем позицию
+        self._clear_player()
+        self.player_title_label.configure(text=f"⏳ {path.name} — читаю длительность…")
+        self._player_load_token += 1
+        token = self._player_load_token
+
+        def worker():
+            duration = self._audio_duration_seconds(path)
+            self.after(0, lambda: self._finish_load_player_track(path, duration, token))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_load_player_track(self, path: Path, duration: float, token: int):
+        if token != self._player_load_token:
+            return  # пользователь успел выбрать другую главу — отбрасываем
+        self._player_path = path
+        self._player_duration = duration
+        self._player_position = 0.0
+        self._player_state = "paused"
+        self.player_scale.configure(to=max(duration, 0.01), state="normal" if duration else "disabled")
+        self.player_pos_var.set(0.0)
+        self.player_title_label.configure(text=path.name)
+        self.player_time_label.configure(text=f"0:00 / {self._fmt_player_time(duration)}")
+        self.player_play_btn.configure(state="normal", text="▶ Играть")
+        self.player_stop_btn.configure(state="disabled")
+
+    def _clear_player(self, label: str | None = None):
+        pygame = None
         try:
-            play_file(path)
+            import pygame as _pg
+            pygame = _pg
+        except ImportError:
+            pass
+        if pygame is not None and self._player_state == "playing":
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+        self._stop_player_tick()
+        self._player_path = None
+        self._player_duration = 0.0
+        self._player_position = 0.0
+        self._player_state = "stopped"
+        self.player_title_label.configure(
+            text=label or ("Глава не озвучена — сначала озвучьте её" if self.chapters else "Глава не выбрана")
+        )
+        self.player_time_label.configure(text="")
+        self.player_pos_var.set(0.0)
+        self.player_scale.configure(state="disabled")
+        self.player_play_btn.configure(state="disabled", text="▶ Играть")
+        self.player_stop_btn.configure(state="disabled")
+
+    def _current_player_position(self) -> float:
+        if self._player_state == "playing":
+            pos = self._player_position + (time.time() - self._player_play_wall_start)
+            return min(pos, self._player_duration) if self._player_duration else pos
+        return self._player_position
+
+    def _player_play_pause(self):
+        pygame = self._ensure_mixer()
+        if pygame is None:
+            self.log(
+                "pygame не установлен — управление проигрыванием (пауза/перемотка) "
+                "недоступно. Запустите install.bat ещё раз, чтобы поставить pygame."
+            )
+            return
+        if self._player_path is None:
+            return
+        if self._player_state == "playing":
+            pygame.mixer.music.stop()
+            self._player_position = self._current_player_position()
+            self._player_state = "paused"
+            self.player_play_btn.configure(text="▶ Играть")
+            self.player_stop_btn.configure(state="normal")
+            self._stop_player_tick()
+            return
+
+        try:
+            pygame.mixer.music.load(str(self._player_path))
+            pygame.mixer.music.play(start=self._player_position)
         except Exception as e:
-            messagebox.showerror("Проигрывание", str(e))
+            self.log(f"Не удалось проиграть файл: {e}")
+            return
+        self._player_state = "playing"
+        self._player_play_wall_start = time.time()
+        self.player_play_btn.configure(text="⏸ Пауза")
+        self.player_stop_btn.configure(state="normal")
+        self._start_player_tick()
+
+    def _player_stop(self):
+        pygame = self._ensure_mixer()
+        if pygame is not None:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+        self._player_position = 0.0
+        self._player_state = "paused" if self._player_path else "stopped"
+        self.player_play_btn.configure(text="▶ Играть")
+        self.player_stop_btn.configure(state="disabled")
+        self._stop_player_tick()
+        self._player_updating_scale = True
+        self.player_pos_var.set(0.0)
+        self._player_updating_scale = False
+        if self._player_duration:
+            self.player_time_label.configure(text=f"0:00 / {self._fmt_player_time(self._player_duration)}")
+        if self._player_block_event is not None:
+            self._player_block_event.set()
+
+    def _start_player_tick(self):
+        self._stop_player_tick()
+        self._player_tick_job = self.after(200, self._player_tick)
+
+    def _stop_player_tick(self):
+        if self._player_tick_job is not None:
+            try:
+                self.after_cancel(self._player_tick_job)
+            except Exception:
+                pass
+            self._player_tick_job = None
+
+    def _player_tick(self):
+        self._player_tick_job = None
+        if self._player_state != "playing":
+            return
+        pygame = self._ensure_mixer()
+        pos = self._current_player_position()
+        finished = pygame is not None and not pygame.mixer.music.get_busy()
+        if finished or (self._player_duration and pos >= self._player_duration):
+            self._player_position = 0.0
+            self._player_state = "paused" if self._player_path else "stopped"
+            self.player_play_btn.configure(text="▶ Играть")
+            self.player_stop_btn.configure(state="disabled")
+            self._player_updating_scale = True
+            self.player_pos_var.set(0.0)
+            self._player_updating_scale = False
+            if self._player_duration:
+                self.player_time_label.configure(text=f"0:00 / {self._fmt_player_time(self._player_duration)}")
+            if self._player_block_event is not None:
+                self._player_block_event.set()
+            return
+        if not self._player_seek_dragging:
+            self._player_updating_scale = True
+            self.player_pos_var.set(pos)
+            self._player_updating_scale = False
+        self.player_time_label.configure(
+            text=f"{self._fmt_player_time(pos)} / {self._fmt_player_time(self._player_duration)}"
+        )
+        self._player_tick_job = self.after(200, self._player_tick)
+
+    def _on_player_scale_move(self, _value):
+        # Срабатывает и от перетаскивания мышью, и от программного
+        # .set() (тик плеера) — здесь только обновляем подпись времени
+        # вживую при перетаскивании; сама перемотка применяется в
+        # _on_player_seek_commit (по отпусканию кнопки мыши), не на
+        # каждое промежуточное движение.
+        if getattr(self, "_player_updating_scale", False) or not self._player_seek_dragging:
+            return
+        pos = self.player_pos_var.get()
+        self.player_time_label.configure(
+            text=f"{self._fmt_player_time(pos)} / {self._fmt_player_time(self._player_duration)}"
+        )
+
+    def _on_player_seek_start(self, _event):
+        if self._player_path is None or not self._player_duration:
+            return "break"
+        self._player_seek_dragging = True
+
+    def _on_player_seek_commit(self, _event):
+        if not self._player_seek_dragging:
+            return
+        self._player_seek_dragging = False
+        if self._player_path is None or not self._player_duration:
+            return
+        target = max(0.0, min(self._player_duration, self.player_pos_var.get()))
+        pygame = self._ensure_mixer()
+        was_playing = self._player_state == "playing"
+        if pygame is not None:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+        self._player_position = target
+        if was_playing and pygame is not None:
+            try:
+                pygame.mixer.music.load(str(self._player_path))
+                pygame.mixer.music.play(start=target)
+                self._player_play_wall_start = time.time()
+                self._player_state = "playing"
+                self._start_player_tick()
+            except Exception as e:
+                self.log(f"Не удалось перемотать: {e}")
+                self._player_state = "paused"
+        else:
+            self._player_state = "paused"
+        self.player_time_label.configure(
+            text=f"{self._fmt_player_time(target)} / {self._fmt_player_time(self._player_duration)}"
+        )
+
+    def _embedded_play(self, path: Path):
+        """play_fn для run_* — автопроигрывание сразу после озвучки главы
+        (галочка "Проигрывать после озвучки каждой главы"). Вызывается из
+        потока озвучки и должна там же и блокировать выполнение (иначе
+        следующая глава начнёт озвучиваться поверх ещё звучащей) — поэтому
+        ждём threading.Event, который выставляется по естественному
+        окончанию трека или по нажатию "Стоп" (см. _player_stop/_player_tick)."""
+        pygame = self._ensure_mixer()
+        if pygame is None:
+            self.after(0, lambda: self.log(
+                "pygame не установлен — играю через системный проигрыватель "
+                "(без кнопок паузы/стопа/перемотки здесь). Запустите install.bat "
+                "ещё раз, чтобы поставить pygame и получить управление проигрыванием."
+            ))
+            try:
+                play_file(path)
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda t=err: self.log(f"Не удалось проиграть файл: {t}"))
+            return
+
+        duration = self._audio_duration_seconds(path)
+        done_event = threading.Event()
+        self._player_block_event = done_event
+
+        def start_on_ui_thread():
+            self._clear_player()
+            self._player_load_token += 1
+            self._player_path = path
+            self._player_duration = duration
+            self._player_position = 0.0
+            self._player_state = "paused"
+            self.player_scale.configure(to=max(duration, 0.01), state="normal" if duration else "disabled")
+            self.player_title_label.configure(text=f"▶ {path.name}")
+            self._player_play_pause()
+
+        self.after(0, start_on_ui_thread)
+        done_event.wait()
+        self._player_block_event = None
 
     def _on_close(self):
         if self._worker and self._worker.is_alive():
@@ -1483,8 +2930,56 @@ class AudiobookApp(tk.Tk):
         self.destroy()
 
 
+def _install_error_logging(app: "AudiobookApp"):
+    """Ловит и пишет в logs/fb2_reader_gui.log ЛЮБЫЕ ошибки, включая те,
+    что раньше проходили мимо — а именно исключения внутри обработчиков
+    событий tkinter (нажатия кнопок, выбор в списках и т.п.): tkinter по
+    умолчанию просто печатает их в консоль и на этом всё, а в run_gui.bat
+    / собранном .exe консоль пользователь обычно не видит, так что такие
+    ошибки были фактически невидимы. Теперь любая такая ошибка попадает и
+    в окно «Журнал», и в файл журнала — с полным traceback."""
+
+    def on_tk_error(exc_type, exc_value, exc_tb):
+        _log_exception_to_file("обработчик события интерфейса", (exc_type, exc_value, exc_tb))
+        try:
+            app.log(f"ОШИБКА (см. подробности в файле журнала logs\\{LOG_FILE_PATH.name}): {exc_value}")
+        except Exception:
+            pass
+
+    app.report_callback_exception = on_tk_error
+
+    def on_thread_excepthook(args):
+        # Ошибки в фоновых потоках (threading.Thread) тоже раньше были
+        # видны только в консоли (или вообще нигде, если её нет) - здесь
+        # они точно так же попадают в файл журнала.
+        _log_exception_to_file(
+            f"фоновый поток {args.thread.name if args.thread else '?'}",
+            (args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = on_thread_excepthook
+
+    def on_sys_excepthook(exc_type, exc_value, exc_tb):
+        _log_exception_to_file("необработанное исключение", (exc_type, exc_value, exc_tb))
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = on_sys_excepthook
+
+    if _log_file_open_failed:
+        try:
+            app.log(
+                f"ПРЕДУПРЕЖДЕНИЕ: не удалось создать файл журнала в {LOGS_DIR} — "
+                "проверьте права на запись в эту папку."
+            )
+        except Exception:
+            pass
+
+
 def run_gui(initial_book: Path | None = None):
     app = AudiobookApp(initial_book=initial_book)
+    _install_error_logging(app)
+    app.log(f"Файл журнала: {LOG_FILE_PATH}")
     app.mainloop()
 
 

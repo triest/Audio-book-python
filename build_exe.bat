@@ -1,47 +1,46 @@
 @echo off
-rem Экспериментально собирает программу в один файл FB2AudiobookReader.exe
-rem (через PyInstaller), чтобы её можно было запускать без установленного
-rem Python вообще — просто по клику на .exe.
+rem Experimentally builds the program into a single FB2AudiobookReader.exe
+rem file (via PyInstaller), so it can run without Python installed at all -
+rem just double-click the .exe.
 rem
-rem ВАЖНО: этот способ проверялся только теоретически (среда, где
-rem собирался этот проект, не может запускать Windows-программы напрямую) —
-rem если сборка не пройдёт с первого раза, пришлите текст ошибки. Более
-rem надёжный вариант "просто по клику" — run_gui.bat, он ставит зависимости
-rem через pip в обычный Python и запускает программу; экспериментировать с
-rem exe стоит, только если по каким-то причинам нужен именно один файл без
-rem Python на компьютере вообще.
+rem NOTE: this method has only been checked theoretically (the environment
+rem this project was built in cannot run Windows programs directly) - if
+rem the build fails on the first try, send the error text. The more
+rem reliable "just click it" option is run_gui.bat, which installs
+rem dependencies via pip into a regular Python and runs the program;
+rem building the exe is worth trying only if, for some reason, you need a
+rem single file with no Python on the computer at all.
 rem
-rem Из-за torch итоговый .exe будет большим (по грубой оценке от 400 МБ до
-rem 1+ ГБ) и первая сборка может занять несколько минут.
+rem Because of torch, the resulting .exe will be large (roughly 400 MB to
+rem 1+ GB) and the first build can take several minutes.
 rem
-rem В собранном .exe НЕ будет работать автозапуск сервиса Silero REST
-rem (режим "silero_rest" с автостартом) — используйте локальный режим
-rem "Silero", он ничего дополнительного не требует.
+rem Automatic startup of the Silero REST service (the "silero_rest" mode
+rem with auto-start) will NOT work in the built .exe - use the local
+rem "Silero" mode instead, it needs nothing extra.
+rem (This file's own messages are in English on purpose - see install.bat
+rem for why. The program itself works in Russian as usual.)
 
-chcp 65001 >nul
-set "PYTHONUTF8=1"
-set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
-    echo Сначала запустите install.bat (или run_gui.bat) хотя бы один раз —
-    echo окружение .venv ещё не создано.
+    echo Run install.bat (or run_gui.bat) at least once first -
+    echo the .venv environment has not been created yet.
     pause
     exit /b 1
 )
 
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 
-echo Устанавливаю PyInstaller...
+echo Installing PyInstaller...
 "%VENV_PY%" -m pip install pyinstaller
 if errorlevel 1 (
-    echo Не удалось установить PyInstaller — см. сообщение выше.
+    echo Failed to install PyInstaller - see the message above.
     pause
     exit /b 1
 )
 
 echo.
-echo Собираю FB2AudiobookReader.exe — подождите, это не быстро...
+echo Building FB2AudiobookReader.exe - please wait, this is not fast...
 echo.
 
 "%VENV_PY%" -m PyInstaller --noconfirm --onefile --windowed ^
@@ -54,21 +53,22 @@ echo.
     --hidden-import=gtts ^
     --hidden-import=requests ^
     --hidden-import=pydub ^
+    --hidden-import=pygame ^
     fb2_reader_gui.py
 
 if errorlevel 1 (
     echo.
-    echo Сборка не удалась — см. сообщения об ошибках выше.
-    echo Самый надёжный способ запуска без такой сборки — run_gui.bat.
+    echo Build failed - see the error messages above.
+    echo The most reliable way to run without building this is run_gui.bat.
     pause
     exit /b 1
 )
 
 echo.
-echo Готово: dist\FB2AudiobookReader.exe
-echo Можно скопировать этот один файл куда угодно на компьютере и запускать
-echo двойным кликом. При первом запуске он всё равно скачает саму модель
-echo Silero (~140 МБ) в ту папку, откуда его запустят, — это отдельно от
-echo самого .exe и происходит один раз.
+echo Done: dist\FB2AudiobookReader.exe
+echo You can copy this single file anywhere on the computer and run it by
+echo double-clicking. On first run it will still download the Silero model
+echo itself (~140 MB) into the folder it is run from - that is separate
+echo from the .exe and happens once.
 echo.
 pause
