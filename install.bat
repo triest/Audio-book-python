@@ -224,6 +224,8 @@ if errorlevel 1 echo WARNING: uvicorn failed to install.
 if errorlevel 1 echo WARNING: python-multipart failed to install.
 "%CV_PY%" -m pip install soundfile
 if errorlevel 1 echo WARNING: soundfile failed to install.
+"%CV_PY%" -m pip install num2words
+if errorlevel 1 echo WARNING: num2words failed to install - numbers in text may be read incorrectly or skipped.
 
 echo Installing torch/torchaudio ^(this is the big one, GB-sized^)...
 rem NOTE: plain "pip install torch" pulls the CPU-only build - it has no

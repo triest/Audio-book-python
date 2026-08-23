@@ -42,6 +42,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -108,7 +109,7 @@ app = FastAPI()
 # продолжал бы обслуживать запросы своим старым кодом сколько угодно долго
 # после того, как программу обновили - новые эндпоинты/исправления просто
 # не были бы видны, пока пользователь вручную не перезапустит компьютер.
-SERVICE_VERSION = "2026-08-23.4"
+SERVICE_VERSION = "2026-08-23.6"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -354,6 +355,35 @@ MAX_TRANSCRIBE_SECONDS = 30.0  # текст образца всё равно н�
 # (может быть многие минуты) незачем и на CPU это очень медленно.
 
 
+def _load_wav_for_whisper(path_or_bytesio, max_seconds: float = MAX_TRANSCRIBE_SECONDS) -> np.ndarray:
+    """Декодирует WAV и ресемплирует в 16 кГц вручную через soundfile/torch,
+    возвращая готовый numpy-массив для model.transcribe(). Используется
+    ВЕЗДЕ, где нужен Whisper (и /transcribe, и автораспознавание текста
+    образца для F5-TTS в _ensure_profile_text) — если вместо этого передать
+    в whisper.transcribe() путь к файлу, она внутри себя попытается вызвать
+    системный ffmpeg (whisper/audio.py: load_audio), которого на машине
+    может не быть, и упадёт с FileNotFoundError [WinError 2]. Так мы вообще
+    не зависим от ffmpeg."""
+    arr, sr = sf.read(path_or_bytesio, dtype="float32", always_2d=True)
+
+    if arr.ndim == 2 and arr.shape[1] > 1:
+        arr = arr.mean(axis=1)
+    else:
+        arr = arr.reshape(-1)
+
+    max_samples = int(max_seconds * sr)
+    if arr.shape[0] > max_samples:
+        arr = arr[:max_samples]
+
+    target_sr = 16000
+    if sr != target_sr:
+        wav_tensor = torch.from_numpy(arr).float().unsqueeze(0)
+        wav_tensor = torchaudio.functional.resample(wav_tensor, sr, target_sr)
+        arr = wav_tensor.squeeze(0).numpy()
+
+    return np.ascontiguousarray(arr.astype(np.float32))
+
+
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
     """Распознаёт речь в начале загруженного аудиофайла через Whisper и
@@ -373,31 +403,9 @@ async def transcribe(audio: UploadFile = File(...)):
     data = await audio.read()
     try:
         try:
-            in_buf = io.BytesIO(data)
-            arr, sr = sf.read(in_buf, dtype="float32", always_2d=True)
+            arr = _load_wav_for_whisper(io.BytesIO(data))
         except Exception as e:
             raise RuntimeError(f"Не удалось прочитать аудиофайл: {e}") from e
-
-        # смешиваем каналы в моно
-        if arr.ndim == 2 and arr.shape[1] > 1:
-            arr = arr.mean(axis=1)
-        else:
-            arr = arr.reshape(-1)
-
-        # берём только начало файла — распознавать целиком не нужно
-        max_samples = int(MAX_TRANSCRIBE_SECONDS * sr)
-        was_trimmed = arr.shape[0] > max_samples
-        if was_trimmed:
-            arr = arr[:max_samples]
-
-        # ресемплируем в 16 кГц, как ожидает Whisper
-        target_sr = 16000
-        if sr != target_sr:
-            wav_tensor = torch.from_numpy(arr).float().unsqueeze(0)
-            wav_tensor = torchaudio.functional.resample(wav_tensor, sr, target_sr)
-            arr = wav_tensor.squeeze(0).numpy()
-
-        arr = np.ascontiguousarray(arr.astype(np.float32))
 
         def _run():
             model = _get_whisper_asr_model()
@@ -405,11 +413,6 @@ async def transcribe(audio: UploadFile = File(...)):
             return result.get("text", "").strip()
 
         text = await run_in_threadpool(_run)
-        if was_trimmed:
-            logger.info(
-                f"[/transcribe] Аудио длиннее {MAX_TRANSCRIBE_SECONDS:.0f} сек — "
-                "распознаны только первые {:.0f} сек.".format(MAX_TRANSCRIBE_SECONDS)
-            )
         return {"text": text}
     except Exception:
         logger.error("[/transcribe] Распознавание речи не удалось:\n" + traceback.format_exc())
@@ -523,6 +526,34 @@ def _get_ruaccent():
     return _ruaccent
 
 
+_NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+
+
+def _numbers_to_words_ru(text: str) -> str:
+    """Заменяет числа словами (num2words) - ни F5-TTS, ни XTTS не умеют
+    сами разворачивать цифры в русский текст (в отличие, например, от
+    Yandex SpeechKit): цифры либо молча пропускаются моделью, либо
+    произносятся невнятно/неправильно. Ловит и числа, слипшиеся с
+    буквами/знаками ("20-летие", "5%", "3,5") - заменяется только
+    цифровая часть. Если num2words не установлен в этом окружении -
+    возвращает текст без изменений (не блокирует синтез)."""
+    try:
+        from num2words import num2words
+    except ImportError:
+        return text
+
+    def _repl(m):
+        raw = m.group(0)
+        try:
+            if "," in raw or "." in raw:
+                return num2words(float(raw.replace(",", ".")), lang="ru")
+            return num2words(int(raw), lang="ru")
+        except Exception:
+            return raw
+
+    return _NUMBER_RE.sub(_repl, text)
+
+
 def _add_stress_marks(text: str) -> str:
     if XTTS_LANGUAGE != "ru":
         return text
@@ -564,8 +595,9 @@ def _ensure_profile_text(voice: str, profile: dict) -> str:
     if profile.get("text"):
         return profile["text"]
     try:
+        arr = _load_wav_for_whisper(profile["wav_path"])
         model = _get_whisper_asr_model()
-        result = model.transcribe(profile["wav_path"], language="ru", fp16=False)
+        result = model.transcribe(arr, language="ru", fp16=False)
         text = (result.get("text") or "").strip()
     except Exception:
         logger.warning(f"Не удалось автоматически распознать текст образца для {voice!r} - "
@@ -588,9 +620,19 @@ def _synthesize(text: str, voice: str) -> np.ndarray:
         raise RuntimeError(f"Профиль голоса {voice!r} не найден (доступны: {list(voice_profiles.keys())})")
 
     prompt_wav_path = profile["wav_path"]
+    text = _numbers_to_words_ru(text)
 
     if ENGINE == "f5":
-        ref_text = _ensure_profile_text(voice, profile)
+        # Если распознать текст образца не удалось (см. _ensure_profile_text)
+        # - "" туда НЕ передаём: сама библиотека f5-tts, получив пустой
+        # ref_text, пытается распознать его САМА через свой внутренний
+        # ASR-пайплайн (transformers), который тоже требует системный
+        # ffmpeg и падает точно так же - т.е. без этой подстраховки один
+        # сбой Whisper на нашей стороне тянет за собой второй, уже не
+        # перехватываемый нами. Один пробел - не пустая строка, поэтому
+        # f5-tts не станет распознавать сама, а просто чуть хуже выровняет
+        # клонирование (в этом крайнем случае текста всё равно ни у кого нет).
+        ref_text = _ensure_profile_text(voice, profile) or " "
         wav, _sr, _spec = cosyvoice_model.infer(
             ref_file=prompt_wav_path, ref_text=ref_text, gen_text=text,
             remove_silence=False, seed=None,

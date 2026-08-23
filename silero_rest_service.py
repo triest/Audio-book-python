@@ -151,18 +151,25 @@ async def startup_event():
         accentizer = None
  
  
+_NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+
+
 def preprocess_text(text):
-    """Преобразует цифры в текстовый формат."""
-    words = text.split()
-    processed_words = []
-    for word in words:
-        if word.isdigit():
-            try:
-                word = num2words(int(word), lang='ru')
-            except Exception:
-                logger.warning(f"Failed to convert number {word!r} to words:\n" + traceback.format_exc())
-        processed_words.append(word)
-    return " ".join(processed_words)
+    """Преобразует цифры в словесную форму (num2words). Раньше ловились
+    только "чистые" числа-слова целиком (word.isdigit()) — числа, слипшиеся
+    с буквами/знаками ("20-летие", "5%", "3,5"), не распознавались и
+    оставались цифрами. Теперь заменяется только цифровая часть таких
+    токенов, остальное остаётся как было."""
+    def _repl(m):
+        raw = m.group(0)
+        try:
+            if "," in raw or "." in raw:
+                return num2words(float(raw.replace(",", ".")), lang="ru")
+            return num2words(int(raw), lang="ru")
+        except Exception:
+            logger.warning(f"Failed to convert number {raw!r} to words:\n" + traceback.format_exc())
+            return raw
+    return _NUMBER_RE.sub(_repl, text)
  
  
 @app.get(

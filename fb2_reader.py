@@ -327,6 +327,37 @@ def sanitize_filename(name: str) -> str:
     return name.strip()[:80] or "chapter"
 
 
+try:
+    from num2words import num2words
+except ImportError:
+    num2words = None
+
+_NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+
+
+def numbers_to_words_ru(text: str) -> str:
+    """Заменяет числа словами (например "2026" -> "две тысячи двадцать
+    шесть"). Без этого TTS-движки, у которых нет собственной нормализации
+    чисел (локальный Silero, CosyVoice/F5-TTS/XTTS), либо молча пропускают
+    цифры, либо читают их как попало по одной цифре. Ловит и числа,
+    слипшиеся с буквами/знаками ("20-летие", "5%", "3,5") — заменяется
+    только цифровая часть, остальное остаётся как было. Если пакет
+    num2words не установлен — возвращает текст без изменений (не падает)."""
+    if num2words is None or not text:
+        return text
+
+    def _repl(m: "re.Match") -> str:
+        raw = m.group(0)
+        try:
+            if "," in raw or "." in raw:
+                return num2words(float(raw.replace(",", ".")), lang="ru")
+            return num2words(int(raw), lang="ru")
+        except Exception:
+            return raw
+
+    return _NUMBER_RE.sub(_repl, text)
+
+
 _HAS_LETTER_RE = re.compile(r"\w", re.UNICODE)
 
 
@@ -1499,6 +1530,10 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
     def synth_one(part_text: str, part_speaker: str):
         """Один вызов модели. Бросает исключение при неудаче."""
+        # Локальный Silero (в отличие от silero_rest) не умеет сам
+        # разворачивать числа в слова — без этого цифры либо пропускаются,
+        # либо звучат странно.
+        part_text = numbers_to_words_ru(part_text)
         return model.apply_tts(
             text=part_text,
             speaker=part_speaker,
@@ -1998,6 +2033,21 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
     endpoint = f"{rest_url}/getwav"
     outdir.mkdir(parents=True, exist_ok=True)
 
+    # Какой движок сейчас реально обслуживает сервис (f5/xtts) - попадает в
+    # "отпечаток" параметров ниже, чтобы при переключении движка (или при
+    # смене версии сервиса, где менялась логика синтеза - см. историю
+    # cosyvoice_rest_service.py) уже "готовые" главы не считались готовыми
+    # молча навсегда. Без этого, например, глава, синтезированная в момент,
+    # когда сервис падал на каждой фразе и вместо звука вставлял тишину,
+    # так и осталась бы отмеченной как "уже озвучено" даже после того, как
+    # сама причина ошибки исправлена - до этой правки так и произошло.
+    engine_tag = "unknown"
+    try:
+        health = requests.get(f"{rest_url}/health", timeout=5).json()
+        engine_tag = f"{health.get('engine')}:{health.get('service_version')}"
+    except Exception:
+        pass
+
     log_path = outdir / "cosyvoice_client.log"
 
     def log(message: str):
@@ -2082,7 +2132,7 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
         fingerprint = _params_fingerprint(
             text, mode="cosyvoice", voice=voice, sample_rate=sample_rate, max_len=max_len,
             sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
-            comma_break_ms=comma_break_ms,
+            comma_break_ms=comma_break_ms, engine=engine_tag,
             dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
         )
