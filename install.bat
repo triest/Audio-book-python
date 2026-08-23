@@ -92,6 +92,16 @@ rem Google TTS and system TTS (optional modes)
 "%VENV_PY%" -m pip install gTTS pyttsx3 pydub
 if errorlevel 1 goto :warn_partial
 
+rem Piper TTS (optional mode) - small/fast local CPU voices, no cloning.
+rem Voice files (.onnx) are downloaded on first use into piper_voices/
+rem (see .gitignore) - not needed here, just the engine itself.
+"%VENV_PY%" -m pip install piper-tts
+if errorlevel 1 (
+    echo WARNING: piper-tts failed to install - the "Piper" mode will not be
+    echo available, everything else still works. You can try running
+    echo install.bat again.
+)
+
 rem Built-in player in the program window (pause/stop/seek while
 rem listening to chapters) - we check not just that pip reported
 rem success, but that pygame actually imports (sometimes a wheel
@@ -425,6 +435,16 @@ if errorlevel 1 (
         echo WARNING: could not pre-download the F5-TTS-Russian checkpoint -
         echo it will be downloaded automatically the first time you use voice
         echo cloning instead ^(just makes the very first use slower^).
+    )
+    echo.
+    echo Pre-downloading the ESpeech checkpoint ^(F5-based, another Russian
+    echo finetune - reportedly less noisy than XTTS-v2 and understands stress
+    echo marks - recommended engine, see cosyvoice tab^). ~2.7 GB, only needs
+    echo to happen once...
+    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_SFT-95K', filename='espeech_tts_95k.pt', local_dir='pretrained_models/espeech'); hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_SFT-95K', filename='vocab.txt', local_dir='pretrained_models/espeech')"
+    if errorlevel 1 (
+        echo WARNING: could not pre-download the ESpeech checkpoint - it will
+        echo be downloaded automatically the first time it is selected instead.
     )
 )
 

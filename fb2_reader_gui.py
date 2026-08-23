@@ -21,6 +21,8 @@ from fb2_reader import (
     DEFAULT_ATTRIBUTION_MODEL, ATTRIBUTION_PROVIDERS, DEFAULT_ATTRIBUTION_PROVIDER,
     TTS_MODES,
     YANDEX_VOICES,
+    PIPER_VOICES,
+    PIPER_DEFAULT_VOICE,
     COSYVOICE_DEFAULT_REST_URL,
     cosyvoice_list_voices,
     list_offline_voices,
@@ -29,6 +31,7 @@ from fb2_reader import (
     run_cosyvoice,
     run_offline,
     run_online,
+    run_piper,
     run_silero,
     run_silero_rest,
     run_yandex,
@@ -91,7 +94,7 @@ LOG_FILE_MAX_BYTES = 2_000_000  # ~2 МБ — после этого старый
 # версией, сама перезапускает его - иначе после обновления файлов сервис
 # продолжал бы молча работать со старым кодом, пока пользователь не
 # перезапустит компьютер вручную (именно так сломалось удаление голосов).
-COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.6"
+COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.8"
 
 # Движки синтеза, которые умеет запускать cosyvoice_rest_service.py (см. его
 # ENGINE/TTS_ENGINE) - код (ключ словаря) идёт в переменную окружения
@@ -99,11 +102,12 @@ COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.6"
 # сам сообщает в /health ("engine"), человекочитаемая подпись - то, что
 # видит пользователь в выпадающем списке на вкладке «Голоса CosyVoice».
 COSYVOICE_ENGINE_LABELS = {
-    "f5": "F5-TTS-Russian (рекомендуется)",
-    "xtts": "XTTS-v2 (запасной)",
+    "f5": "F5-TTS-Russian",
+    "espeech": "ESpeech (F5-based, меньше шума, рекомендуется)",
+    "xtts": "XTTS-v2 (запасной, шумнее)",
 }
 COSYVOICE_ENGINE_CODES = {label: code for code, label in COSYVOICE_ENGINE_LABELS.items()}
-COSYVOICE_DEFAULT_ENGINE = "f5"
+COSYVOICE_DEFAULT_ENGINE = "espeech"
 
 
 def _write_log_file(s: str):
@@ -234,6 +238,7 @@ class AudiobookApp(tk.Tk):
         self._stop_requested = False
         self._offline_voices: list[dict] = []
         self._cosyvoice_voices: list[str] = []
+        self._piper_voice_keys: list[str] = []
         self._rest_proc: subprocess.Popen | None = None
         self._cosyvoice_proc: subprocess.Popen | None = None
         self._mixer_ready = False
@@ -962,11 +967,14 @@ class AudiobookApp(tk.Tk):
         self.cosyvoice_engine_combo.bind("<<ComboboxSelected>>", self._on_cosyvoice_engine_changed)
         ttk.Label(
             pad,
-            text="F5-TTS-Russian обучена именно на русской речи — рекомендуется. "
-                 "XTTS-v2 — запасной вариант (мультиязычная, ударения на русском менее "
-                 "точные). Голоса, которые вы уже добавили, работают с обоими движками "
-                 "без повторного добавления — переклонировать не нужно. Смена движка "
-                 "перезапускает сервис CosyVoice (может занять время на загрузку модели).",
+            text="ESpeech — рекомендуется: тоже F5-TTS-архитектура, но менее шумный "
+                 "результат, чем у XTTS-v2 (по независимым сравнениям), и понимает "
+                 "расстановку ударений. F5-TTS-Russian — тоже неплохо, но без ударений "
+                 "и обучена на меньшем датасете. XTTS-v2 — запасной вариант (мультиязычная, "
+                 "заметно более шумное аудио). Голоса, которые вы уже добавили, работают со "
+                 "всеми движками без повторного добавления — переклонировать не нужно. Смена "
+                 "движка перезапускает сервис CosyVoice (может занять время на загрузку "
+                 "модели, у ESpeech чекпоинт больше — ~2.7 ГБ при первой загрузке).",
             wraplength=680, justify="left", foreground="#555",
         ).pack(anchor="w", pady=(0, 10))
 
@@ -1335,6 +1343,19 @@ class AudiobookApp(tk.Tk):
     def _set_online_voice(self):
         self.voice_combo.configure(values=["Google TTS — русский (выбор голоса недоступен)"], state="disabled")
         self.voice_combo.current(0)
+
+    def _set_piper_voices(self):
+        self._piper_voice_keys = list(PIPER_VOICES.keys())
+        labels = [f"{k} — {v}" for k, v in PIPER_VOICES.items()]
+        self.voice_combo.configure(values=labels, state="readonly")
+        default_idx = self._piper_voice_keys.index(PIPER_DEFAULT_VOICE) if PIPER_DEFAULT_VOICE in self._piper_voice_keys else 0
+        self.voice_combo.current(default_idx)
+
+    def _selected_piper_voice(self) -> str:
+        idx = self.voice_combo.current()
+        if idx < 0 or idx >= len(self._piper_voice_keys):
+            return PIPER_DEFAULT_VOICE
+        return self._piper_voice_keys[idx]
 
     def _set_cosyvoice_voices(self):
         if not self._cosyvoice_voices:
@@ -1732,7 +1753,7 @@ class AudiobookApp(tk.Tk):
     def _update_mode_dependent_widgets(self):
         mode = self._current_mode()
         silero_like = mode in ("silero", "silero_rest")
-        pauses_supported = mode in ("silero", "silero_rest", "cosyvoice")
+        pauses_supported = mode in ("silero", "silero_rest", "cosyvoice", "piper")
         self.model_combo.configure(state="readonly" if silero_like else "disabled")
         self.rest_url_entry.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.auto_start_rest_check.configure(state="normal" if mode == "silero_rest" else "disabled")
@@ -1780,6 +1801,8 @@ class AudiobookApp(tk.Tk):
             self._set_cosyvoice_voices()
             if not self._cosyvoice_voices:
                 self.refresh_cosyvoice_voices()
+        elif mode == "piper":
+            self._set_piper_voices()
         else:
             self._set_online_voice()
 
@@ -1817,6 +1840,8 @@ class AudiobookApp(tk.Tk):
             return list(self._yandex_voice_keys)
         if mode == "cosyvoice":
             return list(self._cosyvoice_voices)
+        if mode == "piper":
+            return list(self._piper_voice_keys) or list(PIPER_VOICES.keys())
         return []
 
     def _populate_dialogue_list(self):
@@ -1826,7 +1851,7 @@ class AudiobookApp(tk.Tk):
         несколько голосов (Google TTS — нет)."""
         mode = self._current_mode()
         self.dialogue_list.delete(0, "end")
-        supported = mode in ("silero", "silero_rest", "offline", "yandex", "cosyvoice")
+        supported = mode in ("silero", "silero_rest", "offline", "yandex", "cosyvoice", "piper")
 
         if mode in ("silero", "silero_rest"):
             for k in self._silero_voice_keys:
@@ -1847,6 +1872,11 @@ class AudiobookApp(tk.Tk):
             for k in self._cosyvoice_voices:
                 self.dialogue_list.insert("end", k)
             if len(self._cosyvoice_voices) < 2:
+                supported = False
+        elif mode == "piper":
+            for k, v in PIPER_VOICES.items():
+                self.dialogue_list.insert("end", f"{k} — {v}")
+            if len(PIPER_VOICES) < 2:
                 supported = False
 
         if supported:
@@ -1935,6 +1965,8 @@ class AudiobookApp(tk.Tk):
             main_voice = self._selected_offline_voice_id()
         elif mode == "cosyvoice":
             main_voice = self._selected_cosyvoice_voice()
+        elif mode == "piper":
+            main_voice = self._selected_piper_voice()
         else:
             return None
         keys = self._dialogue_voice_keys()
@@ -2531,6 +2563,24 @@ class AudiobookApp(tk.Tk):
                         int(self.sample_rate_var.get()),
                         play,
                         cv_rest_url,
+                        sentence_break_ms=int(self.sentence_break_var.get()),
+                        paragraph_break_ms=int(self.paragraph_break_var.get()),
+                        comma_break_ms=int(self.comma_break_var.get()),
+                        on_progress=self._on_synthesis_progress,
+                        chapter_indices=chapter_indices,
+                        char_ranges=char_ranges,
+                        dialogue_voices=dialogue_voices,
+                        attribution=attribution,
+                        should_stop=lambda: self._stop_requested,
+                        play_fn=self._embedded_play,
+                    )
+                elif mode == "piper":
+                    run_piper(
+                        self.chapters,
+                        outdir,
+                        start,
+                        self._selected_piper_voice(),
+                        play,
                         sentence_break_ms=int(self.sentence_break_var.get()),
                         paragraph_break_ms=int(self.paragraph_break_var.get()),
                         comma_break_ms=int(self.comma_break_var.get()),

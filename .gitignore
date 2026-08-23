@@ -48,3 +48,7 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# Скачиваемые голоса Piper TTS (.onnx/.onnx.json, rhasspy/piper-voices) —
+# программа скачивает их сама при первом использовании режима piper.
+piper_voices/

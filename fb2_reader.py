@@ -158,10 +158,34 @@ TTS_MODES = {
     "silero": "Silero (локально, лучшее качество)",
     "silero_rest": "Silero REST (через сервис, SSML-паузы)",
     "cosyvoice": "CosyVoice (локально, GPU, клонирование голоса)",
+    "piper": "Piper (локально, CPU, быстро, без клонирования)",
     "yandex": "Yandex SpeechKit (облако, платно, нужен API-ключ)",
     "online": "Google TTS (нужен интернет)",
     "offline": "Системный TTS (pyttsx3, без интернета)",
 }
+
+# Голоса Piper TTS — быстрый локальный CPU-движок без клонирования голоса
+# (в отличие от cosyvoice), заметно легче и быстрее Silero/F5.
+#
+# Раньше здесь была попытка починить ударения через сторонний патч словаря
+# espeak-ng + голос "mari" (github.com/mitrokun/espeak-ng-data) — откатил:
+# на практике голос и версия словаря оказались рассинхронизированы (автор
+# репозитория сам предупреждает, что дважды переделывал фонемные правила и
+# это "сломало синтез на существующих моделях"; какой версии словаря
+# соответствует именно чекпоинт mari-medium_epoch6399 — не выяснить
+# надёжно без живого прослушивания каждой комбинации), в результате чего
+# синтез превращался в неразборчивую кашу — хуже, чем просто неточные
+# ударения. Вернулись к обычным голосам rhasspy/piper-voices без патча:
+# ударения местами будут не там, зато речь разборчива.
+PIPER_VOICES = {
+    "irina": "Ирина (женский)",
+    "denis": "Денис (мужской)",
+    "dmitri": "Дмитрий (мужской)",
+    "ruslan": "Руслан (мужской)",
+}
+PIPER_DEFAULT_VOICE = "irina"
+PIPER_VOICES_REPO = "rhasspy/piper-voices"
+PIPER_SAMPLE_RATE = 22050  # частота дискретизации у всех "medium"-голосов Piper
 
 # CosyVoice — отдельный сервис (см. cosyvoice_rest_service.py, ставится
 # отдельным install_cosyvoice.bat в свою .venv_cosyvoice, несовместимую по
@@ -2221,6 +2245,183 @@ def list_offline_voices():
     return result
 
 
+_PIPER_VOICE_CACHE: dict = {}
+
+
+def _piper_voice_dir() -> Path:
+    d = Path(__file__).resolve().parent / "piper_voices"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def _load_piper_voice(name: str):
+    """Скачивает (при первом обращении, в piper_voices/ рядом со скриптом —
+    см. .gitignore) .onnx + .onnx.json нужного голоса Piper с HuggingFace
+    (rhasspy/piper-voices) и загружает его через PiperVoice.load(). Голоса
+    кэшируются в памяти на весь процесс — не грузим заново на каждую фразу
+    и не держим больше одной копии голоса в памяти одновременно."""
+    if name in _PIPER_VOICE_CACHE:
+        return _PIPER_VOICE_CACHE[name]
+
+    import requests
+    from piper import PiperVoice
+
+    voice_dir = _piper_voice_dir()
+    fname_onnx = f"ru_RU-{name}-medium.onnx"
+    fname_json = f"ru_RU-{name}-medium.onnx.json"
+    base_url = f"https://huggingface.co/{PIPER_VOICES_REPO}/resolve/main/ru/ru_RU/{name}/medium"
+
+    for fname in (fname_onnx, fname_json):
+        path = voice_dir / fname
+        if path.exists() and path.stat().st_size > 0:
+            continue
+        print(f"Скачиваю голос Piper {name!r} ({fname})…")
+        resp = requests.get(f"{base_url}/{fname}?download=true", timeout=120)
+        resp.raise_for_status()
+        path.write_bytes(resp.content)
+
+    voice = PiperVoice.load(str(voice_dir / fname_onnx))
+    _PIPER_VOICE_CACHE[name] = voice
+    return voice
+
+
+def run_piper(chapters, outdir: Path, start: int, voice: str, play: bool,
+              sentence_break_ms: int = 250, paragraph_break_ms: int = 450,
+              comma_break_ms: int = 120, on_progress=None,
+              chapter_indices=None, char_ranges=None, dialogue_voices=None, attribution=None,
+              should_stop=None, play_fn=None):
+    """Озвучка через Piper TTS — маленький и быстрый (в отличие от Silero и
+    тем более cosyvoice) локальный CPU-движок без клонирования голоса,
+    четыре готовых русских голоса (см. PIPER_VOICES). Синтезирует заметно
+    быстрее Silero, но качество/выразительность речи скромнее (нет
+    отдельной расстановки ударений/интонации — только то, что заложено в
+    сам голос). Текст режется на куски с паузами так же, как в silero/
+    cosyvoice (см. _segments_with_pauses), voice — ключ из PIPER_VOICES.
+
+    dialogue_voices — необязательный список ключей PIPER_VOICES, которыми
+    по очереди озвучиваются реплики прямой речи (как в других режимах, см.
+    resolve_voice_groups)."""
+    import io
+    import wave
+    import numpy as np
+
+    if voice not in PIPER_VOICES:
+        print(f"Голос {voice!r} недоступен для Piper, использую {PIPER_DEFAULT_VOICE!r}")
+        voice = PIPER_DEFAULT_VOICE
+    if dialogue_voices:
+        bad = [v for v in dialogue_voices if v not in PIPER_VOICES]
+        dialogue_voices = [v for v in dialogue_voices if v in PIPER_VOICES]
+        if bad:
+            print(f"Голоса {bad} недоступны для Piper, пропускаю их в чередовании диалогов.")
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    max_chars = 400
+
+    def synth_one(part_text: str, part_voice: str) -> "np.ndarray":
+        piper_voice = _load_piper_voice(part_voice)
+        part_text = numbers_to_words_ru(part_text)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            piper_voice.synthesize_wav(part_text, wf)
+        buf.seek(0)
+        with wave.open(buf, "rb") as wf:
+            n_frames = wf.getnframes()
+            pcm = wf.readframes(n_frames)
+        arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        return arr
+
+    def synth_with_fallback(part_text: str, idx: int, title: str, part_voice: str) -> "np.ndarray":
+        if not _text_has_speakable_content(part_text):
+            return np.zeros(int(PIPER_SAMPLE_RATE * 0.4), dtype=np.float32)
+        try:
+            return synth_one(part_text, part_voice)
+        except Exception as e:
+            print(f"  [Гл.{idx} «{title}»] ОШИБКА: не удалось синтезировать фрагмент Piper "
+                  f"({e}). Вставляю тишину вместо него: {part_text[:80]!r}…")
+            silence_seconds = max(0.4, min(6.0, len(part_text) / 15))
+            return np.zeros(int(PIPER_SAMPLE_RATE * silence_seconds), dtype=np.float32)
+
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
+
+    for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
+        fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
+        out_path = outdir / fname
+
+        fingerprint = _params_fingerprint(
+            text, mode="piper", voice=voice, max_chars=max_chars,
+            sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
+            comma_break_ms=comma_break_ms,
+            dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
+            attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
+        )
+        if _is_already_done(out_path, fingerprint):
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
+            if play:
+                print("  Проигрывание...")
+                (play_fn or play_file)(out_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
+            continue
+
+        print(f"[{idx}/{len(chapters)}] Озвучиваю (Piper): {title} -> {fname}")
+
+        voice_groups = resolve_voice_groups(
+            text, voice, dialogue_voices, outdir, attribution=attribution,
+            log_fn=_make_file_logger(outdir, "piper_client.log"),
+        )
+        segments = []
+        for group_voice, group_text in voice_groups:
+            for part_text, pause_ms in _segments_with_pauses(
+                group_text, sentence_break_ms=sentence_break_ms,
+                paragraph_break_ms=paragraph_break_ms, comma_break_ms=comma_break_ms,
+                max_chars=max_chars,
+            ):
+                segments.append((part_text, pause_ms, group_voice))
+
+        audio_parts = []
+        segs_total = len(segments) or 1
+        if on_progress:
+            on_progress(pos, total, 0, segs_total)
+
+        for seg_i, (part_text, pause_ms, seg_voice) in enumerate(
+            tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
+        ):
+            if not part_text.strip():
+                if on_progress:
+                    on_progress(pos, total, seg_i, segs_total)
+                continue
+            audio = synth_with_fallback(part_text, idx, title, seg_voice)
+            audio_parts.append(audio)
+            if pause_ms > 0:
+                audio_parts.append(np.zeros(int(PIPER_SAMPLE_RATE * pause_ms / 1000), dtype=np.float32))
+            if on_progress:
+                on_progress(pos, total, seg_i, segs_total)
+
+        if not audio_parts:
+            continue
+
+        full_audio = np.concatenate(audio_parts)
+        with wave.open(str(out_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(PIPER_SAMPLE_RATE)
+            pcm = (full_audio * 32767).astype(np.int16).tobytes()
+            wf.writeframes(pcm)
+
+        _save_fingerprint(out_path, fingerprint)
+
+        if play:
+            print("  Проигрывание...")
+            (play_fn or play_file)(out_path)
+
+    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+
+
 def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str = "", on_progress=None,
                  chapter_indices=None, char_ranges=None, dialogue_voice_ids=None, attribution=None,
                  outdir: Path = None, should_stop=None):
@@ -2304,13 +2505,15 @@ def main():
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
     ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
     ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
-    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "cosyvoice", "yandex"],
+    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "cosyvoice", "piper", "yandex"],
                      default="silero",
                      help="silero = нейросетевой голос локально через torch.hub; "
                           "silero_rest = синтез через Silero-REST-Service с интонационными паузами "
                           "(SSML: паузы на запятых/тире, границах предложений и абзацев, интонация "
                           "вопросов/восклицаний); cosyvoice = локальный сервис CosyVoice (GPU, "
                           "клонирование голоса по образцу — см. install_cosyvoice.bat); "
+                          "piper = Piper TTS (локально, CPU, быстро, без клонирования — "
+                          "см. --piper-voice); "
                           "yandex = облачный Yandex SpeechKit (платно, нужны "
                           "--yandex-api-key и --yandex-folder-id); online = gTTS (интернет); "
                           "offline = pyttsx3 (без интернета)")
@@ -2359,6 +2562,12 @@ def main():
                      help="макс. длина куска текста за один вызов CosyVoice, символов "
                           "(по умолчанию 400 — CosyVoice медленнее Silero, куски короче удобнее "
                           "для прогресса/повторов при сбое)")
+    ap.add_argument("--piper-voice", type=str, default=PIPER_DEFAULT_VOICE,
+                     choices=list(PIPER_VOICES.keys()),
+                     help=f"голос Piper (по умолчанию {PIPER_DEFAULT_VOICE!r}) — режим piper")
+    ap.add_argument("--piper-dialogue-voices", type=str, default="",
+                     help="список голосов Piper через запятую — если задан, реплики диалогов по "
+                          "очереди озвучиваются этими голосами вместо --piper-voice (режим piper)")
     ap.add_argument("--sentence-break-ms", type=int, default=320,
                      help="пауза между предложениями в silero/silero_rest/cosyvoice-режимах (мс)")
     ap.add_argument("--paragraph-break-ms", type=int, default=550,
@@ -2508,6 +2717,13 @@ def main():
                       max_len=args.cosyvoice_max_len,
                       chapter_indices=chapter_indices, dialogue_voices=cosyvoice_dialogue_voices,
                       attribution=attribution)
+    elif args.mode == "piper":
+        piper_dialogue_voices = [v.strip() for v in args.piper_dialogue_voices.split(",") if v.strip()] or None
+        run_piper(chapters, args.outdir, args.start, args.piper_voice, args.play,
+                  sentence_break_ms=args.sentence_break_ms, paragraph_break_ms=args.paragraph_break_ms,
+                  comma_break_ms=args.comma_break_ms,
+                  chapter_indices=chapter_indices, dialogue_voices=piper_dialogue_voices,
+                  attribution=attribution)
     elif args.mode == "yandex":
         api_key = args.yandex_api_key or os.environ.get("YANDEX_API_KEY", "")
         folder_id = args.yandex_folder_id or os.environ.get("YANDEX_FOLDER_ID", "")
