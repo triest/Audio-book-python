@@ -109,7 +109,7 @@ app = FastAPI()
 # продолжал бы обслуживать запросы своим старым кодом сколько угодно долго
 # после того, как программу обновили - новые эндпоинты/исправления просто
 # не были бы видны, пока пользователь вручную не перезапустит компьютер.
-SERVICE_VERSION = "2026-08-23.8"
+SERVICE_VERSION = "2026-08-23.10"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -125,7 +125,7 @@ VOICES_DIR.mkdir(exist_ok=True)
 os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
 ENGINE = os.environ.get("TTS_ENGINE", "f5").strip().lower()
-if ENGINE not in ("f5", "xtts", "espeech"):
+if ENGINE not in ("f5", "xtts", "espeech", "f5winter"):
     ENGINE = "f5"
 
 # --- F5-TTS-Russian ---
@@ -144,11 +144,27 @@ F5_MODEL_DIR = BASE_DIR / "pretrained_models" / "f5-tts-russian"
 # некоммерческое использование). Плюс, в отличие от F5-TTS-Russian,
 # понимает "+"-разметку ударений (см. _add_stress_marks) - поэтому в
 # _synthesize её мы, в отличие от обычного f5, применяем.
-ESPEECH_MODEL_REPO = os.environ.get("ESPEECH_MODEL_REPO", "ESpeech/ESpeech-TTS-1_SFT-95K")
-ESPEECH_CKPT_FILENAME = "espeech_tts_95k.pt"
+ESPEECH_MODEL_REPO = os.environ.get("ESPEECH_MODEL_REPO", "ESpeech/ESpeech-TTS-1_RL-V2")
+ESPEECH_CKPT_FILENAME = "espeech_tts_rlv2.pt"
 ESPEECH_VOCAB_FILENAME = "vocab.txt"
 ESPEECH_ARCH = "F5TTS_Base"
 ESPEECH_MODEL_DIR = BASE_DIR / "pretrained_models" / "espeech"
+# Апгрейд с ESpeech-TTS-1_SFT-95K (использовался раньше) на более новый и
+# более качественный чекпоинт RL-V2 (обучен через RL, дообучен на большем
+# датасете - ESpeech-webinars2, 792k сэмплов/253 часа); тот же формат и
+# конфиг (ESPEECH_DIT_CFG ниже), поэтому грузится тем же кодом.
+
+# --- F5-TTS-Russian "winter" (TTS_ENGINE=f5winter) - более свежий
+# community-чекпоинт F5-TTS для русского от другого автора (Misha24-10),
+# в отличие от F5_MODEL_REPO выше (hotstone228) ОБУЧЕН понимать
+# "+"-разметку ударений перед гласной - поэтому, в отличие от обычного f5,
+# в _synthesize для него эта разметка применяется (как для espeech/xtts).
+# Архитектура стандартная F5TTS_Base, тот же класс F5TTS, что и у обычного f5.
+F5WINTER_MODEL_REPO = os.environ.get("F5WINTER_MODEL_REPO", "Misha24-10/F5-TTS_RUSSIAN")
+F5WINTER_CKPT_FILENAME = "F5TTS_v1_Base_v4_winter/model_212000.safetensors"
+F5WINTER_VOCAB_FILENAME = "F5TTS_v1_Base/vocab.txt"  # свой vocab.txt в папке winter не публикуется - используется общий, от базовой версии в этом же репозитории
+F5WINTER_ARCH = "F5TTS_Base"
+F5WINTER_MODEL_DIR = BASE_DIR / "pretrained_models" / "f5-tts-russian-winter"
 
 # --- XTTS-v2 (запасной движок, TTS_ENGINE=xtts) ---
 XTTS_MODEL_NAME = os.environ.get("XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2")
@@ -286,6 +302,31 @@ def _load_f5_model():
                 f"GPU доступен: {torch.cuda.is_available()} (устройство: {device}).")
 
 
+def _load_f5winter_model():
+    """Аналогично _load_f5_model, но для более свежего чекпоинта
+    F5TTS_v1_Base_v4_winter (Misha24-10/F5-TTS_RUSSIAN) - грузится тем же
+    высокоуровневым классом F5TTS (обычный .safetensors, стандартная
+    архитектура F5TTS_Base), просто из другого репозитория и с общим
+    vocab.txt из папки F5TTS_v1_Base того же репозитория."""
+    global cosyvoice_model, synth_sample_rate
+    from huggingface_hub import hf_hub_download
+    from f5_tts.api import F5TTS
+
+    logger.info(f"Скачиваю/проверяю чекпоинт F5-TTS-Russian winter ({F5WINTER_MODEL_REPO}) - "
+                "при первом запуске это ~1.4 ГБ, один раз...")
+    ckpt_path = hf_hub_download(repo_id=F5WINTER_MODEL_REPO, filename=F5WINTER_CKPT_FILENAME,
+                                 local_dir=str(F5WINTER_MODEL_DIR))
+    vocab_path = hf_hub_download(repo_id=F5WINTER_MODEL_REPO, filename=F5WINTER_VOCAB_FILENAME,
+                                  local_dir=str(F5WINTER_MODEL_DIR))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Загружаю модель F5-TTS-Russian winter на устройство {device} ...")
+    cosyvoice_model = F5TTS(model=F5WINTER_ARCH, ckpt_file=ckpt_path, vocab_file=vocab_path, device=device)
+    synth_sample_rate = int(getattr(cosyvoice_model, "target_sample_rate", 24000) or 24000)
+    logger.info(f"Модель F5-TTS-Russian winter загружена. Частота дискретизации: {synth_sample_rate} Гц. "
+                f"GPU доступен: {torch.cuda.is_available()} (устройство: {device}).")
+
+
 # ESpeech, при загрузке через обычный высокоуровневый класс F5TTS (как
 # F5-TTS-Russian выше), давал на выходе не речь, а искажённый "мурчащий"
 # шум - несмотря на то, что архитектура (ESPEECH_DIT_CFG ниже) совпадает
@@ -344,7 +385,8 @@ def _load_xtts_model():
 @app.on_event("startup")
 async def startup_event():
     global cosyvoice_model, ENGINE
-    loaders = {"f5": _load_f5_model, "xtts": _load_xtts_model, "espeech": _load_espeech_model}
+    loaders = {"f5": _load_f5_model, "xtts": _load_xtts_model, "espeech": _load_espeech_model,
+               "f5winter": _load_f5winter_model}
     order = [ENGINE] + [e for e in loaders if e != ENGINE]  # пробуем выбранный первым, остальные - запасные
     for engine_name in order:
         try:
@@ -355,7 +397,7 @@ async def startup_event():
             logger.error(f"Не удалось загрузить модель ({engine_name}):\n" + traceback.format_exc())
             cosyvoice_model = None
     else:
-        logger.error("Не удалось загрузить ни один из движков синтеза (f5, xtts, espeech) - "
+        logger.error("Не удалось загрузить ни один из движков синтеза (f5, xtts, espeech, f5winter) - "
                       "см. ошибки выше по логу.")
 
     _load_voice_profiles()
@@ -692,6 +734,16 @@ def _synthesize(text: str, voice: str) -> np.ndarray:
             remove_silence=False, seed=None,
         )
         speech = np.asarray(wav, dtype=np.float32)
+    elif ENGINE == "f5winter":
+        # В отличие от обычного f5 (hotstone228), этот чекпоинт обучен
+        # понимать "+"-разметку ударений - применяем её здесь же.
+        ref_text = _ensure_profile_text(voice, profile) or " "
+        gen_text = _add_stress_marks(text)
+        wav, _sr, _spec = cosyvoice_model.infer(
+            ref_file=prompt_wav_path, ref_text=ref_text, gen_text=gen_text,
+            remove_silence=False, seed=None,
+        )
+        speech = np.asarray(wav, dtype=np.float32)
     elif ENGINE == "espeech":
         # Низкоуровневый путь (см. _load_espeech_model) - тот же, что в
         # официальном демо ESpeech, вместо класса F5TTS.
@@ -699,9 +751,14 @@ def _synthesize(text: str, voice: str) -> np.ndarray:
         global synth_sample_rate
         ref_text = _ensure_profile_text(voice, profile) or " "  # см. комментарий выше про ffmpeg
         ref_audio_proc, ref_text_proc = preprocess_ref_audio_text(prompt_wav_path, ref_text)
-        # ESpeech, в отличие от F5-TTS-Russian (hotstone228), обучена
-        # понимать "+"-разметку ударений перед гласной - как и XTTS.
-        gen_text = _add_stress_marks(text)
+        # Официальная документация/демо ESpeech заявляют, что "+"-разметка
+        # ударений понимается моделью - но на практике чекпоинт RL-V2 не
+        # игнорирует "+", а буквально произносит слово "плюс" на её месте
+        # (проверено пользователем). Похоже, RL-дообучение увело модель от
+        # этой разметки (или её вообще не было в RL-этапе обучения), в
+        # отличие от того, что написано в демо. Поэтому, как и для обычного
+        # F5-TTS-Russian, здесь разметку НЕ применяем - используем текст как есть.
+        gen_text = text
         wav, sr, _spec = infer_process(
             ref_audio_proc, ref_text_proc, gen_text, _espeech_model, _espeech_vocoder,
             cross_fade_duration=0.15, nfe_step=32, speed=1.0,

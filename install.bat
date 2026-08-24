@@ -16,6 +16,18 @@ setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
 
+rem Re-launch itself once, piping all output (both what you see on screen
+rem AND everything below) through PowerShell's Tee-Object into
+rem install_log.txt next to this file - so if something goes wrong, you
+rem can just send that file instead of copy-pasting the console. The
+rem INSTALL_LOG_TEE marker prevents this from looping forever (the
+rem re-launched copy inherits it and skips straight past this block).
+if not defined INSTALL_LOG_TEE (
+    set "INSTALL_LOG_TEE=1"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%~f0' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
+    exit /b
+)
+
 echo ===============================================
 echo   FB2 Audiobook Reader - installing dependencies
 echo ===============================================
@@ -220,7 +232,16 @@ if not exist ".venv_cosyvoice\Scripts\python.exe" (
 
 set "CV_PY=%~dp0.venv_cosyvoice\Scripts\python.exe"
 
-"%CV_PY%" -m pip install --upgrade pip --quiet
+rem setuptools/wheel are required to build openai-whisper (a dependency of
+rem f5-tts) from source if the exact pinned version it wants is not
+rem available as a pre-built wheel. Just "--upgrade setuptools" is NOT
+rem enough (and was the actual root cause of repeated "ModuleNotFoundError:
+rem No module named 'pkg_resources'" failures, even with --no-build-isolation
+rem below) - setuptools removed the pkg_resources module entirely starting
+rem around version 81, and openai-whisper's old setup.py still imports it.
+rem Pinning below that keeps pkg_resources available.
+"%CV_PY%" -m pip install --upgrade pip wheel --quiet
+"%CV_PY%" -m pip install "setuptools<81" --quiet
 
 echo Installing CosyVoice dependencies - each package is installed
 echo separately on purpose, so that one failure does not block the rest.
@@ -416,7 +437,21 @@ rem below so that fallback actually works. The CosyVoice2 model download
 rem step that used to be here was removed - no longer used.
 echo.
 echo Installing f5-tts ^(F5-TTS-Russian voice cloning engine - primary^)...
-"%CV_PY%" -m pip install f5-tts huggingface_hub
+rem --no-build-isolation: pip's build isolation builds packages from source
+rem (like the old openai-whisper==20231117 that f5-tts pins, which has no
+rem pre-built wheel for newer Python) inside a throwaway "overlay"
+rem environment that does NOT inherit the setuptools/wheel installed above
+rem into .venv_cosyvoice itself - so even with them installed, the build
+rem still failed with "No module named 'pkg_resources'". Without isolation,
+rem it builds using .venv_cosyvoice directly, which does have them.
+"%CV_PY%" -m pip install f5-tts huggingface_hub --no-build-isolation
+rem f5-tts pulls in "datasets" (only actually needed for TRAINING, not for
+rem the inference-only code paths this program uses - but f5-tts imports it
+rem unconditionally either way), which needs a newer pyarrow than what
+rem sometimes ends up installed - without this, loading f5/espeech fails
+rem with "AttributeError: module 'pyarrow' has no attribute 'json_'" and
+rem the service silently falls back to the noisier XTTS-v2 engine instead.
+"%CV_PY%" -m pip install --upgrade pyarrow
 if errorlevel 1 (
     echo WARNING: f5-tts failed to install - this can happen because one of
     echo its dependencies ^(bitsandbytes^) does not always have a ready-made
@@ -437,14 +472,24 @@ if errorlevel 1 (
         echo cloning instead ^(just makes the very first use slower^).
     )
     echo.
-    echo Pre-downloading the ESpeech checkpoint ^(F5-based, another Russian
-    echo finetune - reportedly less noisy than XTTS-v2 and understands stress
-    echo marks - recommended engine, see cosyvoice tab^). ~2.7 GB, only needs
-    echo to happen once...
-    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_SFT-95K', filename='espeech_tts_95k.pt', local_dir='pretrained_models/espeech'); hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_SFT-95K', filename='vocab.txt', local_dir='pretrained_models/espeech')"
+    echo Pre-downloading the ESpeech RL-V2 checkpoint ^(F5-based, another
+    echo Russian finetune - reportedly less noisy than XTTS-v2, understands
+    echo stress marks and supports voice cloning - recommended engine, see
+    echo cosyvoice tab^). ~2.7 GB, only needs to happen once...
+    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='espeech_tts_rlv2.pt', local_dir='pretrained_models/espeech'); hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='vocab.txt', local_dir='pretrained_models/espeech')"
     if errorlevel 1 (
         echo WARNING: could not pre-download the ESpeech checkpoint - it will
         echo be downloaded automatically the first time it is selected instead.
+    )
+    echo.
+    echo Pre-downloading the F5-TTS-Russian winter checkpoint ^(a newer
+    echo community F5-TTS finetune for Russian with full stress-mark support^).
+    echo ~1.4 GB, only needs to happen once...
+    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='Misha24-10/F5-TTS_RUSSIAN', filename='F5TTS_v1_Base_v4_winter/model_212000.safetensors', local_dir='pretrained_models/f5-tts-russian-winter'); hf_hub_download(repo_id='Misha24-10/F5-TTS_RUSSIAN', filename='F5TTS_v1_Base/vocab.txt', local_dir='pretrained_models/f5-tts-russian-winter')"
+    if errorlevel 1 (
+        echo WARNING: could not pre-download the F5-TTS-Russian winter
+        echo checkpoint - it will be downloaded automatically the first time
+        echo it is selected instead.
     )
 )
 
@@ -514,6 +559,111 @@ echo CosyVoice setup finished ^(see any WARNING lines above for details^).
 echo If everything above succeeded, the "CosyVoice" voice mode will be
 echo available in the program, and its background service will start
 echo automatically when you select that mode - no separate window needed.
+
+rem ===============================================
+rem   CosyVoice3 (FunAudioLLM/CosyVoice, Fun-CosyVoice3-0.5B)
+rem   Optional, SEPARATE environment (.venv_cosyvoice3) and
+rem   SEPARATE folder (CosyVoice3\) - its pinned dependency
+rem   versions (torch==2.3.1 etc.) are incompatible with what
+rem   .venv_cosyvoice already has installed above for F5-TTS/
+rem   XTTS/ESpeech (newer torch), so it cannot share that venv.
+rem   Failures here are NOT fatal - everything above still works.
+rem
+rem   (This used to be a Docker container instead - see
+rem   docker\cosyvoice3\ - but Docker Desktop/WSL2 turned out too
+rem   unreliable on the target machine, so it now runs the same
+rem   way as the rest of CosyVoice: a plain subprocess in its own
+rem   venv on Windows directly.)
+rem ===============================================
+echo.
+echo ===============================================
+echo   CosyVoice3 (experimental) - optional setup
+echo ===============================================
+echo.
+
+if not exist "CosyVoice3" (
+    where git >nul 2>nul
+    if errorlevel 1 (
+        echo WARNING: git was not found - cannot download CosyVoice3.
+        echo Install git from https://git-scm.com/downloads and run
+        echo install.bat again if you want this engine.
+        goto :cosyvoice3_done
+    )
+    echo Downloading CosyVoice3 ^(FunAudioLLM/CosyVoice, this can take a
+    echo minute^)...
+    git clone --depth 1 --recurse-submodules https://github.com/FunAudioLLM/CosyVoice.git CosyVoice3
+    if errorlevel 1 (
+        echo WARNING: failed to download CosyVoice3 - this engine will not
+        echo be available. You can try running install.bat again.
+        goto :cosyvoice3_done
+    )
+)
+
+if exist "CosyVoice3\.git" (
+    pushd CosyVoice3
+    git submodule update --init --recursive
+    popd
+)
+
+rem Same pinned-dependency constraint as the CosyVoice3 requirements.txt
+rem (torch==2.3.1 etc. do not have wheels for very new Python versions) -
+rem reuse whichever suitable interpreter was already found above for the
+rem main CosyVoice setup, if any; otherwise look again.
+set "CV3_PYLAUNCHER=%CV_PYLAUNCHER%"
+if not defined CV3_PYLAUNCHER (
+    for %%V in (3.10 3.11 3.9) do (
+        if not defined CV3_PYLAUNCHER (
+            py -%%V --version >nul 2>nul
+            if not errorlevel 1 set "CV3_PYLAUNCHER=py -%%V"
+        )
+    )
+)
+if not defined CV3_PYLAUNCHER set "CV3_PYLAUNCHER=%PYLAUNCHER%"
+
+if not exist ".venv_cosyvoice3\Scripts\python.exe" (
+    echo Creating .venv_cosyvoice3 environment using: !CV3_PYLAUNCHER!
+    !CV3_PYLAUNCHER! -m venv .venv_cosyvoice3
+    if errorlevel 1 (
+        echo WARNING: failed to create .venv_cosyvoice3 - CosyVoice3 will
+        echo not be available.
+        goto :cosyvoice3_done
+    )
+)
+
+set "CV3_PY=%~dp0.venv_cosyvoice3\Scripts\python.exe"
+
+rem setuptools/wheel are required to build openai-whisper (one of
+rem CosyVoice3's dependencies) from source. Just "--upgrade setuptools" is
+rem NOT enough - setuptools removed the pkg_resources module entirely
+rem starting around version 81, and openai-whisper's old setup.py still
+rem imports it, which is what actually caused the repeated
+rem "ModuleNotFoundError: No module named 'pkg_resources'" failures (even
+rem with --no-build-isolation below). Pinning below that keeps pkg_resources
+rem available.
+"%CV3_PY%" -m pip install --upgrade pip wheel --quiet
+"%CV3_PY%" -m pip install "setuptools<81" --quiet
+
+echo Installing CosyVoice3 dependencies - this is a large install (PyTorch
+echo with CUDA, several audio/ML libraries) and can take a long while,
+echo especially on a slow connection.
+rem --no-build-isolation - see the comment on the f5-tts install above for
+rem why this is needed (same openai-whisper build issue applies here).
+"%CV3_PY%" -m pip install -r CosyVoice3\requirements.txt --no-build-isolation
+if errorlevel 1 (
+    echo WARNING: some CosyVoice3 dependencies failed to install - this
+    echo engine may not work. You can try running install.bat again.
+) else (
+    "%CV3_PY%" -m pip install num2words huggingface_hub
+    copy /Y "cosyvoice3_rest_service.py" "CosyVoice3\cosyvoice3_rest_service.py" >nul
+    echo.
+    echo CosyVoice3 dependencies installed. Model weights ^(~1-2 GB^) are
+    echo NOT downloaded here - they download automatically the first time
+    echo you select the "CosyVoice 3" engine in the program ^(can take a
+    echo while, watch the program's log window for progress^).
+)
+
+:cosyvoice3_done
+echo.
 
 :cosyvoice_done
 echo.

@@ -2073,6 +2073,12 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
         pass
 
     log_path = outdir / "cosyvoice_client.log"
+    # Раньше в конце всегда печаталось "Готово", даже если половина
+    # фрагментов не синтезировалась и была заменена тишиной - по этому
+    # сообщению было невозможно понять, что что-то пошло не так, не читая
+    # весь лог целиком. Считаем неудачи по ходу дела и меняем финальное
+    # сообщение, если они были.
+    failure_stats = {"failed_fragments": 0, "silent_fragments": 0, "chapters_with_failures": set()}
 
     def log(message: str):
         line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
@@ -2122,6 +2128,8 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
                 "sample_rate": sample_rate,
             })
         except Exception as e:
+            failure_stats["failed_fragments"] += 1
+            failure_stats["chapters_with_failures"].add(idx)
             log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] ОШИБКА: не удалось синтезировать "
                 f"({_error_detail(e)}). Вставляю тишину вместо фрагмента, чтобы не потерять "
                 f"место в главе — ЭТО НЕ НОРМАЛЬНО, проверьте логи сервиса CosyVoice "
@@ -2136,6 +2144,8 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
             pcm = wf.readframes(n)
             audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
         if audio.size == 0 or float(np.abs(audio).max()) < 1e-4:
+            failure_stats["silent_fragments"] += 1
+            failure_stats["chapters_with_failures"].add(idx)
             log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] ПРЕДУПРЕЖДЕНИЕ: сервис вернул "
                 f"пустой или практически беззвучный WAV (без ошибки HTTP) — если это "
                 f"повторяется на каждом фрагменте, скорее всего профиль голоса "
@@ -2217,8 +2227,30 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
             print("  Проигрывание...")
             (play_fn or play_file)(out_path)
 
-    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
-    print(f"Подробный лог ошибок (если были): {log_path.resolve()}")
+    total_bad = failure_stats["failed_fragments"] + failure_stats["silent_fragments"]
+    if total_bad > 0:
+        n_chapters = len(failure_stats["chapters_with_failures"])
+        print(
+            f"\nЗАВЕРШЕНО С ОШИБКАМИ: не удалось озвучить {total_bad} фрагмент(ов) "
+            f"({failure_stats['failed_fragments']} — ошибка синтеза, "
+            f"{failure_stats['silent_fragments']} — пустой/беззвучный ответ) "
+            f"в {n_chapters} глав(ах). На месте этих фрагментов в готовых .wav — тишина. "
+            f"Файлы сохранены в: {outdir.resolve()}"
+        )
+        print(f"Подробности по каждому фрагменту — в логе: {log_path.resolve()}")
+    else:
+        print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+        print(f"Подробный лог ошибок (если были): {log_path.resolve()}")
+
+    # Возвращаем статистику ошибок, чтобы вызывающий код (GUI) не писал
+    # "Озвучка завершена" бодрым тоном, если на самом деле часть фрагментов
+    # заменена тишиной - раньше run_cosyvoice ничего не возвращал, и GUI
+    # не могла отличить полный успех от "завершилось, но с дырами".
+    return {
+        "failed_fragments": failure_stats["failed_fragments"],
+        "silent_fragments": failure_stats["silent_fragments"],
+        "chapters_with_failures": len(failure_stats["chapters_with_failures"]),
+    }
 
 
 def list_offline_voices():

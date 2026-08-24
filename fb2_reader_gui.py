@@ -94,7 +94,7 @@ LOG_FILE_MAX_BYTES = 2_000_000  # ~2 МБ — после этого старый
 # версией, сама перезапускает его - иначе после обновления файлов сервис
 # продолжал бы молча работать со старым кодом, пока пользователь не
 # перезапустит компьютер вручную (именно так сломалось удаление голосов).
-COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.8"
+COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.10"
 
 # Движки синтеза, которые умеет запускать cosyvoice_rest_service.py (см. его
 # ENGINE/TTS_ENGINE) - код (ключ словаря) идёт в переменную окружения
@@ -103,11 +103,21 @@ COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.8"
 # видит пользователь в выпадающем списке на вкладке «Голоса CosyVoice».
 COSYVOICE_ENGINE_LABELS = {
     "f5": "F5-TTS-Russian",
-    "espeech": "ESpeech (F5-based, меньше шума, рекомендуется)",
+    "espeech": "ESpeech RL-V2 (F5-based, меньше шума, рекомендуется)",
+    "f5winter": "F5-TTS-Russian winter (свежий чекпоинт, с ударениями)",
     "xtts": "XTTS-v2 (запасной, шумнее)",
+    "cosyvoice3": "CosyVoice 3 (экспериментально, отдельное окружение)",
 }
 COSYVOICE_ENGINE_CODES = {label: code for code, label in COSYVOICE_ENGINE_LABELS.items()}
 COSYVOICE_DEFAULT_ENGINE = "espeech"
+
+# CosyVoice3, в отличие от остальных движков (f5/espeech/f5winter/xtts),
+# запускается подпроцессом в СВОЁМ окружении .venv_cosyvoice3 (не в общем
+# .venv_cosyvoice - см. cosyvoice3_rest_service.py и install.bat) - у него
+# несовместимый со всем остальным набор фиксированных версий зависимостей.
+# Порт и ожидаемая версия сервиса поэтому тоже отдельные.
+COSYVOICE3_DEFAULT_REST_URL = "http://localhost:5012"
+COSYVOICE3_EXPECTED_SERVICE_VERSION = "2026-08-24.15-transcribe-window-fix"
 
 
 def _write_log_file(s: str):
@@ -241,6 +251,7 @@ class AudiobookApp(tk.Tk):
         self._piper_voice_keys: list[str] = []
         self._rest_proc: subprocess.Popen | None = None
         self._cosyvoice_proc: subprocess.Popen | None = None
+        self._cosyvoice3_proc: subprocess.Popen | None = None
         self._mixer_ready = False
 
         # Запоминаем последнюю папку, открытую в каждом отдельном диалоге
@@ -967,14 +978,25 @@ class AudiobookApp(tk.Tk):
         self.cosyvoice_engine_combo.bind("<<ComboboxSelected>>", self._on_cosyvoice_engine_changed)
         ttk.Label(
             pad,
-            text="ESpeech — рекомендуется: тоже F5-TTS-архитектура, но менее шумный "
-                 "результат, чем у XTTS-v2 (по независимым сравнениям), и понимает "
-                 "расстановку ударений. F5-TTS-Russian — тоже неплохо, но без ударений "
-                 "и обучена на меньшем датасете. XTTS-v2 — запасной вариант (мультиязычная, "
-                 "заметно более шумное аудио). Голоса, которые вы уже добавили, работают со "
-                 "всеми движками без повторного добавления — переклонировать не нужно. Смена "
-                 "движка перезапускает сервис CosyVoice (может занять время на загрузку "
-                 "модели, у ESpeech чекпоинт больше — ~2.7 ГБ при первой загрузке).",
+            text="ESpeech RL-V2 — рекомендуется: тоже F5-TTS-архитектура, но менее шумный "
+                 "результат, чем у XTTS-v2 (по независимым сравнениям), и поддерживает "
+                 "клонирование (новее версии SFT-95K, которая использовалась раньше). "
+                 "Расстановку ударений не использует — несмотря на документацию, "
+                 "чекпоинт на практике произносит символ \"+\" как слово \"плюс\" вместо того, "
+                 "чтобы ставить ударение. F5-TTS-Russian winter — более свежий "
+                 "чекпоинт F5-TTS для русского с полной разметкой ударений (в отличие от "
+                 "обычного F5-TTS-Russian ниже). F5-TTS-Russian — тоже неплохо, но без "
+                 "ударений и обучена на меньшем датасете. XTTS-v2 — запасной вариант "
+                 "(мультиязычная, заметно более шумное аудио). CosyVoice 3 — "
+                 "экспериментальный, официально поддерживает русский, но независимых "
+                 "отзывов о качестве на русском пока нет; ставится отдельной секцией "
+                 "install.bat в своё окружение .venv_cosyvoice3 (несовместимо со всем "
+                 "остальным по версиям зависимостей). Голоса, которые вы уже добавили, "
+                 "работают со всеми движками без повторного добавления — переклонировать "
+                 "не нужно. Смена движка перезапускает сервис CosyVoice (может занять "
+                 "время на загрузку модели — у ESpeech и F5-TTS-Russian winter чекпоинты "
+                 "больше, ~1.3–2.7 ГБ при первой загрузке; у CosyVoice3 ещё и веса "
+                 "модели, ~1-2 ГБ, при первом запуске).",
             wraplength=680, justify="left", foreground="#555",
         ).pack(anchor="w", pady=(0, 10))
 
@@ -1408,10 +1430,24 @@ class AudiobookApp(tk.Tk):
         self._refresh_cosyvoice_voices_listbox()
 
     def _selected_cosyvoice_voice(self) -> str:
+        """ВАЖНО: раньше при idx == -1 (ничего не выбрано в выпадающем
+        списке - например, из-за гонки между фоновым обновлением списка
+        голосов в refresh_cosyvoice_voices() и стартом синтеза) сюда
+        возвращалась буквальная строка "default" - а такого профиля голоса
+        у CosyVoice3 никогда не бывает (профили называются как файлы
+        образцов, например "002 Пролог"), поэтому /getwav сразу отвечал
+        HTTP 400 "Профиль голоса 'default' не найден" на КАЖДОМ фрагменте
+        книги подряд - озвучка проходила вхолостую, вставляя тишину везде.
+        Теперь при отсутствии валидного выбора в комбобоксе подстраховываемся
+        первым РЕАЛЬНЫМ профилем из self._cosyvoice_voices (если список вообще
+        не пуст) - это почти наверняка тот голос, который был бы выбран по
+        умолчанию при обычном заполнении списка (см. _set_cosyvoice_voices)."""
         idx = self.voice_combo.current()
-        if idx < 0 or idx >= len(self._cosyvoice_voices):
-            return "default"
-        return self._cosyvoice_voices[idx]
+        if 0 <= idx < len(self._cosyvoice_voices):
+            return self._cosyvoice_voices[idx]
+        if self._cosyvoice_voices:
+            return self._cosyvoice_voices[0]
+        return "default"
 
     def _refresh_cosyvoice_voices_listbox(self):
         """Перезаполняет список на вкладке «Голоса CosyVoice» текущим
@@ -2104,7 +2140,7 @@ class AudiobookApp(tk.Tk):
         return False
 
     @staticmethod
-    def _cosyvoice_model_loaded(url: str, timeout: float = 3.0) -> bool:
+    def _cosyvoice_model_loaded(url: str, timeout: float = 3.0, expected_version: str = None) -> bool:
         """В отличие от _ping_rest_service (который считает сервис рабочим
         по любому HTTP-ответу), здесь мы проверяем именно то, что модель
         CosyVoice реально загрузилась И что запущенный сервис - это
@@ -2121,7 +2157,15 @@ class AudiobookApp(tk.Tk):
         cosyvoice_rest_service.py обновился на диске — из-за чего новые
         эндпоинты и исправления молча не действовали бы, пока пользователь
         не перезапустит компьютер вручную (именно так один раз сломалось
-        удаление голосов: старый процесс просто не знал про /voices/{name})."""
+        удаление голосов: старый процесс просто не знал про /voices/{name}).
+
+        expected_version - какую версию сервиса считать актуальной; по
+        умолчанию COSYVOICE_EXPECTED_SERVICE_VERSION (обычный сервис в
+        .venv_cosyvoice), но для CosyVoice3 (см. _ensure_cosyvoice3_service_running)
+        передаётся COSYVOICE3_EXPECTED_SERVICE_VERSION - у него отдельный
+        файл сервиса и своя нумерация версий."""
+        if expected_version is None:
+            expected_version = COSYVOICE_EXPECTED_SERVICE_VERSION
         try:
             with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -2130,7 +2174,7 @@ class AudiobookApp(tk.Tk):
                 # Сверяем строго, включая случай "поля вообще нет" (значит,
                 # это ещё более старая версия сервиса, до появления самой
                 # этой проверки, - тем более пора перезапустить).
-                if data.get("service_version") != COSYVOICE_EXPECTED_SERVICE_VERSION:
+                if data.get("service_version") != expected_version:
                     return False
                 return True
         except Exception:
@@ -2199,7 +2243,26 @@ class AudiobookApp(tk.Tk):
         обслуживает запросы старым движком, пока его не перезапустить -
         останавливаем его здесь же, чтобы следующий запрос сам поднял
         сервис заново с новым TTS_ENGINE (см. _ensure_cosyvoice_service_running
-        и сверку engine в _cosyvoice_model_loaded)."""
+        и сверку engine в _cosyvoice_model_loaded).
+
+        CosyVoice3 - отдельный случай: у него свой подпроцесс/окружение и
+        свой порт 5012 (см. _ensure_cosyvoice3_service_running), не
+        связанный с движками f5/espeech/f5winter/xtts на порту 5011 -
+        здесь просто переключаем REST URL на его порт, чтобы не пришлось
+        делать это вручную (сам процесс на 5011, если запущен, трогать не
+        нужно - при выборе cosyvoice3 к нему никто и не обращается). При
+        переключении ОБРАТНО с cosyvoice3 на любой другой движок -
+        возвращаем URL по умолчанию, если пользователь не менял его сам
+        вручную на что-то своё."""
+        engine = self._cosyvoice_engine_code()
+        current_url = self.cosyvoice_rest_url_var.get().strip()
+        if engine == "cosyvoice3":
+            if current_url in ("", COSYVOICE_DEFAULT_REST_URL):
+                self.cosyvoice_rest_url_var.set(COSYVOICE3_DEFAULT_REST_URL)
+            return
+        if current_url == COSYVOICE3_DEFAULT_REST_URL:
+            self.cosyvoice_rest_url_var.set(COSYVOICE_DEFAULT_REST_URL)
+
         if self._cosyvoice_proc is not None and self._cosyvoice_proc.poll() is None:
             self.log(f"Движок CosyVoice изменён на «{self.cosyvoice_engine_var.get()}» — "
                       "перезапускаю сервис…")
@@ -2212,13 +2275,162 @@ class AudiobookApp(tk.Tk):
             self._cosyvoice_proc = None
             threading.Thread(target=lambda: self._kill_process_on_port(port), daemon=True).start()
 
+    def _ensure_cosyvoice3_service_running(self, rest_url: str, ready_timeout: float = 2700.0) -> bool:
+        """Аналог _ensure_cosyvoice_service_running, но для CosyVoice3 -
+        собственный подпроцесс в СВОЁМ окружении .venv_cosyvoice3 (у
+        CosyVoice3 несовместимый со всем остальным набор фиксированных
+        версий зависимостей - torch==2.3.1 и т.д., см. install.bat,
+        секция CosyVoice3), и свой порт (COSYVOICE3_DEFAULT_REST_URL).
+
+        (Изначально это планировалось запускать в Docker-контейнере (см.
+        docker/cosyvoice3/) для полной изоляции - но Docker Desktop/WSL2 у
+        пользователя оказался слишком капризным, поэтому вместо контейнера -
+        обычный подпроцесс, как у остальных движков.)"""
+        if getattr(sys, "frozen", False):
+            self.after(0, lambda: self.log(
+                "Автозапуск сервиса CosyVoice3 недоступен в собранной .exe-версии "
+                "программы. Запустите программу из исходников (run_gui.bat)."
+            ))
+            return False
+
+        cosyvoice3_py = _app_dir() / ".venv_cosyvoice3" / "Scripts" / "python.exe"
+        if not cosyvoice3_py.exists():
+            alt = _app_dir() / ".venv_cosyvoice3" / "bin" / "python"
+            cosyvoice3_py = alt if alt.exists() else cosyvoice3_py
+        service_dir = _app_dir() / "CosyVoice3"
+        service_path = service_dir / "cosyvoice3_rest_service.py"
+
+        if not cosyvoice3_py.exists() or not service_path.exists():
+            self.after(0, lambda: self.log(
+                "Движок CosyVoice3 ещё не установлен на этом компьютере. Запустите "
+                "install.bat ещё раз (секция CosyVoice3 — отдельная, большая загрузка, "
+                "может занять время)."
+            ))
+            return False
+
+        try:
+            from urllib.parse import urlparse
+            port = urlparse(rest_url).port or 5012
+        except Exception:
+            port = 5012
+
+        need_start = self._cosyvoice3_proc is None or self._cosyvoice3_proc.poll() is not None
+        if need_start and self._ping_rest_service(rest_url):
+            # self._cosyvoice3_proc only tracks a process THIS instance of
+            # the GUI started - it's None right after the program (re)starts
+            # even if a service from a PREVIOUS run is still alive and
+            # holding the port (its parent GUI process can exit without
+            # killing it, since it isn't spawned as a detached/job-linked
+            # child). Without this check we would spawn a second copy here,
+            # which immediately crashes with "[Errno 10048] address already
+            # in use" while the old copy just keeps answering /health - so
+            # the GUI would loop "model not loaded... service exited...
+            # model not loaded..." forever instead of just using it or
+            # replacing it once.
+            if self._cosyvoice_model_loaded(rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION):
+                self.after(0, lambda: self.log(
+                    "Сервис CosyVoice3 уже запущен (остался от предыдущего запуска "
+                    "программы) и готов принимать запросы."
+                ))
+                return True
+            self.after(0, lambda: self.log(
+                "Обнаружен уже запущенный сервис CosyVoice3 (видимо, от предыдущего "
+                "запуска программы), но версия/модель не подходят — останавливаю его "
+                "и запускаю заново…"
+            ))
+            self._kill_process_on_port(port)
+            time.sleep(1.0)
+        elif not need_start and self._ping_rest_service(rest_url) and not self._cosyvoice_model_loaded(
+            rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION
+        ):
+            self.after(0, lambda: self.log(
+                "Обнаружен уже запущенный сервис CosyVoice3, у которого не загружена "
+                "модель — останавливаю его и запускаю заново…"
+            ))
+            self._cosyvoice3_proc = None
+            self._kill_process_on_port(port)
+            time.sleep(1.0)
+            need_start = True
+        if need_start:
+            try:
+                popen_kwargs = dict(
+                    cwd=str(service_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=dict(os.environ, COSYVOICE3_PORT=str(port)),
+                )
+                if sys.platform == "win32":
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                self._cosyvoice3_proc = subprocess.Popen(
+                    [str(cosyvoice3_py), str(service_path)], **popen_kwargs
+                )
+            except Exception as e:
+                _log_exception_to_file("запуск сервиса CosyVoice3")
+                err = str(e)
+                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice3: {t}"))
+                return False
+
+            def pump_output():
+                proc = self._cosyvoice3_proc
+                if proc is None or proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.after(0, lambda l=line: self.log("  [сервис CosyVoice3] " + l))
+
+            threading.Thread(target=pump_output, daemon=True).start()
+
+        deadline = time.time() + ready_timeout
+        last_notice = 0.0
+        while time.time() < deadline:
+            just_exited = self._cosyvoice3_proc is not None and self._cosyvoice3_proc.poll() is not None
+            if not just_exited and self._ping_rest_service(rest_url):
+                if self._cosyvoice_model_loaded(rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION):
+                    self.after(0, lambda: self.log("Сервис CosyVoice3 запущен и готов принимать запросы."))
+                    return True
+                if time.time() - last_notice > 15:
+                    last_notice = time.time()
+                    self.after(0, lambda: self.log(
+                        "Сервис CosyVoice3 отвечает, но модель ещё не загрузилась (первый "
+                        "запуск также скачивает веса, ~1-2 ГБ) — жду… Подробности в "
+                        "CosyVoice3\\data\\cosyvoice3_rest_service.log."
+                    ))
+            if just_exited:
+                self.after(0, lambda: self.log(
+                    f"Сервис CosyVoice3 завершился сам собой (код {self._cosyvoice3_proc.returncode}) "
+                    "— см. CosyVoice3\\data\\cosyvoice3_rest_service.log."
+                ))
+                return False
+            time.sleep(1.0)
+
+        self.after(0, lambda: self.log("Сервис CosyVoice3 не успел запуститься за отведённое время."))
+        return False
+
     def _ensure_cosyvoice_service_running(self, rest_url: str, ready_timeout: float = 900.0) -> bool:
         """Аналог _ensure_rest_service_running для CosyVoice: запускает
         cosyvoice_rest_service.py тем интерпретатором, что установлен
         install_cosyvoice.bat в .venv_cosyvoice (отдельно от основного
         .venv, т.к. у CosyVoice несовместимый со всем остальным набор
         зависимостей), без отдельного окна консоли. Первый запуск может
-        занять несколько минут — модель загружается в память GPU."""
+        занять несколько минут — модель загружается в память GPU.
+
+        Движок CosyVoice3 обрабатывается отдельно (см.
+        _ensure_cosyvoice3_service_running) - у него своё окружение
+        (.venv_cosyvoice3) и свой порт."""
+        if self._cosyvoice_engine_code() == "cosyvoice3":
+            # CosyVoice3 при первом запуске ещё и скачивает веса модели
+            # (~1-2 ГБ с HuggingFace) поверх обычной загрузки в память GPU,
+            # так что 900 сек (15 мин) не хватало на медленном соединении -
+            # сервис реально работал (что подтверждали логи), просто GUI
+            # переставал ждать раньше, чем он успевал подняться. Даём
+            # заметно больше времени именно для cosyvoice3, если вызывающий
+            # код не передал явный ready_timeout.
+            cv3_timeout = ready_timeout if ready_timeout != 900.0 else 2700.0
+            return self._ensure_cosyvoice3_service_running(rest_url, ready_timeout=cv3_timeout)
+
         if getattr(sys, "frozen", False):
             self.after(0, lambda: self.log(
                 "Автозапуск сервиса CosyVoice недоступен в собранной .exe-версии "
@@ -2453,6 +2665,7 @@ class AudiobookApp(tk.Tk):
         def worker():
             old_stdout = sys.stdout
             sys.stdout = TextRedirector(self.log_text)
+            self._synthesis_had_failures = None
             try:
                 if mode == "online":
                     run_online(self.chapters, outdir, play, start, voice_lang="ru",
@@ -2555,7 +2768,7 @@ class AudiobookApp(tk.Tk):
                                 "Подробности — в журнале выше и в logs\\fb2_reader_gui.log. "
                                 "Проверьте, что install.bat успешно поставил CosyVoice."
                             )
-                    run_cosyvoice(
+                    cv_stats = run_cosyvoice(
                         self.chapters,
                         outdir,
                         start,
@@ -2574,6 +2787,17 @@ class AudiobookApp(tk.Tk):
                         should_stop=lambda: self._stop_requested,
                         play_fn=self._embedded_play,
                     )
+                    if cv_stats:
+                        total_bad = cv_stats.get("failed_fragments", 0) + cv_stats.get("silent_fragments", 0)
+                        if total_bad > 0:
+                            self._synthesis_had_failures = (
+                                f"{total_bad} фрагмент(ов) не удалось озвучить "
+                                f"({cv_stats.get('failed_fragments', 0)} ошибок синтеза, "
+                                f"{cv_stats.get('silent_fragments', 0)} беззвучных ответов) "
+                                f"в {cv_stats.get('chapters_with_failures', 0)} глав(ах) — "
+                                "там в файле тишина вместо озвучки. Подробности в журнале выше "
+                                "и в logs\\fb2_reader_gui.log."
+                            )
                 elif mode == "piper":
                     run_piper(
                         self.chapters,
@@ -2608,7 +2832,16 @@ class AudiobookApp(tk.Tk):
                         should_stop=lambda: self._stop_requested,
                     )
                 if not self._stop_requested:
-                    self.after(0, lambda: self.log("--- Озвучка завершена ---"))
+                    if self._synthesis_had_failures:
+                        warn_text = self._synthesis_had_failures
+                        self.after(0, lambda t=warn_text: self.log(
+                            f"--- Озвучка завершена С ОШИБКАМИ: {t} ---"
+                        ))
+                        self.after(0, lambda t=warn_text: messagebox.showwarning(
+                            "Озвучка завершена с ошибками", t
+                        ))
+                    else:
+                        self.after(0, lambda: self.log("--- Озвучка завершена ---"))
             except Exception as e:
                 # Важно: захватываем e через значение по умолчанию (e=e), а
                 # не просто по имени из замыкания - Python неявно удаляет

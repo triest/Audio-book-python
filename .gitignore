@@ -22,6 +22,7 @@ dialogue_characters.json
 
 # Логи, кэш Python, файлы IDE
 *.log
+install_log.txt
 __pycache__/
 *.pyc
 .idea/
@@ -35,9 +36,19 @@ __pycache__/
 # у каждого своё, в репозитории не нужно.
 .venv_cosyvoice/
 
+# То же самое, но отдельное окружение для CosyVoice3 (свои версии
+# зависимостей, torch==2.3.1 и т.д., несовместимые с .venv_cosyvoice) —
+# ставит install.bat, у каждого своё, гигабайты, в репозитории не нужно.
+.venv_cosyvoice3/
+
 # Склонированный репозиторий CosyVoice (install.bat делает git clone) — у
 # него свой .git внутри, и сам он не нужен в этом репозитории.
 /CosyVoice/
+
+# То же самое для CosyVoice3 (install.bat клонирует FunAudioLLM/CosyVoice
+# отдельно, для движка на порту 5012) — свой .git внутри, веса моделей и
+# голосовые профили (CosyVoice3/data/) тоже сюда попадают.
+/CosyVoice3/
 
 # Скачиваемые веса моделей (CosyVoice2 и/или XTTS-v2, если что-то из них
 # ставится не через кэш TTS-библиотеки, а прямо в проект) — большие, гигабайты,
@@ -52,3 +63,8 @@ dist/
 # Скачиваемые голоса Piper TTS (.onnx/.onnx.json, rhasspy/piper-voices) —
 # программа скачивает их сама при первом использовании режима piper.
 piper_voices/
+
+# Данные контейнера CosyVoice3 (голоса + лог) - смонтированы как volume в
+# docker/cosyvoice3/docker-compose.yml, создаются автоматически при первом
+# запуске start_cosyvoice3.bat, в репозитории не нужны.
+docker/cosyvoice3/data/

@@ -1,0 +1,34 @@
+# Запуск: docker compose up -d   (из этой папки, или см. start_cosyvoice3.bat
+# в корне проекта - он делает то же самое одной командой).
+# Остановка: docker compose down  (см. stop_cosyvoice3.bat).
+#
+# Требует Docker Desktop с включённой поддержкой GPU (WSL2 + NVIDIA
+# Container Toolkit) - без неё уберите блок deploy ниже, тогда сервис
+# будет работать на CPU (заметно медленнее, но всё равно рабочий).
+services:
+  cosyvoice3:
+    build: .
+    container_name: audiobook-cosyvoice3
+    restart: unless-stopped
+    ports:
+      - "5012:5012"
+    volumes:
+      # Голоса (cosyvoice3_voices.json + сами .wav-образцы) - переживают
+      # пересборку/перезапуск контейнера.
+      - ./data:/opt/CosyVoice/data
+      # Веса модели (~1-2 ГБ) - скачиваются один раз entrypoint.sh, дальше
+      # берутся из этого volume, а не заново при каждом docker compose up.
+      - cosyvoice3-models:/opt/CosyVoice/pretrained_models
+    environment:
+      - COSYVOICE3_PORT=5012
+      - COSYVOICE3_DATA_DIR=/opt/CosyVoice/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  cosyvoice3-models:
