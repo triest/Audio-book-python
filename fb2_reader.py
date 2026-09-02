@@ -1654,12 +1654,28 @@ QWEN_TTS_LOCAL_VOICES = {
 }
 QWEN_TTS_LOCAL_DEFAULT_VOICE = "Serena"
 QWEN_TTS_LOCAL_MODEL_SIZE = "1.7B"
+# seed=-1 (случайный) на каждый кусок текста — вот откуда "скачущие"
+# интонации и как будто немного другой голос от куска к куску: модель
+# каждый раз генерирует заново со случайным сидом. Фиксированный сид даёт
+# стабильный тембр/интонацию у одного голоса между кусками.
+QWEN_TTS_LOCAL_SEED = 42
+# Куски покрупнее (относительно облачных 350 симв.) уменьшают число "швов",
+# но модель Qwen3-TTS сама умеет уверенно озвучить лишь ограниченный кусок
+# за один вызов — при 1800 симв. часть текста в куске обрывалась (отсюда
+# "озвучил не всю главу"). 500 — компромисс, при проблемах уменьшайте ещё.
+QWEN_TTS_LOCAL_MAX_CHARS = 500
+# Пустая инструкция "instruct" оставляет модели полную свободу в выборе
+# интонации — отсюда "слишком эмоционально". Нейтральная инструкция по
+# умолчанию слегка сдерживает экспрессию; при желании отредактируйте.
+QWEN_TTS_LOCAL_INSTRUCT = "Спокойное, ровное повествование, без лишней экспрессии и театральности."
 
 
 def synth_qwen_tts_local_chunk(text: str, server_url: str, voice: str,
                                 language: str = QWEN_TTS_LANGUAGE,
                                 api_name: str = QWEN_TTS_LOCAL_API_NAME,
                                 model_size: str = QWEN_TTS_LOCAL_MODEL_SIZE,
+                                seed: int = QWEN_TTS_LOCAL_SEED,
+                                instruct: str = QWEN_TTS_LOCAL_INSTRUCT,
                                 log_fn=None) -> bytes:
     """Один запрос к локально запущенному Gradio-серверу Qwen3-TTS (без
     DashScope/облака/карты — модель считается на видеокарте пользователя).
@@ -1681,8 +1697,8 @@ def synth_qwen_tts_local_chunk(text: str, server_url: str, voice: str,
     try:
         client = Client(server_url)
         result = client.predict(
-            text=text, language=language, speaker=voice, instruct="",
-            model_size=model_size, seed=-1, api_name=api_name,
+            text=text, language=language, speaker=voice, instruct=instruct,
+            model_size=model_size, seed=seed, api_name=api_name,
         )
     except Exception as e:
         if log_fn:
@@ -1766,7 +1782,7 @@ def run_qwen_tts_local(chapters, outdir: Path, start: int, play: bool, server_ur
 
         voice_groups = resolve_voice_groups(text, voice, dialogue_voices, outdir,
                                              attribution=attribution, log_fn=log)
-        segments = _chunk_voice_groups(voice_groups, QWEN_TTS_MAX_CHARS)
+        segments = _chunk_voice_groups(voice_groups, QWEN_TTS_LOCAL_MAX_CHARS)
         chunks_total = len(segments) or 1
         if on_progress:
             on_progress(pos, total, 0, chunks_total)
