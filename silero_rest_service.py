@@ -182,7 +182,7 @@ async def getwav(text_to_speech: str, speaker: str = "xenia", sample_rate: int =
         raise HTTPException(status_code=500, detail="TTS model is not loaded")
  
     preprocessed_text = preprocess_text(text_to_speech)
-    accented_text = accentizer.process_all(preprocessed_text) if accentizer else preprocessed_text
+    accented_text = _run_accentizer(preprocessed_text)
     logger.info(f"[/getwav] Text after accent processing: {accented_text[:200]}")
  
     try:
@@ -214,10 +214,95 @@ _ANY_TAG_RE = re.compile(r"<[^>]+>")
 _PROSODY_TAG_RE = re.compile(r"</?prosody[^>]*>")
  
  
+# --------------------------------------------------------------------------
+# Две отдельные проблемы с RUAccent, которые видны на слух в готовой
+# озвучке (клиент fb2_reader.py, локальный словарь ударений уже расставляет
+# часть слов с "+" ДО отправки на этот сервис — см. apply_stress_dictionary
+# там же):
+#
+# 1) RUAccent может не узнать уже стоящее "+"-ударение в присланном тексте
+#    и попытаться расставить своё ещё раз, поверх — два ударения в одном
+#    слове звучат как заметное "растягивание". Чиним через protect/restore:
+#    любой токен, где уже стоит "+" (то есть словарь fb2_reader.py его уже
+#    обработал), на время process_all() прячется за плейсхолдером и
+#    возвращается на место как есть, без изменений.
+#
+# 2) У самого RUAccent (расстановка ударений и "ё" — одна и та же модель)
+#    заметно бывают ложные "е" -> "ё" там, где не нужно ("самое" -> "самоё"
+#    и т.п.) — жалоба пользователей "часто вместо е ставит ё". Раз "ё" в
+#    русском языке всегда ударная, а RUAccent параллельно с заменой буквы
+#    сам же расставляет "+", это можно проверить на внутреннюю
+#    согласованность: если "ё" появилась, а сам RUAccent не пометил её как
+#    ударную ("+" не стоит прямо перед этой "ё") — то его же собственная
+#    модель, по сути, сама себе противоречит, и такой "ё" мы не доверяем,
+#    возвращаем обратно "е". "Е" вместо "ё" на письме — обычное дело (в
+#    книгах "ё" почти всегда печатают как обычную "е"), а вот лишняя
+#    услышанная "ё" режет слух — так что при сомнении лучше смолчать про "ё".
+# --------------------------------------------------------------------------
+
+_ALREADY_ACCENTED_RE = re.compile(r"[А-Яа-яЁё]*\+[А-Яа-яЁё-]*[А-Яа-яЁё]")
+_ACCENT_GUARD_RE = re.compile(r"ACCENTGUARD(\d+)")
+
+
+def _protect_already_accented(text: str) -> "tuple[str, dict]":
+    """Прячет за плейсхолдерами ACCENTGUARD{n} слова, где уже стоит "+"
+    (расставлено раньше — локальным словарём клиента или предыдущим
+    проходом этой же функции) — чтобы process_all() их не трогал вообще."""
+    placeholders: dict = {}
+    counter = [0]
+
+    def repl(m: "re.Match") -> str:
+        idx = counter[0]
+        counter[0] += 1
+        placeholder = f"ACCENTGUARD{idx}"
+        placeholders[placeholder] = m.group(0)
+        return placeholder
+
+    return _ALREADY_ACCENTED_RE.sub(repl, text), placeholders
+
+
+def _restore_already_accented(text: str, placeholders: dict) -> str:
+    if not placeholders:
+        return text
+
+    def repl(m: "re.Match") -> str:
+        return placeholders.get(m.group(0), "")
+
+    return _ACCENT_GUARD_RE.sub(repl, text)
+
+
+def _sane_yo(text: str) -> str:
+    """"ё" без "+" прямо перед ней (т.е. сам RUAccent не считает её
+    ударной, хотя "ё" в русском языке всегда ударная) возвращается в "е" —
+    см. пояснение выше."""
+    chars = list(text)
+    for i, ch in enumerate(chars):
+        if ch not in ("ё", "Ё"):
+            continue
+        prev = chars[i - 1] if i > 0 else ""
+        if prev != "+":
+            chars[i] = "е" if ch == "ё" else "Е"
+    return "".join(chars)
+
+
+def _run_accentizer(text: str) -> str:
+    """Единая точка вызова RUAccent для уже препроцессенного текста —
+    защищает уже акцентированные (клиентом) слова от повторной обработки
+    и подчищает внутренне противоречивые "ё" на выходе. Используется и
+    /getwav (обычный текст), и _accent_plain/accentize_ssml_text_nodes
+    (SSML, presented как один и тот же текстовый узел)."""
+    if accentizer is None:
+        return text
+    protected, placeholders = _protect_already_accented(text)
+    accented = accentizer.process_all(protected)
+    restored = _restore_already_accented(accented, placeholders)
+    return _sane_yo(restored)
+
+
 def _accent_plain(text: str) -> str:
     """Прогоняет обычный (не-SSML) текст через preprocess_text + ударения."""
     preprocessed = preprocess_text(text)
-    return accentizer.process_all(preprocessed) if accentizer else preprocessed
+    return _run_accentizer(preprocessed)
  
  
 def accentize_ssml_text_nodes(ssml: str) -> str:

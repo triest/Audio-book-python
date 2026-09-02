@@ -68,3 +68,8 @@ piper_voices/
 # docker/cosyvoice3/docker-compose.yml, создаются автоматически при первом
 # запуске start_cosyvoice3.bat, в репозитории не нужны.
 docker/cosyvoice3/data/
+
+# Офлайн-корпус ударений (~1.68 млн слов/словоформ, ~10 МБ gzip,
+# источник: https://github.com/Koziev/NLP_Datasets) — скачивается сам
+# через install.bat (download_stress_corpus.py), в репозитории не нужен.
+stress_corpus_ru.tsv.gz

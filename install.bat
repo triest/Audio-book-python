@@ -84,6 +84,18 @@ rem Base dependencies - needed almost always (fb2 parsing, GUI, downloads)
 "%VENV_PY%" -m pip install lxml numpy tqdm requests
 if errorlevel 1 goto :warn_partial
 
+rem Offline stress dictionary (~1.68M Russian words/forms, ~10 MB gzipped,
+rem source: https://github.com/Koziev/NLP_Datasets) - used by fb2_reader.py
+rem as the first (fast, no network) source for word stress when a word is
+rem not in stress_dictionary.json, well before it would fall back to
+rem looking the word up online (Wiktionary), which cuts down a lot on how
+rem often that online fallback is even needed - and how often it can hit
+rem the site's own rate limit (HTTP 429) on a long book. Best-effort only:
+rem download_stress_corpus.py never fails the install if this can't be
+rem fetched (no internet right now, GitHub unreachable, etc.) - it just
+rem prints a warning and fb2_reader.py keeps working without it.
+"%VENV_PY%" download_stress_corpus.py
+
 rem Local Silero synthesis (the main, recommended mode)
 "%VENV_PY%" -m pip install silero torch torchaudio omegaconf
 if errorlevel 1 goto :warn_partial
@@ -91,6 +103,30 @@ if errorlevel 1 goto :warn_partial
 rem Silero via a separate REST service (SSML pauses, optional)
 "%VENV_PY%" -m pip install fastapi uvicorn ruaccent num2words
 if errorlevel 1 goto :warn_partial
+
+rem pymorphy3 - Russian morphology analyzer, used to pick the correct
+rem stress for a handful of common words whose stress depends on
+rem grammatical case ("звезды" - genitive singular vs nominative plural,
+rem etc. - see resolve_case_ambiguous_nouns in fb2_reader.py). Optional:
+rem if it fails to install, that specific feature is silently skipped and
+rem everything else keeps working as before.
+"%VENV_PY%" -m pip install pymorphy3 pymorphy3-dicts-ru
+if errorlevel 1 echo WARNING: pymorphy3 failed to install - context-based stress for a few case-ambiguous words (e.g. "звезды") will be less accurate.
+
+rem dashscope - client library for Qwen3-TTS (Alibaba's cloud TTS API,
+rem "qwen_tts" mode). Optional: only needed if you actually use that mode;
+rem if it fails to install, the other TTS modes (Silero, Yandex, etc.) are
+rem unaffected - qwen_tts mode will just show a clear error until it's
+rem installed.
+"%VENV_PY%" -m pip install dashscope
+if errorlevel 1 echo WARNING: dashscope failed to install - the "Qwen3-TTS" mode will not work until it is installed manually.
+
+rem gradio_client - talks to a locally running Qwen3-TTS Gradio server
+rem ("qwen_tts_local" mode) - no cloud account/card needed, runs on your own
+rem GPU via a separately installed server (e.g. through Pinokio). Optional,
+rem same as dashscope above.
+"%VENV_PY%" -m pip install gradio_client
+if errorlevel 1 echo WARNING: gradio_client failed to install - the "Qwen3-TTS (локально)" mode will not work until it is installed manually.
 
 rem Some of the packages above can pull in an older version of click
 rem (used by third-party dependencies like huggingface-hub) - pip

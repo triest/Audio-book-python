@@ -24,6 +24,12 @@ from fb2_reader import (
     PIPER_VOICES,
     PIPER_DEFAULT_VOICE,
     COSYVOICE_DEFAULT_REST_URL,
+    QWEN_TTS_VOICES,
+    QWEN_TTS_DEFAULT_VOICE,
+    QWEN_TTS_LOCAL_DEFAULT_URL,
+    QWEN_TTS_LOCAL_VOICES,
+    QWEN_TTS_LOCAL_DEFAULT_VOICE,
+    book_manual_stress_overrides_path,
     cosyvoice_list_voices,
     list_offline_voices,
     parse_fb2,
@@ -35,6 +41,8 @@ from fb2_reader import (
     run_silero,
     run_silero_rest,
     run_yandex,
+    run_qwen_tts,
+    run_qwen_tts_local,
 )
 from silero_config import (
     DEFAULT_SILERO_MODEL,
@@ -46,128 +54,35 @@ from silero_config import (
     speaker_choices,
 )
 
-
-def _app_dir() -> Path:
-    """Папка, где лежит программа. В обычном запуске (python fb2_reader_gui.py)
-    это папка со скриптом. В собранной PyInstaller-версии (.exe) __file__
-    указывает на временную папку распаковки, которая меняется при каждом
-    запуске — поэтому там нужно брать папку, где лежит сам .exe."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def _make_logs_dir() -> Path:
-    """Отдельная папка "logs" рядом с программой — куда пишется файл
-    журнала. Если её почему-то не удаётся создать там (например, программа
-    лежит в защищённой системной папке без прав на запись — на некоторых
-    компьютерах это Program Files), используем временную папку системы как
-    запасной вариант, чтобы журнал всё равно куда-то писался, а не терялся
-    молча."""
-    primary = _app_dir() / "logs"
-    try:
-        primary.mkdir(parents=True, exist_ok=True)
-        probe = primary / ".write_test"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink(missing_ok=True)
-        return primary
-    except Exception:
-        import tempfile
-        fallback = Path(tempfile.gettempdir()) / "fb2_reader_logs"
-        try:
-            fallback.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        return fallback
-
-
-LOGS_DIR = _make_logs_dir()
-LOG_FILE_PATH = LOGS_DIR / "fb2_reader_gui.log"
-_log_file_handle = None
-_log_file_open_failed = False
-
-
-LOG_FILE_MAX_BYTES = 2_000_000  # ~2 МБ — после этого старый файл переносится в .1, чтобы не расти бесконечно
-
-# Должно совпадать с SERVICE_VERSION в cosyvoice_rest_service.py. Программа
-# сверяет его через /health и, если уже запущенный сервис отвечает старой
-# версией, сама перезапускает его - иначе после обновления файлов сервис
-# продолжал бы молча работать со старым кодом, пока пользователь не
-# перезапустит компьютер вручную (именно так сломалось удаление голосов).
-COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.10"
-
-# Движки синтеза, которые умеет запускать cosyvoice_rest_service.py (см. его
-# ENGINE/TTS_ENGINE) - код (ключ словаря) идёт в переменную окружения
-# TTS_ENGINE процесса сервиса и сравнивается со значением, которое сервис
-# сам сообщает в /health ("engine"), человекочитаемая подпись - то, что
-# видит пользователь в выпадающем списке на вкладке «Голоса CosyVoice».
-COSYVOICE_ENGINE_LABELS = {
-    "f5": "F5-TTS-Russian",
-    "espeech": "ESpeech RL-V2 (F5-based, меньше шума, рекомендуется)",
-    "f5winter": "F5-TTS-Russian winter (свежий чекпоинт, с ударениями)",
-    "xtts": "XTTS-v2 (запасной, шумнее)",
-    "cosyvoice3": "CosyVoice 3 (экспериментально, отдельное окружение)",
-}
-COSYVOICE_ENGINE_CODES = {label: code for code, label in COSYVOICE_ENGINE_LABELS.items()}
-COSYVOICE_DEFAULT_ENGINE = "espeech"
-
-# CosyVoice3, в отличие от остальных движков (f5/espeech/f5winter/xtts),
-# запускается подпроцессом в СВОЁМ окружении .venv_cosyvoice3 (не в общем
-# .venv_cosyvoice - см. cosyvoice3_rest_service.py и install.bat) - у него
-# несовместимый со всем остальным набор фиксированных версий зависимостей.
-# Порт и ожидаемая версия сервиса поэтому тоже отдельные.
-COSYVOICE3_DEFAULT_REST_URL = "http://localhost:5012"
-COSYVOICE3_EXPECTED_SERVICE_VERSION = "2026-08-24.15-transcribe-window-fix"
-
-
-def _write_log_file(s: str):
-    """Дублирует всё, что попадает в окно «Журнал» (и вообще все ошибки —
-    см. _install_error_logging), в текстовый файл в папке logs/ рядом с
-    программой — окно журнала в tkinter не всегда удобно копировать мышью,
-    а из обычного файла (Блокнотом или чем угодно) можно скопировать что
-    угодно без проблем.
-
-    Файл ДОПИСЫВАЕТСЯ между запусками программы (а не перезаписывается с
-    нуля каждый раз) — раньше он открывался в режиме "w" (перезапись), из-за
-    чего при каждом новом запуске программы весь журнал предыдущего запуска
-    стирался; если ошибка случалась в одном запуске, а посмотреть файл
-    получалось только после следующего — важные строки уже пропадали.
-    Теперь только при СТАРТЕ программы, если файл вырос больше ~2 МБ, он
-    переименовывается в fb2_reader_gui.log.1 (затирая предыдущий .1) — так
-    файл не растёт бесконечно, но и не обнуляется просто от перезапуска."""
-    global _log_file_handle, _log_file_open_failed
-    if _log_file_handle is None:
-        try:
-            if LOG_FILE_PATH.exists() and LOG_FILE_PATH.stat().st_size > LOG_FILE_MAX_BYTES:
-                rotated = LOG_FILE_PATH.with_suffix(LOG_FILE_PATH.suffix + ".1")
-                try:
-                    rotated.unlink(missing_ok=True)
-                    LOG_FILE_PATH.rename(rotated)
-                except Exception:
-                    pass  # не критично - просто продолжим дописывать в тот же файл
-            _log_file_handle = open(LOG_FILE_PATH, "a", encoding="utf-8", buffering=1)
-            _log_file_handle.write(f"\n=== Запуск программы: {LOG_FILE_PATH} ===\n")
-        except Exception:
-            _log_file_handle = False  # не удалось открыть — больше не пробуем
-            _log_file_open_failed = True
-    if _log_file_handle:
-        try:
-            _log_file_handle.write(s)
-        except Exception:
-            pass
-
-
-def _log_exception_to_file(context: str, exc_info=None):
-    """Пишет в файл журнала полный traceback (не только текст ошибки) —
-    используется и глобальным обработчиком необработанных исключений, и
-    отдельными местами в коде, где ошибка перехватывается вручную (запуск
-    сервисов, сетевые запросы и т.п.), чтобы для диагностики всегда было
-    видно, что именно произошло и где."""
-    import traceback
-    if exc_info is None:
-        exc_info = sys.exc_info()
-    tb_text = "".join(traceback.format_exception(*exc_info)) if exc_info[0] else ""
-    _write_log_file(f"\n--- ОШИБКА ({context}) ---\n{tb_text}\n")
+# Общие константы/функции вынесены в gui_shared.py (см. его docstring) —
+# специально, чтобы у миксинов (gui_service_management.py,
+# gui_voice_profiles.py, gui_player.py, gui_ui_builder.py) не было обратного
+# импорта из fb2_reader_gui, который ломался при запуске программы напрямую
+# (python fb2_reader_gui.py) циклической ошибкой импорта.
+#
+# import gui_shared (модуль целиком, не только from...import) нужен отдельно,
+# потому что _log_file_open_failed - изменяемая глобальная переменная внутри
+# gui_shared (её меняет gui_shared._write_log_file через global). Если бы мы
+# сделали `from gui_shared import _log_file_open_failed`, то получили бы
+# независимую копию значения на момент импорта (всегда False) и не увидели
+# бы более позднее изменение - поэтому ниже в _install_error_logging нужно
+# обращаться именно как gui_shared._log_file_open_failed.
+import gui_shared
+from gui_shared import (
+    LOGS_DIR,
+    LOG_FILE_PATH,
+    LOG_FILE_MAX_BYTES,
+    COSYVOICE_EXPECTED_SERVICE_VERSION,
+    COSYVOICE_ENGINE_LABELS,
+    COSYVOICE_ENGINE_CODES,
+    COSYVOICE_DEFAULT_ENGINE,
+    COSYVOICE3_DEFAULT_REST_URL,
+    COSYVOICE3_EXPECTED_SERVICE_VERSION,
+    _app_dir,
+    _write_log_file,
+    _log_exception_to_file,
+    add_context_menu,
+)
 
 
 class TextRedirector(io.TextIOBase):
@@ -206,35 +121,20 @@ SETTINGS_FIELDS = [
     "sentence_break_var", "paragraph_break_var", "comma_break_var",
     "accent_var", "yo_var", "emphasis_var",
     "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
+    "qwen_api_key_var", "qwen_voice_var",
+    "qwen_local_url_var", "qwen_local_start_cmd_var", "qwen_local_auto_stop_var",
     "dialogue_var", "attribution_var", "attribution_provider_var",
     "attribution_api_key_var", "attribution_model_var", "attribution_folder_id_var",
 ]
 
 
-def add_context_menu(widget):
-    """Добавляет виджету Entry стандартное контекстное меню правой кнопкой
-    мыши (Вырезать/Копировать/Вставить/Выделить всё) — у полей tkinter его
-    нет по умолчанию, из-за чего вставка правой кнопкой мыши (в отличие от
-    Ctrl+V) может выглядеть так, будто ничего не работает."""
-    menu = tk.Menu(widget, tearoff=0)
-    menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
-    menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
-    menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
-    menu.add_separator()
-    menu.add_command(label="Выделить всё", command=lambda: widget.select_range(0, "end"))
-
-    def show_menu(event):
-        widget.focus_set()
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-
-    widget.bind("<Button-3>", show_menu)
-    return widget
+from gui_service_management import ServiceManagementMixin
+from gui_voice_profiles import CosyVoiceVoicesMixin
+from gui_player import PlayerMixin
+from gui_ui_builder import UIBuilderMixin
 
 
-class AudiobookApp(tk.Tk):
+class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UIBuilderMixin, tk.Tk):
     def __init__(self, initial_book: Path | None = None):
         super().__init__()
         self.title("FB2 Audiobook — озвучивание книг")
@@ -252,6 +152,8 @@ class AudiobookApp(tk.Tk):
         self._rest_proc: subprocess.Popen | None = None
         self._cosyvoice_proc: subprocess.Popen | None = None
         self._cosyvoice3_proc: subprocess.Popen | None = None
+        self._qwen_local_proc: subprocess.Popen | None = None
+        self._qwen_local_started_by_us = False
         self._mixer_ready = False
 
         # Запоминаем последнюю папку, открытую в каждом отдельном диалоге
@@ -335,760 +237,8 @@ class AudiobookApp(tk.Tk):
         except OSError as e:
             self.log(f"Не удалось сохранить настройки: {e}")
 
-    def _build_ui(self):
-        style = ttk.Style(self)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
 
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True)
 
-        main_tab = ttk.Frame(self.notebook)
-        self.notebook.add(main_tab, text="Озвучка")
-
-        voices_tab = ttk.Frame(self.notebook)
-        self.notebook.add(voices_tab, text="Голоса CosyVoice")
-
-        outer = ttk.Frame(main_tab, padding=10)
-        outer.pack(fill="both", expand=True)
-
-        # --- верх: выбор файла ---
-        file_row = ttk.Frame(outer)
-        file_row.pack(fill="x", pady=(0, 8))
-
-        ttk.Label(file_row, text="Книга FB2:").pack(side="left")
-        self.book_var = tk.StringVar()
-        add_context_menu(
-            ttk.Entry(file_row, textvariable=self.book_var)
-        ).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(file_row, text="Обзор…", command=self.browse_book).pack(side="left")
-        ttk.Button(file_row, text="Загрузить", command=self.reload_book).pack(side="left", padx=(6, 0))
-
-        paned = ttk.Panedwindow(outer, orient="horizontal")
-        paned.pack(fill="both", expand=True)
-
-        # --- левая колонка: главы ---
-        left = ttk.Frame(paned, padding=(0, 0, 8, 0))
-        paned.add(left, weight=3)
-
-        self.title_label = ttk.Label(left, text="Книга не выбрана", font=("Segoe UI", 11, "bold"))
-        self.title_label.pack(anchor="w", pady=(0, 4))
-
-        self.chapters_info = ttk.Label(left, text="Глав: —")
-        self.chapters_info.pack(anchor="w", pady=(0, 6))
-
-        chapters_frame = ttk.LabelFrame(left, text="Главы", padding=6)
-        chapters_frame.pack(fill="both", expand=True)
-
-        self.chapters_list = tk.Listbox(
-            chapters_frame,
-            activestyle="none",
-            exportselection=False,
-            font=("Consolas", 10),
-            selectmode=tk.EXTENDED,
-        )
-        scroll = ttk.Scrollbar(chapters_frame, orient="vertical", command=self.chapters_list.yview)
-        self.chapters_list.configure(yscrollcommand=scroll.set)
-        self.chapters_list.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        self.chapters_list.bind("<<ListboxSelect>>", self._on_chapters_selection_change)
-
-        ttk.Label(
-            left,
-            text="Можно выделить несколько глав (Ctrl/Shift+клик) — тогда озвучатся "
-                 "только они, а «Начать с главы» справа будет проигнорировано. Если "
-                 "выделена ровно одна глава, ниже можно озвучить только её часть.",
-            wraplength=340, foreground="#555", justify="left",
-        ).pack(anchor="w", pady=(4, 0))
-
-        self.chapter_range_frame = ttk.LabelFrame(left, text="Кусок главы (необязательно)", padding=6)
-        self.chapter_range_frame.pack(fill="x", pady=(6, 0))
-        ttk.Label(self.chapter_range_frame, text="С символа:").grid(row=0, column=0, sticky="w")
-        self.char_from_var = tk.IntVar(value=0)
-        self.char_from_spin = ttk.Spinbox(
-            self.chapter_range_frame, from_=0, to=0, textvariable=self.char_from_var, width=8
-        )
-        self.char_from_spin.grid(row=0, column=1, sticky="w", padx=(4, 12))
-        ttk.Label(self.chapter_range_frame, text="До символа:").grid(row=0, column=2, sticky="w")
-        self.char_to_var = tk.IntVar(value=0)
-        self.char_to_spin = ttk.Spinbox(
-            self.chapter_range_frame, from_=0, to=0, textvariable=self.char_to_var, width=8
-        )
-        self.char_to_spin.grid(row=0, column=3, sticky="w", padx=(4, 0))
-        self.char_range_hint = ttk.Label(
-            self.chapter_range_frame, text="Выделите ровно одну главу, чтобы включить.",
-            foreground="#888",
-        )
-        self.char_range_hint.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        for w in (self.char_from_spin, self.char_to_spin):
-            w.configure(state="disabled")
-
-        # --- правая колонка: настройки ---
-        # Настроек стало много (голоса, диалоги, атрибуция, интонация...) —
-        # они не помещаются целиком по высоте на многих экранах, поэтому
-        # верхняя часть (все LabelFrame с настройками) идёт в прокручиваемую
-        # область, а кнопки/прогресс/журнал внизу закреплены и видны всегда.
-        right = ttk.Frame(paned, padding=(8, 0, 0, 0))
-        paned.add(right, weight=2)
-
-        # --- низ (закреплён): кнопки, прогресс-бар, журнал ---
-        btn_row = ttk.Frame(right)
-        btn_row.pack(side="bottom", fill="x", pady=(10, 6))
-
-        self.start_btn = ttk.Button(btn_row, text="Начать озвучку", command=self.start_synthesis)
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(btn_row, text="Остановить", command=self.request_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=(8, 0))
-
-        # --- встроенный плеер: играет уже озвученную главу (выбранную в
-        # списке слева) или очередную главу сразу после её озвучки (если
-        # включено "Проигрывать после озвучки каждой главы"). Раньше
-        # проигрывание шло через системный проигрыватель/winsound без
-        # какой-либо возможности остановить, поставить на паузу или
-        # перемотать — теперь звук идёт через pygame.mixer, которым можно
-        # управлять прямо отсюда: кнопка play/пауза, стоп и полоса
-        # прокрутки (перемотка кликом/перетаскиванием).
-        player_frame = ttk.LabelFrame(right, text="Проигрывание", padding=(8, 4))
-        player_frame.pack(side="bottom", fill="x", pady=(0, 6))
-
-        self.player_title_label = ttk.Label(player_frame, text="Глава не выбрана", foreground="#555")
-        self.player_title_label.pack(anchor="w", fill="x")
-
-        player_seek_row = ttk.Frame(player_frame)
-        player_seek_row.pack(fill="x", pady=(4, 0))
-        self.player_pos_var = tk.DoubleVar(value=0.0)
-        self.player_scale = ttk.Scale(
-            player_seek_row, from_=0, to=1, orient="horizontal",
-            variable=self.player_pos_var, command=self._on_player_scale_move, state="disabled",
-        )
-        self.player_scale.pack(side="left", fill="x", expand=True)
-        self.player_scale.bind("<ButtonPress-1>", self._on_player_seek_start)
-        self.player_scale.bind("<ButtonRelease-1>", self._on_player_seek_commit)
-        self.player_time_label = ttk.Label(player_seek_row, text="", width=12, anchor="e")
-        self.player_time_label.pack(side="left", padx=(6, 0))
-
-        player_controls_row = ttk.Frame(player_frame)
-        player_controls_row.pack(fill="x", pady=(4, 0))
-        self.player_play_btn = ttk.Button(
-            player_controls_row, text="▶ Играть", command=self._player_play_pause,
-            state="disabled", width=12,
-        )
-        self.player_play_btn.pack(side="left")
-        self.player_stop_btn = ttk.Button(
-            player_controls_row, text="⏹ Стоп", command=self._player_stop, state="disabled", width=10,
-        )
-        self.player_stop_btn.pack(side="left", padx=(6, 0))
-
-        self.progress_label = ttk.Label(right, text="", foreground="#555")
-        self.progress_label.pack(side="bottom", fill="x", pady=(0, 6))
-        self.progress = ttk.Progressbar(right, mode="determinate", maximum=1000, value=0)
-        self.progress.pack(side="bottom", fill="x", pady=(2, 2))
-
-        log_frame = ttk.LabelFrame(right, text="Журнал", padding=6)
-        log_frame.pack(side="bottom", fill="both", expand=True, pady=(8, 0))
-
-        log_buttons_row = ttk.Frame(log_frame)
-        log_buttons_row.pack(side="bottom", fill="x", pady=(4, 0))
-        ttk.Button(
-            log_buttons_row, text="Копировать всё", command=self._copy_log_to_clipboard
-        ).pack(side="left")
-        ttk.Button(
-            log_buttons_row, text="Открыть файл журнала", command=self._open_log_file
-        ).pack(side="left", padx=(6, 0))
-        ttk.Label(
-            log_buttons_row, text=f"Файл: logs\\{LOG_FILE_PATH.name}", foreground="#555"
-        ).pack(side="left", padx=(10, 0))
-
-        log_text_row = ttk.Frame(log_frame)
-        log_text_row.pack(side="top", fill="both", expand=True)
-        self.log_text = tk.Text(log_text_row, height=10, wrap="word", state="disabled", font=("Consolas", 9))
-        log_scroll = ttk.Scrollbar(log_text_row, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        log_scroll.pack(side="right", fill="y")
-
-        # --- верх (прокручивается): все настройки ---
-        scroll_holder = ttk.Frame(right)
-        scroll_holder.pack(side="top", fill="both", expand=True)
-
-        settings_canvas = tk.Canvas(scroll_holder, highlightthickness=0)
-        settings_scroll = ttk.Scrollbar(scroll_holder, orient="vertical", command=settings_canvas.yview)
-        settings_canvas.configure(yscrollcommand=settings_scroll.set)
-        settings_canvas.pack(side="left", fill="both", expand=True)
-        settings_scroll.pack(side="right", fill="y")
-
-        right_scroll = ttk.Frame(settings_canvas)
-        settings_canvas_window = settings_canvas.create_window((0, 0), window=right_scroll, anchor="nw")
-
-        def _on_right_scroll_configure(_event=None):
-            settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
-
-        def _on_settings_canvas_configure(event):
-            settings_canvas.itemconfigure(settings_canvas_window, width=event.width)
-
-        right_scroll.bind("<Configure>", _on_right_scroll_configure)
-        settings_canvas.bind("<Configure>", _on_settings_canvas_configure)
-
-        def _on_settings_mousewheel(event):
-            # Windows/macOS: event.delta; Linux: Button-4/5 обрабатываются отдельно ниже
-            settings_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _bind_settings_wheel(_event=None):
-            settings_canvas.bind_all("<MouseWheel>", _on_settings_mousewheel)
-            settings_canvas.bind_all("<Button-4>", lambda e: settings_canvas.yview_scroll(-1, "units"))
-            settings_canvas.bind_all("<Button-5>", lambda e: settings_canvas.yview_scroll(1, "units"))
-
-        def _unbind_settings_wheel(_event=None):
-            settings_canvas.unbind_all("<MouseWheel>")
-            settings_canvas.unbind_all("<Button-4>")
-            settings_canvas.unbind_all("<Button-5>")
-
-        settings_canvas.bind("<Enter>", _bind_settings_wheel)
-        settings_canvas.bind("<Leave>", _unbind_settings_wheel)
-
-        settings = ttk.LabelFrame(right_scroll, text="Настройки озвучки", padding=10)
-        settings.pack(fill="x")
-
-        row = 0
-        ttk.Label(settings, text="Режим:").grid(row=row, column=0, sticky="w", pady=4)
-        self.mode_var = tk.StringVar(value=TTS_MODES["silero"])
-        self._mode_labels = list(TTS_MODES.values())
-        self._mode_keys = list(TTS_MODES.keys())
-        self.mode_combo = ttk.Combobox(
-            settings,
-            textvariable=self.mode_var,
-            values=self._mode_labels,
-            state="readonly",
-            width=28,
-        )
-        self.mode_combo.grid(row=row, column=1, sticky="ew", pady=4)
-        self.mode_desc = ttk.Label(settings, text=TTS_MODES["silero"], wraplength=280, foreground="#555")
-        self.mode_desc.grid(row=row + 1, column=1, sticky="w", pady=(0, 6))
-
-        row += 2
-        self.model_label = ttk.Label(settings, text="Модель:")
-        self.model_label.grid(row=row, column=0, sticky="w", pady=4)
-        self._model_keys = list(SILERO_MODELS.keys())
-        self._model_labels = [SILERO_MODELS[k]["title"] for k in self._model_keys]
-        default_model_idx = self._model_keys.index(DEFAULT_SILERO_MODEL)
-        self.model_var = tk.StringVar(value=self._model_labels[default_model_idx])
-        self.model_row = ttk.Frame(settings)
-        self.model_row.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
-        self.model_combo = ttk.Combobox(
-            self.model_row,
-            textvariable=self.model_var,
-            values=self._model_labels,
-            state="readonly",
-            width=22,
-        )
-        self.model_combo.pack(side="left", fill="x", expand=True)
-        self.check_updates_btn = ttk.Button(
-            self.model_row, text="Обновления…", command=self.check_model_updates
-        )
-        self.check_updates_btn.pack(side="left", padx=(6, 0))
-
-        row += 1
-        ttk.Label(settings, text="Голос:").grid(row=row, column=0, sticky="w", pady=4)
-        self.voice_var = tk.StringVar()
-        self.voice_combo = ttk.Combobox(settings, textvariable=self.voice_var, state="readonly", width=28)
-        self.voice_combo.grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Button(settings, text="Обновить системные", command=self.refresh_offline_voices).grid(
-            row=row, column=2, padx=(6, 0), pady=4
-        )
-
-        row += 1
-        ttk.Label(settings, text="Начать с главы:").grid(row=row, column=0, sticky="w", pady=4)
-        self.start_var = tk.IntVar(value=1)
-        self.start_spin = ttk.Spinbox(settings, from_=1, to=1, textvariable=self.start_var, width=8)
-        self.start_spin.grid(row=row, column=1, sticky="w", pady=4)
-
-        row += 1
-        ttk.Label(settings, text="Папка вывода:").grid(row=row, column=0, sticky="w", pady=4)
-        out_row = ttk.Frame(settings)
-        out_row.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
-        self.outdir_var = tk.StringVar(value=str(Path("audiobook_output").resolve()))
-        add_context_menu(
-            ttk.Entry(out_row, textvariable=self.outdir_var)
-        ).pack(side="left", fill="x", expand=True)
-        ttk.Button(out_row, text="…", width=3, command=self.browse_outdir).pack(side="left", padx=(4, 0))
-
-        row += 1
-        self.play_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(settings, text="Проигрывать после озвучки каждой главы", variable=self.play_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=4
-        )
-
-        row += 1
-        self.sample_rate_label = ttk.Label(settings, text="Частота (Гц):")
-        self.sample_rate_label.grid(row=row, column=0, sticky="w", pady=4)
-        self.sample_rate_var = tk.StringVar(value="48000")
-        self.sample_rate_combo = ttk.Combobox(
-            settings,
-            textvariable=self.sample_rate_var,
-            values=["8000", "24000", "48000"],
-            state="readonly",
-            width=10,
-        )
-        self.sample_rate_combo.grid(row=row, column=1, sticky="w", pady=4)
-
-        row += 1
-        self.rest_url_label = ttk.Label(settings, text="REST URL:")
-        self.rest_url_label.grid(row=row, column=0, sticky="w", pady=4)
-        self.rest_url_var = tk.StringVar(value="http://localhost:5010")
-        self.rest_url_entry = add_context_menu(ttk.Entry(settings, textvariable=self.rest_url_var))
-        self.rest_url_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
-
-        row += 1
-        self.auto_start_rest_var = tk.BooleanVar(value=True)
-        self.auto_start_rest_check = ttk.Checkbutton(
-            settings,
-            text="Запускать сервис Silero REST автоматически (без консоли)",
-            variable=self.auto_start_rest_var,
-        )
-        self.auto_start_rest_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
-
-        self.cosyvoice_rest_url_var = tk.StringVar(value=COSYVOICE_DEFAULT_REST_URL)
-        self.cosyvoice_engine_var = tk.StringVar(value=COSYVOICE_ENGINE_LABELS[COSYVOICE_DEFAULT_ENGINE])
-        row += 1
-        self.cosyvoice_tab_hint = ttk.Label(
-            settings,
-            text="Список голосов и добавление нового голоса из аудиофайла — "
-                 "на вкладке «Голоса CosyVoice» вверху окна.",
-            foreground="#555", wraplength=280, justify="left",
-        )
-        self.cosyvoice_tab_hint.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
-
-        row += 1
-        self.rate_label = ttk.Label(settings, text="Скорость (offline):")
-        self.rate_label.grid(row=row, column=0, sticky="w", pady=4)
-        self.rate_var = tk.IntVar(value=170)
-        self.rate_spin = ttk.Spinbox(settings, from_=80, to=300, textvariable=self.rate_var, width=8)
-        self.rate_spin.grid(row=row, column=1, sticky="w", pady=4)
-
-        settings.columnconfigure(1, weight=1)
-
-        # --- Разные голоса для диалогов (silero / silero_rest / offline) ---
-        dlg_frame = ttk.LabelFrame(
-            right_scroll, text="Разные голоса для диалогов (реплики персонажей)", padding=10
-        )
-        dlg_frame.pack(fill="x", pady=(8, 0))
-        self._dialogue_frame = dlg_frame
-
-        self.dialogue_var = tk.BooleanVar(value=False)
-        self.dialogue_check = ttk.Checkbutton(
-            dlg_frame, text="Включить", variable=self.dialogue_var,
-            command=self._on_dialogue_toggle,
-        )
-        self.dialogue_check.pack(anchor="w")
-
-        self.dialogue_hint = ttk.Label(
-            dlg_frame,
-            text="Реплики (абзацы, начинающиеся с тире) звучат по очереди голосами "
-                 "из списка ниже, весь остальной текст — основным голосом сверху "
-                 "(«Голос:»). Это чередование, а не привязка голоса к конкретному "
-                 "персонажу — для этого нужен полноценный анализ текста.",
-            foreground="#555", justify="left", wraplength=340,
-        )
-        self.dialogue_hint.pack(anchor="w", pady=(2, 4))
-
-        dlg_list_row = ttk.Frame(dlg_frame)
-        dlg_list_row.pack(fill="both", expand=True)
-        self.dialogue_list = tk.Listbox(
-            dlg_list_row, selectmode=tk.EXTENDED, exportselection=False, height=6, state="disabled",
-        )
-        dlg_list_scroll = ttk.Scrollbar(dlg_list_row, orient="vertical", command=self.dialogue_list.yview)
-        self.dialogue_list.configure(yscrollcommand=dlg_list_scroll.set)
-        self.dialogue_list.pack(side="left", fill="both", expand=True)
-        dlg_list_scroll.pack(side="right", fill="y")
-
-        self.dialogue_unavailable_label = ttk.Label(
-            dlg_frame,
-            text="Google TTS (режим online) не поддерживает несколько разных "
-                 "русских голосов — используйте Silero, Silero REST или Yandex SpeechKit "
-                 "(для Yandex — свой блок «Yandex SpeechKit» ниже).",
-            foreground="#a00", justify="left", wraplength=340,
-        )
-        # прячется/показывается в _update_mode_dependent_widgets
-
-        self._attribution_section = ttk.Frame(dlg_frame)
-        self._attribution_section.pack(fill="x")
-        attr_section = self._attribution_section
-
-        ttk.Separator(attr_section, orient="horizontal").pack(fill="x", pady=(8, 6))
-
-        self.attribution_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            attr_section,
-            text="Определять, КАКОЙ персонаж говорит (через LLM)",
-            variable=self.attribution_var, command=self._on_attribution_toggle,
-        ).pack(anchor="w")
-
-        self.attribution_hint = ttk.Label(
-            attr_section,
-            text="Без этого голоса из списка выше просто чередуются по кругу — диалог двух "
-                 "персонажей прозвучит разными голосами, но один и тот же персонаж в разных "
-                 "сценах/главах может получить разный голос. С этим — LLM читает главу и "
-                 "определяет, кто говорит каждую реплику, и голос закрепляется за персонажем "
-                 "на всю книгу (словарь сохраняется в dialogue_characters.json рядом с аудио "
-                 "— можно поправить руками).",
-            foreground="#555", justify="left", wraplength=340,
-        )
-        self.attribution_hint.pack(anchor="w", pady=(2, 4))
-
-        attr_provider_row = ttk.Frame(attr_section)
-        attr_provider_row.pack(fill="x", pady=(2, 2))
-        ttk.Label(attr_provider_row, text="Сервис:").pack(side="left")
-        self._attribution_provider_titles = [p["title"] for p in ATTRIBUTION_PROVIDERS.values()]
-        self._attribution_provider_by_title = {
-            p["title"]: key for key, p in ATTRIBUTION_PROVIDERS.items()
-        }
-        self._attribution_title_by_provider = {
-            key: p["title"] for key, p in ATTRIBUTION_PROVIDERS.items()
-        }
-        self.attribution_provider_var = tk.StringVar(
-            value=self._attribution_title_by_provider[DEFAULT_ATTRIBUTION_PROVIDER]
-        )
-        self.attribution_provider_combo = ttk.Combobox(
-            attr_provider_row, textvariable=self.attribution_provider_var,
-            values=self._attribution_provider_titles, state="readonly", width=42,
-        )
-        self.attribution_provider_combo.pack(side="left", padx=(6, 0))
-        self.attribution_provider_combo.bind(
-            "<<ComboboxSelected>>", lambda e: self._on_attribution_provider_change()
-        )
-
-        attr_key_row = ttk.Frame(attr_section)
-        attr_key_row.pack(fill="x", pady=(2, 2))
-        self.attribution_key_label = ttk.Label(attr_key_row, text="API-ключ:")
-        self.attribution_key_label.pack(side="left")
-        self.attribution_api_key_var = tk.StringVar(
-            value=os.environ.get("GEMINI_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
-        )
-        self.attribution_api_key_entry = add_context_menu(
-            ttk.Entry(attr_key_row, textvariable=self.attribution_api_key_var, show="•")
-        )
-        self.attribution_api_key_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
-        self._attribution_key_show_var = tk.BooleanVar(value=False)
-
-        def _toggle_attribution_key_visibility():
-            self.attribution_api_key_entry.configure(
-                show="" if self._attribution_key_show_var.get() else "•"
-            )
-
-        ttk.Checkbutton(
-            attr_key_row, text="показать", variable=self._attribution_key_show_var,
-            command=_toggle_attribution_key_visibility,
-        ).pack(side="left")
-
-        attr_folder_row = ttk.Frame(attr_section)
-        attr_folder_row.pack(fill="x", pady=(2, 2))
-        self.attribution_folder_label = ttk.Label(attr_folder_row, text="Folder ID:")
-        self.attribution_folder_label.pack(side="left")
-        self.attribution_folder_id_var = tk.StringVar(value="")
-        self.attribution_folder_id_entry = add_context_menu(
-            ttk.Entry(attr_folder_row, textvariable=self.attribution_folder_id_var)
-        )
-        self.attribution_folder_id_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
-
-        def _use_yandex_speechkit_creds():
-            self.attribution_api_key_var.set(self.yandex_api_key_var.get())
-            self.attribution_folder_id_var.set(self.yandex_folder_id_var.get())
-
-        self.attribution_use_yandex_btn = ttk.Button(
-            attr_section, text="Взять ключ/Folder ID из настроек Yandex SpeechKit ниже",
-            command=_use_yandex_speechkit_creds,
-        )
-        self.attribution_use_yandex_btn.pack(anchor="w", pady=(2, 2))
-
-        attr_model_row = ttk.Frame(attr_section)
-        attr_model_row.pack(fill="x", pady=(2, 0))
-        ttk.Label(attr_model_row, text="Модель:").pack(side="left")
-        self.attribution_model_var = tk.StringVar(value=DEFAULT_ATTRIBUTION_MODEL)
-        self.attribution_model_entry = add_context_menu(
-            ttk.Entry(attr_model_row, textvariable=self.attribution_model_var, width=24)
-        )
-        self.attribution_model_entry.pack(side="left", padx=(6, 0))
-        self.attribution_key_hint_label = ttk.Label(
-            attr_section, text=ATTRIBUTION_PROVIDERS[DEFAULT_ATTRIBUTION_PROVIDER]["key_hint"],
-            foreground="#888", justify="left", wraplength=340,
-        )
-        self.attribution_key_hint_label.pack(anchor="w", pady=(4, 0))
-
-        self._on_attribution_toggle()
-
-        # --- Yandex SpeechKit: ключ, каталог, голос ---
-        yandex_frame = ttk.LabelFrame(right_scroll, text="Yandex SpeechKit (режим yandex)", padding=10)
-        yandex_frame.pack(fill="x", pady=(8, 0))
-
-        yrow = 0
-        ttk.Label(yandex_frame, text="API-ключ:").grid(row=yrow, column=0, sticky="w", pady=3)
-        key_row = ttk.Frame(yandex_frame)
-        key_row.grid(row=yrow, column=1, columnspan=2, sticky="ew", pady=3)
-        self.yandex_api_key_var = tk.StringVar(value=os.environ.get("YANDEX_API_KEY", ""))
-        self.yandex_api_key_entry = add_context_menu(
-            ttk.Entry(key_row, textvariable=self.yandex_api_key_var, show="•")
-        )
-        self.yandex_api_key_entry.pack(side="left", fill="x", expand=True)
-        self._yandex_key_show_var = tk.BooleanVar(value=False)
-
-        def _toggle_key_visibility():
-            self.yandex_api_key_entry.configure(show="" if self._yandex_key_show_var.get() else "•")
-
-        ttk.Checkbutton(
-            key_row, text="показать", variable=self._yandex_key_show_var, command=_toggle_key_visibility
-        ).pack(side="left", padx=(6, 0))
-
-        yrow += 1
-        ttk.Label(yandex_frame, text="Folder ID (необязательно):").grid(row=yrow, column=0, sticky="w", pady=3)
-        self.yandex_folder_id_var = tk.StringVar(value=os.environ.get("YANDEX_FOLDER_ID", ""))
-        self.yandex_folder_id_entry = add_context_menu(
-            ttk.Entry(yandex_frame, textvariable=self.yandex_folder_id_var)
-        )
-        self.yandex_folder_id_entry.grid(row=yrow, column=1, columnspan=2, sticky="ew", pady=3)
-
-        yrow += 1
-        ttk.Label(yandex_frame, text="Голос:").grid(row=yrow, column=0, sticky="w", pady=3)
-        self._yandex_voice_keys = list(YANDEX_VOICES.keys())
-        yandex_voice_labels = [f"{k} — {v}" for k, v in YANDEX_VOICES.items()]
-        self.yandex_voice_var = tk.StringVar(value=yandex_voice_labels[0])
-        self.yandex_voice_combo = ttk.Combobox(
-            yandex_frame, textvariable=self.yandex_voice_var, values=yandex_voice_labels,
-            state="readonly", width=28,
-        )
-        self.yandex_voice_combo.grid(row=yrow, column=1, columnspan=2, sticky="ew", pady=3)
-
-        yrow += 1
-        ttk.Label(yandex_frame, text="Скорость речи:").grid(row=yrow, column=0, sticky="w", pady=3)
-        self.yandex_speed_var = tk.DoubleVar(value=1.0)
-        ttk.Spinbox(
-            yandex_frame, from_=0.1, to=3.0, increment=0.1, textvariable=self.yandex_speed_var, width=8
-        ).grid(row=yrow, column=1, sticky="w", pady=3)
-
-        yrow += 1
-        ttk.Label(
-            yandex_frame,
-            text="Платный облачный сервис (после пробного периода) — нужен интернет\n"
-                 "на каждую главу. Как получить ключ и Folder ID — см. README.\n"
-                 "Разные голоса для диалогов — в блоке «Разные голоса для диалогов» выше.",
-            foreground="#555", justify="left",
-        ).grid(row=yrow, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-        yandex_frame.columnconfigure(1, weight=1)
-        self._yandex_frame = yandex_frame
-
-        # --- интонация: паузы по знакам препинания, ударения, усиление ---
-        intonation = self._intonation_frame = ttk.LabelFrame(
-            right_scroll, text="Интонация и паузы (silero / silero_rest / cosyvoice)", padding=10
-        )
-        intonation.pack(fill="x", pady=(8, 0))
-
-        irow = 0
-        ttk.Label(intonation, text="Пауза на запятых/тире, мс:").grid(row=irow, column=0, sticky="w", pady=3)
-        self.comma_break_var = tk.IntVar(value=180)
-        ttk.Spinbox(intonation, from_=0, to=1000, increment=10, textvariable=self.comma_break_var, width=8).grid(
-            row=irow, column=1, sticky="w", pady=3
-        )
-
-        irow += 1
-        ttk.Label(intonation, text="Пауза между предложениями, мс:").grid(row=irow, column=0, sticky="w", pady=3)
-        self.sentence_break_var = tk.IntVar(value=320)
-        ttk.Spinbox(intonation, from_=0, to=2000, increment=10, textvariable=self.sentence_break_var, width=8).grid(
-            row=irow, column=1, sticky="w", pady=3
-        )
-
-        irow += 1
-        ttk.Label(intonation, text="Пауза между абзацами, мс:").grid(row=irow, column=0, sticky="w", pady=3)
-        self.paragraph_break_var = tk.IntVar(value=550)
-        ttk.Spinbox(intonation, from_=0, to=3000, increment=10, textvariable=self.paragraph_break_var, width=8).grid(
-            row=irow, column=1, sticky="w", pady=3
-        )
-
-        irow += 1
-        self.accent_var = tk.BooleanVar(value=True)
-        self.accent_check = ttk.Checkbutton(
-            intonation, text="Расставлять ударения автоматически (только silero/silero_rest)",
-            variable=self.accent_var,
-        )
-        self.accent_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
-
-        irow += 1
-        self.yo_var = tk.BooleanVar(value=True)
-        self.yo_check = ttk.Checkbutton(
-            intonation, text='Заменять "е" на "ё" где нужно (только silero/silero_rest)',
-            variable=self.yo_var,
-        )
-        self.yo_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
-
-        irow += 1
-        self.emphasis_var = tk.BooleanVar(value=True)
-        self.emphasis_check = ttk.Checkbutton(
-            intonation,
-            text="Усиливать интонацию «?!» (только silero_rest)",
-            variable=self.emphasis_var,
-        )
-        self.emphasis_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
-
-        intonation.columnconfigure(1, weight=1)
-
-        self._on_attribution_provider_change(reset_model=False)
-        self._populate_silero_voices()
-        self._update_mode_dependent_widgets()
-
-        self._build_voices_tab(voices_tab)
-
-    def _build_voices_tab(self, tab: ttk.Frame):
-        """Отдельная вкладка «Голоса CosyVoice»: список уже сохранённых
-        профилей голоса (они хранятся на самом сервисе CosyVoice REST, в
-        cosyvoice_voices.json — сохраняются постоянно и переживают
-        перезапуск программы и сервиса) и форма для добавления нового
-        голоса из аудиофайла — без всплывающего окна, прямо на вкладке."""
-        pad = ttk.Frame(tab, padding=10)
-        pad.pack(fill="both", expand=True)
-
-        ttk.Label(
-            pad,
-            text="Голоса, склонированные из аудиофайлов для режима CosyVoice. "
-                 "Каждый добавленный голос сохраняется на сервисе CosyVoice "
-                 "(в cosyvoice_voices.json рядом с моделью) и остаётся доступен "
-                 "после перезапуска программы и компьютера — его не нужно "
-                 "добавлять заново.",
-            wraplength=680, justify="left", foreground="#555",
-        ).pack(anchor="w", pady=(0, 10))
-
-        url_row = ttk.Frame(pad)
-        url_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(url_row, text="Адрес сервиса CosyVoice:").pack(side="left")
-        self.cosyvoice_rest_url_entry = add_context_menu(
-            ttk.Entry(url_row, textvariable=self.cosyvoice_rest_url_var, width=32)
-        )
-        self.cosyvoice_rest_url_entry.pack(side="left", padx=(6, 0))
-        self.cosyvoice_refresh_btn = ttk.Button(
-            url_row, text="Обновить список", command=self.refresh_cosyvoice_voices
-        )
-        self.cosyvoice_refresh_btn.pack(side="left", padx=(6, 0))
-
-        engine_row = ttk.Frame(pad)
-        engine_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(engine_row, text="Движок синтеза:").pack(side="left")
-        self.cosyvoice_engine_combo = ttk.Combobox(
-            engine_row, textvariable=self.cosyvoice_engine_var, state="readonly",
-            width=34, values=list(COSYVOICE_ENGINE_LABELS.values()),
-        )
-        self.cosyvoice_engine_combo.pack(side="left", padx=(6, 0))
-        self.cosyvoice_engine_combo.bind("<<ComboboxSelected>>", self._on_cosyvoice_engine_changed)
-        ttk.Label(
-            pad,
-            text="ESpeech RL-V2 — рекомендуется: тоже F5-TTS-архитектура, но менее шумный "
-                 "результат, чем у XTTS-v2 (по независимым сравнениям), и поддерживает "
-                 "клонирование (новее версии SFT-95K, которая использовалась раньше). "
-                 "Расстановку ударений не использует — несмотря на документацию, "
-                 "чекпоинт на практике произносит символ \"+\" как слово \"плюс\" вместо того, "
-                 "чтобы ставить ударение. F5-TTS-Russian winter — более свежий "
-                 "чекпоинт F5-TTS для русского с полной разметкой ударений (в отличие от "
-                 "обычного F5-TTS-Russian ниже). F5-TTS-Russian — тоже неплохо, но без "
-                 "ударений и обучена на меньшем датасете. XTTS-v2 — запасной вариант "
-                 "(мультиязычная, заметно более шумное аудио). CosyVoice 3 — "
-                 "экспериментальный, официально поддерживает русский, но независимых "
-                 "отзывов о качестве на русском пока нет; ставится отдельной секцией "
-                 "install.bat в своё окружение .venv_cosyvoice3 (несовместимо со всем "
-                 "остальным по версиям зависимостей). Голоса, которые вы уже добавили, "
-                 "работают со всеми движками без повторного добавления — переклонировать "
-                 "не нужно. Смена движка перезапускает сервис CosyVoice (может занять "
-                 "время на загрузку модели — у ESpeech и F5-TTS-Russian winter чекпоинты "
-                 "больше, ~1.3–2.7 ГБ при первой загрузке; у CosyVoice3 ещё и веса "
-                 "модели, ~1-2 ГБ, при первом запуске).",
-            wraplength=680, justify="left", foreground="#555",
-        ).pack(anchor="w", pady=(0, 10))
-
-        body = ttk.Panedwindow(pad, orient="horizontal")
-        body.pack(fill="both", expand=True)
-
-        # --- слева: список уже сохранённых голосов ---
-        list_frame = ttk.LabelFrame(body, text="Сохранённые голоса", padding=8)
-        body.add(list_frame, weight=1)
-
-        list_row = ttk.Frame(list_frame)
-        list_row.pack(fill="both", expand=True)
-        self.cosyvoice_voices_listbox = tk.Listbox(list_row, exportselection=False, height=14)
-        cv_list_scroll = ttk.Scrollbar(list_row, orient="vertical", command=self.cosyvoice_voices_listbox.yview)
-        self.cosyvoice_voices_listbox.configure(yscrollcommand=cv_list_scroll.set)
-        self.cosyvoice_voices_listbox.pack(side="left", fill="both", expand=True)
-        cv_list_scroll.pack(side="right", fill="y")
-
-        ttk.Label(
-            list_frame,
-            text="Голос, выбранный здесь, используется как основной, если на "
-                 "вкладке «Озвучка» стоит режим CosyVoice.",
-            wraplength=280, foreground="#555", justify="left",
-        ).pack(anchor="w", pady=(6, 0))
-
-        self._cv_delete_btn = ttk.Button(
-            list_frame, text="Удалить выбранный голос",
-            command=self._delete_selected_cosyvoice_voice,
-        )
-        self._cv_delete_btn.pack(anchor="w", pady=(6, 0))
-
-        # --- справа: добавление нового голоса из аудио ---
-        add_frame = ttk.LabelFrame(body, text="Добавить голос из аудиофайла", padding=8)
-        body.add(add_frame, weight=1)
-
-        ttk.Label(
-            add_frame,
-            text="Короткая (3-10 сек) чистая запись голоса без музыки и шума — "
-                 "например, фрагмент записи любимого диктора.",
-            wraplength=300, foreground="#555", justify="left",
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-
-        ttk.Label(add_frame, text="Аудиофайл:").grid(row=1, column=0, sticky="w", pady=4)
-        self._cv_add_audio_path_var = tk.StringVar()
-        add_context_menu(
-            ttk.Entry(add_frame, textvariable=self._cv_add_audio_path_var, width=26)
-        ).grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Button(add_frame, text="…", width=3, command=self._browse_cosyvoice_audio).grid(
-            row=1, column=2, padx=(4, 0), pady=4
-        )
-
-        ttk.Label(add_frame, text="Имя голоса:").grid(row=2, column=0, sticky="w", pady=4)
-        self._cv_add_name_var = tk.StringVar()
-        add_context_menu(
-            ttk.Entry(add_frame, textvariable=self._cv_add_name_var, width=26)
-        ).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
-
-        ttk.Label(add_frame, text="Текст записи:").grid(row=3, column=0, sticky="nw", pady=4)
-        self._cv_add_text_widget = tk.Text(add_frame, width=26, height=4, wrap="word")
-        self._cv_add_text_widget.grid(row=3, column=1, columnspan=2, sticky="ew", pady=4)
-
-        self._cv_transcribe_btn = ttk.Button(
-            add_frame, text="Распознать текст (по аудио)", command=self._transcribe_cosyvoice_audio,
-        )
-        self._cv_transcribe_btn.grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 4))
-
-        ttk.Label(
-            add_frame,
-            text="Движок клонирования голоса — F5-TTS-Russian (обучена именно на русской "
-                 "речи). Текст записи желателен для лучшего клонирования — если оставить "
-                 "пустым, сервис сам распознает его при первом использовании голоса. Для "
-                 "лучшего результата берите 6-15 секунд чистой речи одного голоса без "
-                 "музыки и шума.",
-            wraplength=300, foreground="#555", justify="left",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
-
-        self._cv_add_status_label = ttk.Label(add_frame, text="", foreground="#555", wraplength=300, justify="left")
-        self._cv_add_status_label.grid(row=6, column=0, columnspan=3, sticky="w")
-
-        self._cv_add_btn = ttk.Button(add_frame, text="Добавить голос", command=self._add_cosyvoice_voice_from_tab)
-        self._cv_add_btn.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-        add_frame.columnconfigure(1, weight=1)
-
-        self.cosyvoice_voices_listbox.bind("<<ListboxSelect>>", self._on_cosyvoice_voices_listbox_select)
-
-        self._refresh_cosyvoice_voices_listbox()
-
-    def _bind_events(self):
-        self.mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_changed())
-        self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def log(self, message: str):
         _write_log_file(message + "\n")
@@ -1154,6 +304,19 @@ class AudiobookApp(tk.Tk):
             self._remember_last_dir("book", path)
             self.book_var.set(path)
             self.reload_book()
+
+    def _browse_qwen_local_start_cmd(self):
+        path = filedialog.askopenfilename(
+            title="Выберите файл запуска локального сервера Qwen3-TTS (.bat/.exe/.cmd)",
+            initialdir=self._get_last_dir("qwen_local_start_cmd") or None,
+            filetypes=[
+                ("Исполняемые файлы", "*.bat *.cmd *.exe"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if path:
+            self._remember_last_dir("qwen_local_start_cmd", path)
+            self.qwen_local_start_cmd_var.set(path)
 
     def browse_outdir(self):
         path = filedialog.askdirectory(
@@ -1379,391 +542,21 @@ class AudiobookApp(tk.Tk):
             return PIPER_DEFAULT_VOICE
         return self._piper_voice_keys[idx]
 
-    def _set_cosyvoice_voices(self):
-        if not self._cosyvoice_voices:
-            labels = ["(нет голосов — нажмите «Обновить голоса»)"]
-            self.voice_combo.configure(values=labels, state="disabled")
-            self.voice_combo.current(0)
-            return
-        self.voice_combo.configure(values=list(self._cosyvoice_voices), state="readonly")
-        default_idx = self._cosyvoice_voices.index("default") if "default" in self._cosyvoice_voices else 0
-        self.voice_combo.current(default_idx)
 
-    def refresh_cosyvoice_voices(self):
-        """Запрашивает у сервиса CosyVoice REST текущий список профилей
-        голоса (GET /voices) в фоновом потоке, чтобы не подвешивать окно
-        на время сетевого запроса (сервис может ещё загружать модель)."""
-        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
-        self.cosyvoice_refresh_btn.configure(state="disabled")
-        self.log(f"Запрашиваю список голосов CosyVoice у {rest_url} …")
 
-        def worker():
-            if self._rest_url_is_local(rest_url) and not self._ping_rest_service(rest_url):
-                self.after(0, lambda: self.log(
-                    "Сервис CosyVoice ещё не запущен — запускаю его автоматически…"
-                ))
-                self._ensure_cosyvoice_service_running(rest_url)
-            try:
-                voices = cosyvoice_list_voices(rest_url)
-            except Exception:
-                voices = []
-            self.after(0, lambda: self._on_cosyvoice_voices_fetched(voices))
 
-        threading.Thread(target=worker, daemon=True).start()
 
-    def _on_cosyvoice_voices_fetched(self, voices: list):
-        self.cosyvoice_refresh_btn.configure(state="normal")
-        self._cosyvoice_voices = voices
-        if not voices:
-            self.log(
-                "Не удалось получить голоса CosyVoice — сервис не отвечает или ещё "
-                "загружает модель (первый запуск после старта сервиса может занять "
-                "некоторое время). Убедитесь, что сервис запущен, и попробуйте ещё раз. "
-                "Если это повторяется — смотрите logs\\fb2_reader_gui.log и "
-                "CosyVoice\\cosyvoice_rest_service.log за подробностями."
-            )
-        else:
-            self.log(f"Голоса CosyVoice: {', '.join(voices)}")
-        if self._current_mode() == "cosyvoice":
-            self._set_cosyvoice_voices()
-            self._populate_dialogue_list()
-        self._refresh_cosyvoice_voices_listbox()
 
-    def _selected_cosyvoice_voice(self) -> str:
-        """ВАЖНО: раньше при idx == -1 (ничего не выбрано в выпадающем
-        списке - например, из-за гонки между фоновым обновлением списка
-        голосов в refresh_cosyvoice_voices() и стартом синтеза) сюда
-        возвращалась буквальная строка "default" - а такого профиля голоса
-        у CosyVoice3 никогда не бывает (профили называются как файлы
-        образцов, например "002 Пролог"), поэтому /getwav сразу отвечал
-        HTTP 400 "Профиль голоса 'default' не найден" на КАЖДОМ фрагменте
-        книги подряд - озвучка проходила вхолостую, вставляя тишину везде.
-        Теперь при отсутствии валидного выбора в комбобоксе подстраховываемся
-        первым РЕАЛЬНЫМ профилем из self._cosyvoice_voices (если список вообще
-        не пуст) - это почти наверняка тот голос, который был бы выбран по
-        умолчанию при обычном заполнении списка (см. _set_cosyvoice_voices)."""
-        idx = self.voice_combo.current()
-        if 0 <= idx < len(self._cosyvoice_voices):
-            return self._cosyvoice_voices[idx]
-        if self._cosyvoice_voices:
-            return self._cosyvoice_voices[0]
-        return "default"
 
-    def _refresh_cosyvoice_voices_listbox(self):
-        """Перезаполняет список на вкладке «Голоса CosyVoice» текущим
-        содержимым self._cosyvoice_voices (обновляется через
-        refresh_cosyvoice_voices / после добавления нового голоса)."""
-        if not hasattr(self, "cosyvoice_voices_listbox"):
-            return
-        self.cosyvoice_voices_listbox.delete(0, "end")
-        for name in self._cosyvoice_voices:
-            self.cosyvoice_voices_listbox.insert("end", name)
 
-    def _on_cosyvoice_voices_listbox_select(self, _event=None):
-        """Выбор голоса в списке на вкладке «Голоса» делает его основным
-        голосом режима CosyVoice на вкладке «Озвучка» (если этот режим
-        сейчас выбран) — чтобы не нужно было переключаться между вкладками
-        и заново искать нужный голос в выпадающем списке."""
-        sel = self.cosyvoice_voices_listbox.curselection()
-        if not sel:
-            return
-        name = self.cosyvoice_voices_listbox.get(sel[0])
-        if self._current_mode() == "cosyvoice" and name in self._cosyvoice_voices:
-            self.voice_combo.current(self._cosyvoice_voices.index(name))
 
-    def _delete_selected_cosyvoice_voice(self):
-        """Удаляет выбранный в списке на вкладке «Голоса CosyVoice» профиль
-        голоса — и на сервисе (cosyvoice_voices.json + сам WAV-файл), и в
-        списке в программе. Голос "default" (ставится при установке из
-        штатного примера CosyVoice) тоже можно удалить, если он не нужен —
-        программа не делает для него исключения."""
-        sel = self.cosyvoice_voices_listbox.curselection()
-        if not sel:
-            messagebox.showinfo("Удалить голос", "Сначала выберите голос в списке слева.")
-            return
-        name = self.cosyvoice_voices_listbox.get(sel[0])
-        if not messagebox.askyesno(
-            "Удалить голос",
-            f"Удалить голос «{name}»? Это действие нельзя отменить — "
-            "образец придётся добавлять заново, если он снова понадобится.",
-        ):
-            return
 
-        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
-        self._cv_delete_btn.configure(state="disabled")
 
-        def worker():
-            try:
-                if self._rest_url_is_local(rest_url):
-                    self.after(0, lambda: self.log(
-                        "Проверяю сервис CosyVoice (при необходимости запущу/перезапущу "
-                        "его автоматически)…"
-                    ))
-                    if not self._ensure_cosyvoice_service_running(rest_url):
-                        raise RuntimeError(
-                            "Не удалось автоматически запустить сервис CosyVoice — "
-                            "подробности в журнале выше и в logs\\fb2_reader_gui.log."
-                        )
-                import requests
-                from urllib.parse import quote
-                resp = requests.delete(f"{rest_url}/voices/{quote(name)}", timeout=30)
-                if resp.status_code != 200:
-                    detail = resp.json().get("detail", resp.text) if resp.content else resp.text
-                    raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
-                data = resp.json()
-                self.after(0, lambda: self._on_cosyvoice_voice_deleted(data))
-            except Exception as e:
-                _log_exception_to_file("удаление голоса CosyVoice")
-                err = str(e)
-                self.after(0, lambda t=err: self._on_cosyvoice_voice_delete_failed(t))
 
-        threading.Thread(target=worker, daemon=True).start()
 
-    def _on_cosyvoice_voice_deleted(self, data: dict):
-        self._cv_delete_btn.configure(state="normal")
-        self._cosyvoice_voices = data.get("voices") or []
-        self._refresh_cosyvoice_voices_listbox()
-        self.log(f"Голос «{data.get('name')}» удалён.")
-        if self._current_mode() == "cosyvoice":
-            self._set_cosyvoice_voices()
-            self._populate_dialogue_list()
 
-    def _on_cosyvoice_voice_delete_failed(self, err: str):
-        self._cv_delete_btn.configure(state="normal")
-        messagebox.showerror("Удалить голос", f"Не удалось удалить голос:\n{err}")
-        self.log(f"Не удалось удалить голос CosyVoice: {err}")
 
-    def _browse_cosyvoice_audio(self):
-        path = filedialog.askopenfilename(
-            title="Выберите аудиофайл с образцом голоса",
-            initialdir=self._get_last_dir("cosyvoice_audio") or None,
-            filetypes=[
-                ("Аудио", "*.wav *.mp3 *.flac *.ogg *.m4a"),
-                ("Все файлы", "*.*"),
-            ],
-        )
-        if path:
-            self._remember_last_dir("cosyvoice_audio", path)
-            self._cv_add_audio_path_var.set(path)
-            if not self._cv_add_name_var.get().strip():
-                self._cv_add_name_var.set(Path(path).stem)
 
-    def _transcribe_cosyvoice_audio(self):
-        """Отправляет выбранный аудиофайл сервису CosyVoice (POST
-        /transcribe) на распознавание речи через Whisper и подставляет
-        результат в поле «Текст записи» — чтобы не печатать транскрипт
-        образца вручную. Модель Whisper для распознавания (~500 МБ)
-        скачивается сервисом один раз при первом использовании этой кнопки
-        и дальше берётся из кэша."""
-        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
-        audio_path = self._cv_add_audio_path_var.get().strip()
-        if not audio_path:
-            messagebox.showwarning("Распознать текст", "Сначала выберите аудиофайл с образцом голоса.")
-            return
-
-        self._cv_transcribe_btn.configure(state="disabled")
-        self._cv_add_status_label.configure(
-            text="Готовлю файл к отправке на распознавание…"
-        )
-        # Помимо маленькой подписи под кнопкой (её легко не заметить),
-        # дублируем происходящее в основной журнал — включая периодические
-        # "ещё работаю" сообщения с указанием текущего этапа, пока идёт
-        # сам запрос, чтобы не выглядело, будто программа зависла (первый
-        # запуск с загрузкой модели распознавания может занимать пару
-        # минут без какого-либо ответа).
-        try:
-            size_kb = Path(audio_path).stat().st_size / 1024
-        except Exception:
-            size_kb = 0
-        self.log(f"Распознаю текст образца «{Path(audio_path).name}» ({size_kb:.0f} КБ) через Whisper…")
-
-        stop_ticker = threading.Event()
-
-        def _fmt_elapsed(sec: int) -> str:
-            return f"{sec // 60} мин {sec % 60:02d} сек" if sec >= 60 else f"{sec} сек"
-
-        def ticker():
-            waited = 0
-            while not stop_ticker.wait(10.0):
-                waited += 10
-                if waited <= 30:
-                    stage = "отправляю файл на сервис / сервис ещё может качать модель Whisper (~500 МБ, разово)"
-                else:
-                    stage = "модель Whisper распознаёт речь"
-                self.after(0, lambda w=waited, s=stage: self.log(
-                    f"…распознавание ещё идёт ({_fmt_elapsed(w)}): {s}…"
-                ))
-
-        threading.Thread(target=ticker, daemon=True).start()
-
-        def worker():
-            try:
-                if self._rest_url_is_local(rest_url):
-                    if not self._ensure_cosyvoice_service_running(rest_url):
-                        raise RuntimeError(
-                            "Не удалось запустить сервис CosyVoice — подробности в файле "
-                            f"журнала (logs\\{LOG_FILE_PATH.name}) и в самом окне «Журнал» выше."
-                        )
-                import requests
-                self.after(0, lambda: self.log("Отправляю аудиофайл на сервис…"))
-                try:
-                    with open(audio_path, "rb") as f:
-                        resp = requests.post(
-                            f"{rest_url}/transcribe",
-                            files={"audio": (Path(audio_path).name, f)},
-                            timeout=300,
-                        )
-                except requests.exceptions.ConnectionError as ce:
-                    _log_exception_to_file("подключение к сервису CosyVoice (/transcribe)")
-                    raise RuntimeError(
-                        f"Не удалось подключиться к сервису CosyVoice по адресу {rest_url}."
-                    ) from ce
-                if resp.status_code != 200:
-                    detail = resp.json().get("detail", resp.text) if resp.content else resp.text
-                    raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
-                text = resp.json().get("text", "")
-                self.after(0, lambda: self._on_cosyvoice_audio_transcribed(text))
-            except Exception as e:
-                _log_exception_to_file("распознавание речи CosyVoice")
-                err = str(e)
-                self.after(0, lambda t=err: self._on_cosyvoice_transcribe_failed(t))
-            finally:
-                stop_ticker.set()
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_cosyvoice_audio_transcribed(self, text: str):
-        self._cv_transcribe_btn.configure(state="normal")
-        if text:
-            self._cv_add_text_widget.delete("1.0", "end")
-            self._cv_add_text_widget.insert("1.0", text)
-            self._cv_add_status_label.configure(text=f"Готово: распознано {len(text)} симв. — проверьте и поправьте при необходимости.")
-            self.log(f"Текст распознан ({len(text)} символов): {text}")
-        else:
-            self._cv_add_status_label.configure(text="Не удалось распознать текст (пустой результат) — впишите вручную.")
-            self.log("Распознавание вернуло пустой текст — впишите текст образца вручную.")
-
-    def _on_cosyvoice_transcribe_failed(self, err: str):
-        self._cv_transcribe_btn.configure(state="normal")
-        self._cv_add_status_label.configure(text=f"Ошибка распознавания: {err}")
-        self.log(f"ОШИБКА распознавания текста CosyVoice: {err}")
-        messagebox.showerror("Распознать текст — ошибка", err)
-
-    def _add_cosyvoice_voice_from_tab(self):
-        """Отправляет форму добавления голоса на вкладке «Голоса CosyVoice»
-        сервису CosyVoice REST (POST /add_voice) — добавленный голос
-        сохраняется на сервисе постоянно (cosyvoice_voices.json) и остаётся
-        доступен после перезапуска, поэтому его достаточно добавить один
-        раз."""
-        rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
-        audio_path = self._cv_add_audio_path_var.get().strip()
-        name = self._cv_add_name_var.get().strip()
-        text = self._cv_add_text_widget.get("1.0", "end").strip()
-
-        if not audio_path:
-            messagebox.showwarning("Добавить голос", "Выберите аудиофайл с образцом голоса.")
-            return
-        if not name:
-            messagebox.showwarning("Добавить голос", "Введите имя для нового голоса.")
-            return
-        # Движок клонирования (XTTS-v2) сам тексту образца не требует —
-        # клонирует по одному только аудио. Текст здесь используется
-        # исключительно для истории/справки, поэтому пустое поле больше не
-        # блокируется предупреждением (было актуально для прежнего движка
-        # CosyVoice, у которого без текста образца включался режим
-        # "cross-lingual", не понимавший русский язык).
-
-        self._cv_add_btn.configure(state="disabled")
-        self._cv_add_status_label.configure(text="Отправляю запись сервису CosyVoice, подождите…")
-        try:
-            size_kb = Path(audio_path).stat().st_size / 1024
-        except Exception:
-            size_kb = 0
-        self.log(f"Добавляю голос «{name}» ({Path(audio_path).name}, {size_kb:.0f} КБ)…")
-
-        stop_ticker = threading.Event()
-
-        def _fmt_elapsed(sec: int) -> str:
-            return f"{sec // 60} мин {sec % 60:02d} сек" if sec >= 60 else f"{sec} сек"
-
-        def ticker():
-            waited = 0
-            while not stop_ticker.wait(10.0):
-                waited += 10
-                self.after(0, lambda w=waited: self.log(
-                    f"…добавление голоса «{name}» ещё идёт ({_fmt_elapsed(w)}): сервис обрабатывает "
-                    "и клонирует запись (при первом запуске здесь же может ещё загружаться модель CosyVoice)…"
-                ))
-
-        threading.Thread(target=ticker, daemon=True).start()
-
-        def worker():
-            try:
-                if self._rest_url_is_local(rest_url) and not self._ping_rest_service(rest_url):
-                    self.after(0, lambda: self._cv_add_status_label.configure(
-                        text="Сервис CosyVoice ещё не запущен — запускаю автоматически…"
-                    ))
-                    self.after(0, lambda: self.log("Сервис CosyVoice ещё не запущен — запускаю автоматически…"))
-                    if not self._ensure_cosyvoice_service_running(rest_url):
-                        raise RuntimeError(
-                            "Не удалось запустить сервис CosyVoice — подробности в файле "
-                            f"журнала (logs\\{LOG_FILE_PATH.name}) и в самом окне «Журнал» выше."
-                        )
-                import requests
-                self.after(0, lambda: self.log("Сервис запущен, отправляю аудиофайл и текст…"))
-                try:
-                    with open(audio_path, "rb") as f:
-                        resp = requests.post(
-                            f"{rest_url}/add_voice",
-                            data={"name": name, "text": text},
-                            files={"audio": (Path(audio_path).name, f)},
-                            timeout=120,
-                        )
-                except requests.exceptions.ConnectionError as ce:
-                    _log_exception_to_file("подключение к сервису CosyVoice (/add_voice)")
-                    raise RuntimeError(
-                        f"Не удалось подключиться к сервису CosyVoice по адресу {rest_url} "
-                        "(соединение отклонено — сервис не запущен или ещё не успел "
-                        "подняться). Проверьте, что install.bat полностью и без ошибок "
-                        "поставил CosyVoice (папки CosyVoice\\ и .venv_cosyvoice должны "
-                        "существовать), и посмотрите файл журнала на подробности."
-                    ) from ce
-                if resp.status_code != 200:
-                    detail = resp.json().get("detail", resp.text) if resp.content else resp.text
-                    _write_log_file(f"\n--- /add_voice вернул {resp.status_code} ---\n{detail}\n")
-                    raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
-                data = resp.json()
-                self.after(0, lambda: self._on_cosyvoice_voice_added_from_tab(data))
-            except Exception as e:
-                _log_exception_to_file("добавление голоса CosyVoice")
-                err = str(e)
-                self.after(0, lambda t=err: self._on_cosyvoice_voice_add_failed_in_tab(t))
-            finally:
-                stop_ticker.set()
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_cosyvoice_voice_added_from_tab(self, data: dict):
-        self._cv_add_btn.configure(state="normal")
-        self._cv_add_status_label.configure(text=f"Готово: голос «{data.get('name')}» добавлен.")
-        self._cosyvoice_voices = data.get("voices") or self._cosyvoice_voices
-        self._refresh_cosyvoice_voices_listbox()
-        if self._current_mode() == "cosyvoice":
-            self._set_cosyvoice_voices()
-            self._populate_dialogue_list()
-            if data.get("name") in self._cosyvoice_voices:
-                self.voice_combo.current(self._cosyvoice_voices.index(data["name"]))
-        self.log(f"Голос «{data.get('name')}» добавлен и сохранён — доступен в списке «Голос».")
-        # очищаем форму, чтобы можно было сразу добавить следующий голос
-        self._cv_add_audio_path_var.set("")
-        self._cv_add_name_var.set("")
-        self._cv_add_text_widget.delete("1.0", "end")
-
-    def _on_cosyvoice_voice_add_failed_in_tab(self, error: str):
-        self._cv_add_btn.configure(state="normal")
-        self._cv_add_status_label.configure(text=f"Ошибка: {error}")
-        self.log(f"ОШИБКА добавления голоса CosyVoice: {error}")
-        messagebox.showerror("Добавить голос — ошибка", error)
 
     def _set_yandex_voice_placeholder(self):
         self.voice_combo.configure(values=["см. блок «Yandex SpeechKit» ниже"], state="disabled")
@@ -1800,6 +593,19 @@ class AudiobookApp(tk.Tk):
         self.yandex_folder_id_entry.configure(state=yandex_field_state)
         self.yandex_voice_combo.configure(state="readonly" if mode == "yandex" else "disabled")
 
+        qwen_field_state = "normal" if mode == "qwen_tts" else "disabled"
+        self.qwen_api_key_entry.configure(state=qwen_field_state)
+        qwen_local_field_state = "normal" if mode == "qwen_tts_local" else "disabled"
+        self.qwen_local_url_entry.configure(state=qwen_local_field_state)
+        self.qwen_local_start_cmd_entry.configure(state=qwen_local_field_state)
+        self.qwen_local_start_cmd_btn.configure(state=qwen_local_field_state)
+        self.qwen_local_auto_stop_check.configure(state=qwen_local_field_state)
+        self.qwen_voice_combo.configure(
+            state="readonly" if mode in ("qwen_tts", "qwen_tts_local") else "disabled"
+        )
+        if mode in ("qwen_tts", "qwen_tts_local"):
+            self._refresh_qwen_voice_list(mode)
+
         # Прячем строки настроек, неактуальные для текущего режима, чтобы
         # не перегружать интерфейс полями, которые всё равно ни на что не
         # влияют в этом режиме.
@@ -1815,9 +621,12 @@ class AudiobookApp(tk.Tk):
         # между кусками текста, см. run_cosyvoice) — целиком показываются/
         # прячутся вместе с рамкой.
         self._yandex_frame.pack_forget()
+        self._qwen_frame.pack_forget()
         self._intonation_frame.pack_forget()
         if mode == "yandex":
             self._yandex_frame.pack(fill="x", pady=(8, 0))
+        if mode in ("qwen_tts", "qwen_tts_local"):
+            self._qwen_frame.pack(fill="x", pady=(8, 0))
         if pauses_supported:
             self._intonation_frame.pack(fill="x", pady=(8, 0))
         # "Усиливать интонацию «?!»" — это SSML-фича самого Silero REST;
@@ -1833,6 +642,8 @@ class AudiobookApp(tk.Tk):
             self._set_offline_voices()
         elif mode == "yandex":
             self._set_yandex_voice_placeholder()
+        elif mode in ("qwen_tts", "qwen_tts_local"):
+            self._set_qwen_voice_placeholder()
         elif mode == "cosyvoice":
             self._set_cosyvoice_voices()
             if not self._cosyvoice_voices:
@@ -1862,6 +673,32 @@ class AudiobookApp(tk.Tk):
             return "alena"
         return self._yandex_voice_keys[idx]
 
+    def _set_qwen_voice_placeholder(self):
+        self.voice_combo.configure(values=["см. блок «Qwen3-TTS» ниже"], state="disabled")
+        self.voice_combo.current(0)
+
+    def _refresh_qwen_voice_list(self, mode: str):
+        """Список голосов у облачного (DashScope) и локального (свой
+        Gradio-сервер) Qwen3-TTS РАЗНЫЙ — при переключении режима
+        перезаполняем self.qwen_voice_combo под нужный список, иначе можно
+        было бы выбрать голос, которого у текущего сервера просто нет."""
+        voices = QWEN_TTS_LOCAL_VOICES if mode == "qwen_tts_local" else QWEN_TTS_VOICES
+        default_voice = QWEN_TTS_LOCAL_DEFAULT_VOICE if mode == "qwen_tts_local" else QWEN_TTS_DEFAULT_VOICE
+        new_keys = list(voices.keys())
+        if new_keys == getattr(self, "_qwen_voice_keys", None):
+            return  # уже тот список — не сбрасываем выбор пользователя зря
+        self._qwen_voice_keys = new_keys
+        labels = [f"{k} — {v}" for k, v in voices.items()]
+        self.qwen_voice_combo.configure(values=labels)
+        default_idx = self._qwen_voice_keys.index(default_voice) if default_voice in self._qwen_voice_keys else 0
+        self.qwen_voice_var.set(labels[default_idx])
+
+    def _selected_qwen_voice(self) -> str:
+        idx = self.qwen_voice_combo.current()
+        if idx < 0 or idx >= len(self._qwen_voice_keys):
+            return QWEN_TTS_LOCAL_DEFAULT_VOICE if self._current_mode() == "qwen_tts_local" else QWEN_TTS_DEFAULT_VOICE
+        return self._qwen_voice_keys[idx]
+
     def _dialogue_voice_keys(self):
         """Ключи голосов, которые сейчас показаны в списке «Разные голоса
         для диалогов» — зависят от текущего режима: спикеры Silero,
@@ -1874,6 +711,8 @@ class AudiobookApp(tk.Tk):
             return [v["id"] for v in self._offline_voices]
         if mode == "yandex":
             return list(self._yandex_voice_keys)
+        if mode in ("qwen_tts", "qwen_tts_local"):
+            return list(self._qwen_voice_keys)
         if mode == "cosyvoice":
             return list(self._cosyvoice_voices)
         if mode == "piper":
@@ -1887,7 +726,10 @@ class AudiobookApp(tk.Tk):
         несколько голосов (Google TTS — нет)."""
         mode = self._current_mode()
         self.dialogue_list.delete(0, "end")
-        supported = mode in ("silero", "silero_rest", "offline", "yandex", "cosyvoice", "piper")
+        supported = mode in (
+            "silero", "silero_rest", "offline", "yandex", "qwen_tts", "qwen_tts_local",
+            "cosyvoice", "piper",
+        )
 
         if mode in ("silero", "silero_rest"):
             for k in self._silero_voice_keys:
@@ -1903,6 +745,10 @@ class AudiobookApp(tk.Tk):
                 self.dialogue_list.insert("end", f"{mark}{v['name']}")
         elif mode == "yandex":
             for k, v in YANDEX_VOICES.items():
+                self.dialogue_list.insert("end", f"{k} — {v}")
+        elif mode in ("qwen_tts", "qwen_tts_local"):
+            qwen_voices = QWEN_TTS_LOCAL_VOICES if mode == "qwen_tts_local" else QWEN_TTS_VOICES
+            for k, v in qwen_voices.items():
                 self.dialogue_list.insert("end", f"{k} — {v}")
         elif mode == "cosyvoice":
             for k in self._cosyvoice_voices:
@@ -1995,6 +841,8 @@ class AudiobookApp(tk.Tk):
         mode = self._current_mode()
         if mode == "yandex":
             main_voice = self._selected_yandex_voice()
+        elif mode in ("qwen_tts", "qwen_tts_local"):
+            main_voice = self._selected_qwen_voice()
         elif mode in ("silero", "silero_rest"):
             main_voice = self._selected_silero_speaker()
         elif mode == "offline":
@@ -2042,571 +890,488 @@ class AudiobookApp(tk.Tk):
 
         self.after(0, update)
 
-    @staticmethod
-    def _rest_url_is_local(url: str) -> bool:
-        from urllib.parse import urlparse
-        host = (urlparse(url).hostname or "").lower()
-        return host in ("localhost", "127.0.0.1", "::1", "")
 
-    @staticmethod
-    def _ping_rest_service(url: str, timeout: float = 1.5) -> bool:
-        """Проверяет, отвечает ли уже сервис Silero REST по этому адресу.
-        Любой ответ сервера (даже 404 на несуществующий путь) значит, что
-        сервис поднят — ошибка нас интересует только на уровне соединения
-        (сервис не запущен / порт никто не слушает)."""
-        try:
-            urllib.request.urlopen(url.rstrip("/") + "/docs", timeout=timeout)
-            return True
-        except urllib.error.HTTPError:
-            return True
-        except Exception:
-            return False
 
-    def _ensure_rest_service_running(self, rest_url: str, ready_timeout: float = 600.0) -> bool:
-        """Запускает silero_rest_service.py в фоне (без консоли пользователя)
-        и ждёт, пока он не начнёт отвечать на rest_url. При первом запуске
-        сервис может несколько минут скачивать модель — поэтому таймаут
-        большой, а в журнал периодически пишется, что процесс ещё идёт."""
-        if getattr(sys, "frozen", False):
-            # Собранная в один .exe версия (PyInstaller) не содержит
-            # отдельного python.exe — sys.executable указывает на сам этот
-            # exe, поэтому "запустить silero_rest_service.py тем же
-            # интерпретатором" тут не сработает. В таком случае проще
-            # использовать локальный режим Silero (он не требует сервиса)
-            # либо запускать программу из исходников через run_gui.bat.
-            self.after(0, lambda: self.log(
-                "Автозапуск сервиса Silero REST недоступен в собранной .exe-версии "
-                "программы. Используйте режим «Silero (локально)» — он не требует "
-                "отдельного сервиса, — либо запустите программу из исходников "
-                "(run_gui.bat) и включите автозапуск там."
-            ))
-            return False
-        if self._rest_proc is None or self._rest_proc.poll() is not None:
-            service_path = _app_dir() / "silero_rest_service.py"
-            if not service_path.exists():
-                self.after(0, lambda: self.log(f"Не найден файл сервиса: {service_path}"))
-                return False
-            try:
-                popen_kwargs = dict(
-                    cwd=str(service_path.parent),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
-                if sys.platform == "win32":
-                    # без отдельного окна консоли для сервиса
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                self._rest_proc = subprocess.Popen(
-                    [sys.executable, str(service_path)], **popen_kwargs
-                )
-            except Exception as e:
-                err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис Silero REST: {t}"))
-                return False
 
-            def pump_output():
-                proc = self._rest_proc
-                if proc is None or proc.stdout is None:
-                    return
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        self.after(0, lambda l=line: self.log("  [сервис Silero REST] " + l))
 
-            threading.Thread(target=pump_output, daemon=True).start()
 
-        deadline = time.time() + ready_timeout
-        last_notice = 0.0
-        while time.time() < deadline:
-            if self._ping_rest_service(rest_url):
-                self.after(0, lambda: self.log("Сервис Silero REST запущен и готов принимать запросы."))
-                return True
-            if self._rest_proc is not None and self._rest_proc.poll() is not None:
-                self.after(0, lambda: self.log(
-                    f"Сервис Silero REST завершился сам собой (код {self._rest_proc.returncode}) "
-                    "во время запуска — см. сообщения [сервис Silero REST] выше."
-                ))
-                return False
-            if time.time() - last_notice > 15:
-                last_notice = time.time()
-                self.after(0, lambda: self.log(
-                    "…сервис Silero REST ещё запускается (при первом запуске может скачивать "
-                    "модель, это может занять несколько минут)…"
-                ))
-            time.sleep(1.0)
 
-        self.after(0, lambda: self.log("Сервис Silero REST не успел запуститься за отведённое время."))
-        return False
 
-    @staticmethod
-    def _cosyvoice_model_loaded(url: str, timeout: float = 3.0, expected_version: str = None) -> bool:
-        """В отличие от _ping_rest_service (который считает сервис рабочим
-        по любому HTTP-ответу), здесь мы проверяем именно то, что модель
-        CosyVoice реально загрузилась И что запущенный сервис - это
-        актуальная версия кода (через отдельный эндпоинт /health).
 
-        Без первой проверки зависший с прошлого раза процесс с ошибкой при
-        загрузке модели выглядел бы для программы как "уже запущен и всё
-        хорошо", и она бы просто продолжала слать в него запросы, каждый
-        раз получая HTTP 500 без единой новой попытки перезапуска.
 
-        Без второй проверки (версия) уже РАБОТАЮЩИЙ (с успешно загруженной
-        моделью) сервис, оставшийся с прошлого запуска программы, считался
-        бы полностью готовым даже после того, как сам файл
-        cosyvoice_rest_service.py обновился на диске — из-за чего новые
-        эндпоинты и исправления молча не действовали бы, пока пользователь
-        не перезапустит компьютер вручную (именно так один раз сломалось
-        удаление голосов: старый процесс просто не знал про /voices/{name}).
-
-        expected_version - какую версию сервиса считать актуальной; по
-        умолчанию COSYVOICE_EXPECTED_SERVICE_VERSION (обычный сервис в
-        .venv_cosyvoice), но для CosyVoice3 (см. _ensure_cosyvoice3_service_running)
-        передаётся COSYVOICE3_EXPECTED_SERVICE_VERSION - у него отдельный
-        файл сервиса и своя нумерация версий."""
-        if expected_version is None:
-            expected_version = COSYVOICE_EXPECTED_SERVICE_VERSION
-        try:
-            with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if not data.get("model_loaded"):
-                    return False
-                # Сверяем строго, включая случай "поля вообще нет" (значит,
-                # это ещё более старая версия сервиса, до появления самой
-                # этой проверки, - тем более пора перезапустить).
-                if data.get("service_version") != expected_version:
-                    return False
-                return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def _pids_listening_on_port(port: int) -> set:
-        no_window = subprocess.CREATE_NO_WINDOW
-        out = subprocess.check_output(
-            ["netstat", "-ano"], text=True, creationflags=no_window,
-        )
-        pids = set()
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and parts[0].upper() == "TCP":
-                local_addr = parts[1]
-                if local_addr.endswith(f":{port}") and "LISTENING" in line.upper():
-                    pid = parts[-1]
-                    if pid.isdigit() and pid != "0":
-                        pids.add(pid)
-        return pids
-
-    @classmethod
-    def _kill_process_on_port(cls, port: int, wait_free_timeout: float = 8.0):
-        """Убивает процесс(ы), слушающие данный TCP-порт на localhost —
-        используется, чтобы наверняка избавиться от зависшего с прошлого
-        раза сервиса CosyVoice (например, оставшегося после того, как
-        программу закрыли не тем способом, или процесс пережил закрытие
-        родителя). Работает через стандартные системные утилиты Windows
-        (netstat/taskkill), без сторонних зависимостей.
-
-        После taskkill Windows не всегда освобождает порт мгновенно —
-        поэтому дальше ждём (опрашивая netstat), пока порт реально не
-        освободится, вместо того чтобы полагаться на фиксированную паузу
-        (слишком короткая пауза раньше приводила к тому, что новый процесс
-        сразу падал с "address already in use", т.к. старый ещё не успел
-        полностью закрыть сокет)."""
-        if sys.platform != "win32":
-            return
-        try:
-            pids = cls._pids_listening_on_port(port)
-            no_window = subprocess.CREATE_NO_WINDOW
-            for pid in pids:
-                subprocess.run(
-                    ["taskkill", "/PID", pid, "/F"],
-                    creationflags=no_window, capture_output=True,
-                )
-            if not pids:
-                return
-            deadline = time.time() + wait_free_timeout
-            while time.time() < deadline:
-                if not cls._pids_listening_on_port(port):
-                    return
-                time.sleep(0.5)
-        except Exception:
-            _log_exception_to_file(f"попытка остановить процесс на порту {port}")
-
-    def _cosyvoice_engine_code(self) -> str:
-        """Внутренний код выбранного движка ("f5"/"xtts") по подписи,
-        выбранной в выпадающем списке — уходит в переменную окружения
-        TTS_ENGINE процесса сервиса."""
-        return COSYVOICE_ENGINE_CODES.get(self.cosyvoice_engine_var.get(), COSYVOICE_DEFAULT_ENGINE)
-
-    def _on_cosyvoice_engine_changed(self, event=None):
-        """При смене движка в выпадающем списке уже запущенный сервис
-        обслуживает запросы старым движком, пока его не перезапустить -
-        останавливаем его здесь же, чтобы следующий запрос сам поднял
-        сервис заново с новым TTS_ENGINE (см. _ensure_cosyvoice_service_running
-        и сверку engine в _cosyvoice_model_loaded).
-
-        CosyVoice3 - отдельный случай: у него свой подпроцесс/окружение и
-        свой порт 5012 (см. _ensure_cosyvoice3_service_running), не
-        связанный с движками f5/espeech/f5winter/xtts на порту 5011 -
-        здесь просто переключаем REST URL на его порт, чтобы не пришлось
-        делать это вручную (сам процесс на 5011, если запущен, трогать не
-        нужно - при выборе cosyvoice3 к нему никто и не обращается). При
-        переключении ОБРАТНО с cosyvoice3 на любой другой движок -
-        возвращаем URL по умолчанию, если пользователь не менял его сам
-        вручную на что-то своё."""
-        engine = self._cosyvoice_engine_code()
-        current_url = self.cosyvoice_rest_url_var.get().strip()
-        if engine == "cosyvoice3":
-            if current_url in ("", COSYVOICE_DEFAULT_REST_URL):
-                self.cosyvoice_rest_url_var.set(COSYVOICE3_DEFAULT_REST_URL)
-            return
-        if current_url == COSYVOICE3_DEFAULT_REST_URL:
-            self.cosyvoice_rest_url_var.set(COSYVOICE_DEFAULT_REST_URL)
-
-        if self._cosyvoice_proc is not None and self._cosyvoice_proc.poll() is None:
-            self.log(f"Движок CosyVoice изменён на «{self.cosyvoice_engine_var.get()}» — "
-                      "перезапускаю сервис…")
-            try:
-                rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
-                from urllib.parse import urlparse
-                port = urlparse(rest_url).port or 5011
-            except Exception:
-                port = 5011
-            self._cosyvoice_proc = None
-            threading.Thread(target=lambda: self._kill_process_on_port(port), daemon=True).start()
-
-    def _ensure_cosyvoice3_service_running(self, rest_url: str, ready_timeout: float = 2700.0) -> bool:
-        """Аналог _ensure_cosyvoice_service_running, но для CosyVoice3 -
-        собственный подпроцесс в СВОЁМ окружении .venv_cosyvoice3 (у
-        CosyVoice3 несовместимый со всем остальным набор фиксированных
-        версий зависимостей - torch==2.3.1 и т.д., см. install.bat,
-        секция CosyVoice3), и свой порт (COSYVOICE3_DEFAULT_REST_URL).
-
-        (Изначально это планировалось запускать в Docker-контейнере (см.
-        docker/cosyvoice3/) для полной изоляции - но Docker Desktop/WSL2 у
-        пользователя оказался слишком капризным, поэтому вместо контейнера -
-        обычный подпроцесс, как у остальных движков.)"""
-        if getattr(sys, "frozen", False):
-            self.after(0, lambda: self.log(
-                "Автозапуск сервиса CosyVoice3 недоступен в собранной .exe-версии "
-                "программы. Запустите программу из исходников (run_gui.bat)."
-            ))
-            return False
-
-        cosyvoice3_py = _app_dir() / ".venv_cosyvoice3" / "Scripts" / "python.exe"
-        if not cosyvoice3_py.exists():
-            alt = _app_dir() / ".venv_cosyvoice3" / "bin" / "python"
-            cosyvoice3_py = alt if alt.exists() else cosyvoice3_py
-        service_dir = _app_dir() / "CosyVoice3"
-        service_path = service_dir / "cosyvoice3_rest_service.py"
-
-        if not cosyvoice3_py.exists() or not service_path.exists():
-            self.after(0, lambda: self.log(
-                "Движок CosyVoice3 ещё не установлен на этом компьютере. Запустите "
-                "install.bat ещё раз (секция CosyVoice3 — отдельная, большая загрузка, "
-                "может занять время)."
-            ))
-            return False
-
-        try:
-            from urllib.parse import urlparse
-            port = urlparse(rest_url).port or 5012
-        except Exception:
-            port = 5012
-
-        need_start = self._cosyvoice3_proc is None or self._cosyvoice3_proc.poll() is not None
-        if need_start and self._ping_rest_service(rest_url):
-            # self._cosyvoice3_proc only tracks a process THIS instance of
-            # the GUI started - it's None right after the program (re)starts
-            # even if a service from a PREVIOUS run is still alive and
-            # holding the port (its parent GUI process can exit without
-            # killing it, since it isn't spawned as a detached/job-linked
-            # child). Without this check we would spawn a second copy here,
-            # which immediately crashes with "[Errno 10048] address already
-            # in use" while the old copy just keeps answering /health - so
-            # the GUI would loop "model not loaded... service exited...
-            # model not loaded..." forever instead of just using it or
-            # replacing it once.
-            if self._cosyvoice_model_loaded(rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION):
-                self.after(0, lambda: self.log(
-                    "Сервис CosyVoice3 уже запущен (остался от предыдущего запуска "
-                    "программы) и готов принимать запросы."
-                ))
-                return True
-            self.after(0, lambda: self.log(
-                "Обнаружен уже запущенный сервис CosyVoice3 (видимо, от предыдущего "
-                "запуска программы), но версия/модель не подходят — останавливаю его "
-                "и запускаю заново…"
-            ))
-            self._kill_process_on_port(port)
-            time.sleep(1.0)
-        elif not need_start and self._ping_rest_service(rest_url) and not self._cosyvoice_model_loaded(
-            rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION
-        ):
-            self.after(0, lambda: self.log(
-                "Обнаружен уже запущенный сервис CosyVoice3, у которого не загружена "
-                "модель — останавливаю его и запускаю заново…"
-            ))
-            self._cosyvoice3_proc = None
-            self._kill_process_on_port(port)
-            time.sleep(1.0)
-            need_start = True
-        if need_start:
-            try:
-                popen_kwargs = dict(
-                    cwd=str(service_dir),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env=dict(os.environ, COSYVOICE3_PORT=str(port)),
-                )
-                if sys.platform == "win32":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                self._cosyvoice3_proc = subprocess.Popen(
-                    [str(cosyvoice3_py), str(service_path)], **popen_kwargs
-                )
-            except Exception as e:
-                _log_exception_to_file("запуск сервиса CosyVoice3")
-                err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice3: {t}"))
-                return False
-
-            def pump_output():
-                proc = self._cosyvoice3_proc
-                if proc is None or proc.stdout is None:
-                    return
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        self.after(0, lambda l=line: self.log("  [сервис CosyVoice3] " + l))
-
-            threading.Thread(target=pump_output, daemon=True).start()
-
-        deadline = time.time() + ready_timeout
-        last_notice = 0.0
-        while time.time() < deadline:
-            just_exited = self._cosyvoice3_proc is not None and self._cosyvoice3_proc.poll() is not None
-            if not just_exited and self._ping_rest_service(rest_url):
-                if self._cosyvoice_model_loaded(rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION):
-                    self.after(0, lambda: self.log("Сервис CosyVoice3 запущен и готов принимать запросы."))
-                    return True
-                if time.time() - last_notice > 15:
-                    last_notice = time.time()
-                    self.after(0, lambda: self.log(
-                        "Сервис CosyVoice3 отвечает, но модель ещё не загрузилась (первый "
-                        "запуск также скачивает веса, ~1-2 ГБ) — жду… Подробности в "
-                        "CosyVoice3\\data\\cosyvoice3_rest_service.log."
-                    ))
-            if just_exited:
-                self.after(0, lambda: self.log(
-                    f"Сервис CosyVoice3 завершился сам собой (код {self._cosyvoice3_proc.returncode}) "
-                    "— см. CosyVoice3\\data\\cosyvoice3_rest_service.log."
-                ))
-                return False
-            time.sleep(1.0)
-
-        self.after(0, lambda: self.log("Сервис CosyVoice3 не успел запуститься за отведённое время."))
-        return False
-
-    def _ensure_cosyvoice_service_running(self, rest_url: str, ready_timeout: float = 900.0) -> bool:
-        """Аналог _ensure_rest_service_running для CosyVoice: запускает
-        cosyvoice_rest_service.py тем интерпретатором, что установлен
-        install_cosyvoice.bat в .venv_cosyvoice (отдельно от основного
-        .venv, т.к. у CosyVoice несовместимый со всем остальным набор
-        зависимостей), без отдельного окна консоли. Первый запуск может
-        занять несколько минут — модель загружается в память GPU.
-
-        Движок CosyVoice3 обрабатывается отдельно (см.
-        _ensure_cosyvoice3_service_running) - у него своё окружение
-        (.venv_cosyvoice3) и свой порт."""
-        if self._cosyvoice_engine_code() == "cosyvoice3":
-            # CosyVoice3 при первом запуске ещё и скачивает веса модели
-            # (~1-2 ГБ с HuggingFace) поверх обычной загрузки в память GPU,
-            # так что 900 сек (15 мин) не хватало на медленном соединении -
-            # сервис реально работал (что подтверждали логи), просто GUI
-            # переставал ждать раньше, чем он успевал подняться. Даём
-            # заметно больше времени именно для cosyvoice3, если вызывающий
-            # код не передал явный ready_timeout.
-            cv3_timeout = ready_timeout if ready_timeout != 900.0 else 2700.0
-            return self._ensure_cosyvoice3_service_running(rest_url, ready_timeout=cv3_timeout)
-
-        if getattr(sys, "frozen", False):
-            self.after(0, lambda: self.log(
-                "Автозапуск сервиса CosyVoice недоступен в собранной .exe-версии "
-                "программы. Запустите программу из исходников (run_gui.bat)."
-            ))
-            return False
-
-        cosyvoice_py = _app_dir() / ".venv_cosyvoice" / "Scripts" / "python.exe"
-        if not cosyvoice_py.exists():
-            # на всякий случай также проверяем "не-Windows" раскладку venv
-            alt = _app_dir() / ".venv_cosyvoice" / "bin" / "python"
-            cosyvoice_py = alt if alt.exists() else cosyvoice_py
-        service_dir = _app_dir() / "CosyVoice"
-        service_path = service_dir / "cosyvoice_rest_service.py"
-
-        if not cosyvoice_py.exists() or not service_path.exists():
-            self.after(0, lambda: self.log(
-                "Режим CosyVoice ещё не установлен на этом компьютере. Запустите "
-                "install.bat ещё раз (он теперь заодно ставит и CosyVoice — это "
-                "большая, отдельная от остального загрузка, может занять время)."
-            ))
-            return False
-
-        try:
-            from urllib.parse import urlparse
-            port = urlparse(rest_url).port or 5011
-        except Exception:
-            port = 5011
-        port_retry_done = False
-
-        need_start = self._cosyvoice_proc is None or self._cosyvoice_proc.poll() is not None
-        if not need_start and self._ping_rest_service(rest_url) and not self._cosyvoice_model_loaded(rest_url):
-            # Сервис отвечает (например, остался запущенным с прошлого
-            # раза), но модель CosyVoice у него не загрузилась — такой
-            # "зомби"-процесс нужно принудительно остановить и поднять
-            # заново, иначе программа будет считать его рабочим и получать
-            # HTTP 500 на каждый запрос без единой новой попытки перезапуска.
-            self.after(0, lambda: self.log(
-                "Обнаружен уже запущенный сервис CosyVoice, у которого не загружена "
-                "модель (скорее всего остался с прошлого раза, до недавнего "
-                "исправления) — останавливаю его и запускаю заново…"
-            ))
-            self._cosyvoice_proc = None
-            self._kill_process_on_port(port)
-            time.sleep(1.0)
-            need_start = True
-        if need_start:
-            try:
-                popen_env = dict(os.environ)
-                popen_env["TTS_ENGINE"] = self._cosyvoice_engine_code()
-                popen_kwargs = dict(
-                    cwd=str(service_dir),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env=popen_env,
-                )
-                if sys.platform == "win32":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                self._cosyvoice_proc = subprocess.Popen(
-                    [str(cosyvoice_py), str(service_path)], **popen_kwargs
-                )
-            except Exception as e:
-                _log_exception_to_file("запуск сервиса CosyVoice")
-                err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
-                return False
-
-            def pump_output():
-                proc = self._cosyvoice_proc
-                if proc is None or proc.stdout is None:
-                    return
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        self.after(0, lambda l=line: self.log("  [сервис CosyVoice] " + l))
-
-            threading.Thread(target=pump_output, daemon=True).start()
-
-        deadline = time.time() + ready_timeout
-        last_notice = 0.0
-        while time.time() < deadline:
-            # ВАЖНО: сначала проверяем, не завершился ли только что нами
-            # же запущенный процесс, и только потом - пинг. Если проверять
-            # в обратном порядке, то в ситуации "старый зомби-процесс всё
-            # ещё держит порт" пинг будет успешно отвечать (это ответ
-            # зомби, а не нашего свежего процесса), и мы никогда не
-            # заметим, что наш новый процесс уже упал с "порт занят".
-            just_exited = self._cosyvoice_proc is not None and self._cosyvoice_proc.poll() is not None
-            if not just_exited and self._ping_rest_service(rest_url):
-                # Сервис отвечает - но это ещё не значит, что модель
-                # загрузилась (uvicorn начинает принимать запросы даже
-                # если startup_event поймал исключение при загрузке модели
-                # - см. _cosyvoice_model_loaded). Дожидаемся именно этого,
-                # а не просто первого ответа сервера.
-                if self._cosyvoice_model_loaded(rest_url):
-                    self.after(0, lambda: self.log("Сервис CosyVoice запущен и готов принимать запросы."))
-                    return True
-                if time.time() - last_notice > 15:
-                    last_notice = time.time()
-                    self.after(0, lambda: self.log(
-                        "Сервис CosyVoice отвечает, но модель ещё не загрузилась (или не "
-                        "смогла загрузиться) — жду… Если это долго не проходит, смотрите "
-                        "подробности в CosyVoice\\cosyvoice_rest_service.log."
-                    ))
-                time.sleep(1.0)
-                continue
-            if just_exited:
-                if not port_retry_done:
-                    # Частый случай: старый ("зомби") процесс ещё не успел
-                    # полностью освободить порт к моменту, когда новый уже
-                    # пытался на него забиндиться ("address already in
-                    # use") - добираем ещё раз, уже с более долгим
-                    # ожиданием освобождения порта, и пробуем один раз ещё.
-                    port_retry_done = True
-                    self.after(0, lambda: self.log(
-                        "Сервис CosyVoice завершился сразу после запуска — возможно, порт "
-                        "ещё не освободился от предыдущего процесса. Пробую ещё раз…"
-                    ))
-                    self._cosyvoice_proc = None
-                    self._kill_process_on_port(port, wait_free_timeout=12.0)
-                    time.sleep(1.0)
-                    try:
-                        popen_env2 = dict(os.environ)
-                        popen_env2["TTS_ENGINE"] = self._cosyvoice_engine_code()
-                        popen_kwargs = dict(
-                            cwd=str(service_dir),
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            bufsize=1,
-                            env=popen_env2,
-                        )
-                        if sys.platform == "win32":
-                            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                        self._cosyvoice_proc = subprocess.Popen(
-                            [str(cosyvoice_py), str(service_path)], **popen_kwargs
-                        )
-
-                        def pump_output2():
-                            proc = self._cosyvoice_proc
-                            if proc is None or proc.stdout is None:
-                                return
-                            for line in proc.stdout:
-                                line = line.rstrip()
-                                if line:
-                                    self.after(0, lambda l=line: self.log("  [сервис CosyVoice] " + l))
-
-                        threading.Thread(target=pump_output2, daemon=True).start()
-                        time.sleep(1.0)
-                        continue
-                    except Exception as e:
-                        _log_exception_to_file("повторный запуск сервиса CosyVoice")
-                        err = str(e)
-                        self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
-                        return False
-                self.after(0, lambda: self.log(
-                    f"Сервис CosyVoice завершился сам собой (код {self._cosyvoice_proc.returncode}) "
-                    "во время запуска — см. сообщения [сервис CosyVoice] выше."
-                ))
-                return False
-            if time.time() - last_notice > 15:
-                last_notice = time.time()
-                self.after(0, lambda: self.log(
-                    "…сервис CosyVoice ещё запускается (модель грузится в память GPU, "
-                    "при первом запуске это может занять несколько минут)…"
-                ))
-            time.sleep(1.0)
-
-        self.after(0, lambda: self.log("Сервис CosyVoice не успел запуститься за отведённое время."))
-        return False
 
     def request_stop(self):
         self._stop_requested = True
         self.log("Запрошена остановка после текущей главы…")
+
+    def check_ambiguous_stress(self):
+        """Кнопка «Проверить ударения» — сканирует ТЕКСТ выбранной книги (не
+        аудио) на предмет слов, у которых ударение зависит от контекста
+        (омографы), и открывает готовый текстовый отчёт. Быстрая
+        альтернатива тому, чтобы ловить неправильные ударения на слух в
+        многочасовой готовой озвучке — см. check_ambiguous_stress.py."""
+        if self._worker and self._worker.is_alive():
+            messagebox.showinfo("Проверка ударений", "Дождитесь окончания текущей озвучки.")
+            return
+        if not self.book_path:
+            messagebox.showwarning("Проверка ударений", "Сначала выберите книгу.")
+            return
+
+        try:
+            import check_ambiguous_stress
+        except Exception as e:
+            messagebox.showerror(
+                "Проверка ударений",
+                f"Не удалось загрузить check_ambiguous_stress.py:\n{e}"
+            )
+            return
+
+        book_path = self.book_path
+        out_path = Path(str(book_path.with_suffix("")) + ".ambiguous_stress_report.txt")
+
+        self.log(f"\n--- Проверка ударений по тексту: {book_path.name} ---")
+        self.check_stress_btn.configure(state="disabled")
+
+        def worker():
+            try:
+                report_text, stats = check_ambiguous_stress.analyze_book(
+                    book_path, top=200, max_examples=3,
+                    progress_cb=lambda msg: self.after(0, self.log, msg),
+                )
+                out_path.write_text(report_text, encoding="utf-8")
+            except Exception as e:
+                self.after(0, self.log, f"Проверка ударений не удалась: {e}")
+                self.after(0, messagebox.showerror, "Проверка ударений", str(e))
+                self.after(0, lambda: self.check_stress_btn.configure(state="normal"))
+                return
+
+            def done():
+                self.check_stress_btn.configure(state="normal")
+                self.log(
+                    f"Отчёт готов: {out_path.name}\n"
+                    f"  Раздел 1 (программа решает сама): {stats['auto_unique']} слов, "
+                    f"{stats['auto_total']} вхождений\n"
+                    f"  Раздел 2 (без автоматики — можно проставить ударения ниже): "
+                    f"{stats['plain_unique']} слов, {stats['plain_total']} вхождений"
+                )
+                self._open_stress_review_dialog(stats, out_path)
+
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_stress_review_dialog(self, stats: dict, report_out_path: Path,
+                                    limit: int = 300):
+        """Окно со списком спорных слов (раздел 2 отчёта — без автоматики),
+        отсортированных по частоте, с полем ввода напротив каждого. Идея
+        именно в этом (а не только в чтении отчёта): пользователь САМ
+        указывает нужное ударение для конкретных слов книги — программа
+        сохраняет их в manual_stress_overrides.json и будет применять при
+        каждой следующей озвучке этой (и любой другой) книги, где встретится
+        такое же слово. Пустые поля просто пропускаются."""
+        plain_words = stats.get("plain_words") or []
+        win = tk.Toplevel(self)
+        win.title(f"Проверка ударений — {stats.get('book_title', '')}")
+        win.geometry("880x640")
+        win.transient(self)
+
+        info = ttk.Frame(win, padding=(10, 8))
+        info.pack(side="top", fill="x")
+        ttk.Label(
+            info,
+            text=(
+                "Щёлкните по ударной гласной букве в слове — вводить ничего не нужно. "
+                "Повторный щелчок по той же букве снимает выбор (слово будет пропущено). "
+                "Ударения сохраняются ОТДЕЛЬНО ДЛЯ ЭТОЙ КНИГИ (рядом с книгой, файл "
+                "«…manual_stress_overrides.json») — то же слово в другой книге можно "
+                "разметить иначе. Если у слова вообще не бывает другого варианта ударения "
+                "(список составлен по внешнему источнику и не идеален) — жмите «Это не "
+                "омограф»: это, наоборот, действует сразу для всех книг, потому что это "
+                "не выбор чтения, а факт о самом слове."
+            ),
+            wraplength=840, justify="left",
+        ).pack(anchor="w")
+        if len(plain_words) > limit:
+            ttk.Label(
+                info,
+                text=f"Показаны {limit} самых частых слов из {len(plain_words)} — "
+                     f"полный список со всеми примерами см. в текстовом отчёте "
+                     f"({report_out_path.name}).",
+                foreground="#a60", wraplength=840, justify="left",
+            ).pack(anchor="w", pady=(4, 0))
+
+        btn_row = ttk.Frame(win, padding=(10, 0, 10, 8))
+        btn_row.pack(side="bottom", fill="x")
+        status_label = ttk.Label(btn_row, text="")
+        status_label.pack(side="left")
+        ttk.Button(
+            btn_row, text="Открыть полный текстовый отчёт",
+            command=lambda: self._open_file_externally(report_out_path),
+        ).pack(side="right")
+        save_btn = ttk.Button(btn_row, text="Сохранить")
+        save_btn.pack(side="right", padx=(0, 8))
+        ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side="right", padx=(0, 8))
+
+        canvas_holder = ttk.Frame(win)
+        canvas_holder.pack(side="top", fill="both", expand=True, padx=10)
+        canvas = tk.Canvas(canvas_holder, highlightthickness=0)
+        scroll = ttk.Scrollbar(canvas_holder, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        rows_frame = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+        rows_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+        win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>")
+                 if e.widget is win else None)
+
+        _RU_VOWELS = set("аеёиоуыэюя")
+        letter_font = ("Segoe UI", 12)
+        letter_font_selected = ("Segoe UI", 12, "bold", "underline")
+
+        # selections[word] = индекс ударной буквы в word (или None — не выбрано)
+        selections: dict[str, "int | None"] = {}
+        # letter_labels[word] = [Label, ...] — по одной метке на КАЖДУЮ букву слова,
+        # чтобы при выборе можно было сбросить подсветку с предыдущей и включить на новой
+        letter_labels: dict[str, list] = {}
+
+        def select_letter(word, idx):
+            labels = letter_labels[word]
+            prev = selections.get(word)
+            if prev == idx:
+                # повторный щелчок по той же букве — снимаем выбор
+                labels[idx].configure(font=letter_font, foreground="black")
+                selections[word] = None
+                return
+            if prev is not None:
+                labels[prev].configure(font=letter_font, foreground="black")
+            labels[idx].configure(font=letter_font_selected, foreground="#c00")
+            selections[word] = idx
+
+        shown_words = plain_words[:limit]
+        for row_i, (word, count, examples) in enumerate(shown_words):
+            row = ttk.Frame(rows_frame, padding=(0, 3))
+            row.grid(row=row_i, column=0, sticky="ew")
+            rows_frame.grid_columnconfigure(0, weight=1)
+
+            head = ttk.Frame(row)
+            head.pack(side="top", fill="x")
+            ttk.Label(head, text=f"× {count}", width=6, foreground="#555").pack(side="left")
+
+            word_frame = ttk.Frame(head)
+            word_frame.pack(side="left", padx=(4, 0))
+            selections[word] = None
+            labels = []
+            letter_labels[word] = labels
+            for idx, ch in enumerate(word):
+                is_vowel = ch in _RU_VOWELS
+                lbl = tk.Label(
+                    word_frame, text=ch, font=letter_font,
+                    cursor="hand2" if is_vowel else "arrow",
+                    padx=0,
+                )
+                lbl.pack(side="left")
+                labels.append(lbl)
+                if is_vowel:
+                    lbl.bind("<Button-1>", lambda e, w=word, i=idx: select_letter(w, i))
+
+            def mark_not_ambiguous(w=word, rw=row, wf=word_frame):
+                try:
+                    import fb2_reader
+                    fb2_reader.mark_word_not_ambiguous(w)
+                except Exception as e:
+                    messagebox.showerror("Проверка ударений", f"Не удалось сохранить: {e}")
+                    return
+                selections.pop(w, None)
+                for lbl in letter_labels.get(w, []):
+                    lbl.configure(state="disabled", foreground="#aaa", cursor="arrow")
+                    lbl.unbind("<Button-1>")
+                not_ambig_btn.configure(text="✓ больше не спросим", state="disabled")
+                self.log(f'"{w}" отмечено как не омограф — больше не будет появляться '
+                         f"в этом списке (not_ambiguous_stress_words_ru.txt).")
+
+            not_ambig_btn = ttk.Button(
+                head, text="Это не омограф", command=mark_not_ambiguous,
+            )
+            not_ambig_btn.pack(side="right", padx=(6, 0))
+
+            if examples:
+                _, ctx = examples[0]
+                ttk.Label(
+                    row, text=ctx, foreground="#666", wraplength=800, justify="left"
+                ).pack(side="top", anchor="w", padx=(24, 0))
+            ttk.Separator(row, orient="horizontal").pack(side="bottom", fill="x", pady=(4, 0))
+
+        def do_save():
+            to_save = {}
+            for word, idx in selections.items():
+                if idx is None:
+                    continue
+                to_save[word] = word[:idx] + "+" + word[idx:]
+            if not to_save:
+                messagebox.showinfo("Проверка ударений", "Ни одна буква не выбрана.")
+                return
+            book_overrides_path = Path(stats["book_overrides_path"])
+            try:
+                import fb2_reader
+                fb2_reader.save_manual_stress_overrides(to_save, book_overrides_path)
+            except Exception as e:
+                messagebox.showerror("Проверка ударений", f"Не удалось сохранить: {e}")
+                return
+            self.log(f"Сохранено вручную заданных ударений для книги "
+                      f"«{stats.get('book_title', '')}»: {len(to_save)} "
+                      f"({book_overrides_path.name}) — "
+                      + ", ".join(f"{w}→{v}" for w, v in sorted(to_save.items())))
+            status_label.configure(text=f"Сохранено: {len(to_save)}")
+            messagebox.showinfo(
+                "Проверка ударений",
+                f"Сохранено {len(to_save)} слов(о) в {book_overrides_path.name} — "
+                "отдельный файл для ЭТОЙ книги, рядом с ней.\n"
+                "Они будут применены при следующей озвучке этой книги.",
+            )
+
+        save_btn.configure(command=do_save)
+
+    def open_stress_dictionary_editor(self):
+        """Кнопка «Словарь ударений» — полноценное управление всеми вручную
+        заданными ударениями: список (со всех источников — основной словарь,
+        общие ручные переопределения и, если книга открыта, ещё и её
+        собственные), поиск по слову, удаление, плюс форма добавления новой
+        записи (используется и для случая, когда слово не входит в отчёт
+        «Проверить ударения», но хочется задать ему ударение по привычке —
+        см. fb2_reader.add_preferred_stress)."""
+        import fb2_reader
+
+        win = tk.Toplevel(self)
+        win.title("Словарь ударений")
+        win.geometry("760x600")
+        win.transient(self)
+
+        # --- поиск + список ---
+        search_row = ttk.Frame(win, padding=(10, 8, 10, 4))
+        search_row.pack(side="top", fill="x")
+        ttk.Label(search_row, text="Поиск:").pack(side="left")
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_row, textvariable=search_var, width=30)
+        search_entry.pack(side="left", padx=(6, 0))
+        count_label = ttk.Label(search_row, text="", foreground="#555")
+        count_label.pack(side="left", padx=(10, 0))
+
+        list_frame = ttk.Frame(win, padding=(10, 0))
+        list_frame.pack(side="top", fill="both", expand=True)
+        columns = ("word", "stress", "source")
+        tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
+        tree.heading("word", text="Слово")
+        tree.heading("stress", text="Ударение")
+        tree.heading("source", text="Источник")
+        tree.column("word", width=180, anchor="w")
+        tree.column("stress", width=180, anchor="w")
+        tree.column("source", width=280, anchor="w")
+        tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=tree_scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+
+        book_path = self.book_path
+
+        def _source_label(source_path: Path) -> str:
+            if book_path is not None and Path(source_path) == fb2_reader.book_manual_stress_overrides_path(book_path):
+                return f"эта книга ({Path(source_path).name})"
+            if Path(source_path) == fb2_reader.DEFAULT_STRESS_DICT_PATH:
+                return "основной словарь"
+            if Path(source_path) == fb2_reader.DEFAULT_MANUAL_STRESS_OVERRIDES_PATH:
+                return "общие ручные (все книги)"
+            return Path(source_path).name
+
+        all_entries = []  # кэш последней загрузки, чтобы поиск не бил по диску на каждую букву
+
+        def reload_entries():
+            nonlocal all_entries
+            try:
+                all_entries = fb2_reader.list_stress_entries(book_path)
+            except Exception as e:
+                messagebox.showerror("Словарь ударений", f"Не удалось прочитать словари: {e}")
+                all_entries = []
+            apply_filter()
+
+        def apply_filter(*_args):
+            query = search_var.get().strip().lower()
+            tree.delete(*tree.get_children())
+            shown = 0
+            for e in all_entries:
+                if query and query not in e["word"]:
+                    continue
+                tree.insert("", "end", values=(e["word"], e["stress"], _source_label(e["source"])),
+                            tags=(str(e["source"]),))
+                shown += 1
+            count_label.configure(text=f"{shown} из {len(all_entries)}")
+
+        search_var.trace_add("write", apply_filter)
+
+        # --- удаление выбранной записи ---
+        actions_row = ttk.Frame(win, padding=(10, 6))
+        actions_row.pack(side="top", fill="x")
+
+        def delete_selected():
+            sel = tree.selection()
+            if not sel:
+                return
+            word, stress, _source_display = tree.item(sel[0], "values")
+            source_path = Path(tree.item(sel[0], "tags")[0])
+            if not messagebox.askyesno(
+                "Словарь ударений",
+                f'Удалить "{word}" ({stress}) из {source_path.name}?',
+            ):
+                return
+            try:
+                fb2_reader.delete_stress_entry(word, source_path)
+            except Exception as e:
+                messagebox.showerror("Словарь ударений", f"Не удалось удалить: {e}")
+                return
+            self.log(f'Словарь ударений: удалено "{word}" из {source_path.name}')
+            reload_entries()
+
+        ttk.Button(actions_row, text="Удалить выбранное", command=delete_selected).pack(side="left")
+        ttk.Button(actions_row, text="Обновить список", command=reload_entries).pack(
+            side="left", padx=(6, 0)
+        )
+
+        ttk.Separator(win, orient="horizontal").pack(side="top", fill="x", pady=(6, 0))
+
+        # --- добавление новой записи ---
+        add_label_row = ttk.Frame(win, padding=(10, 8, 10, 0))
+        add_label_row.pack(side="top", fill="x")
+        ttk.Label(
+            add_label_row,
+            text=(
+                "Добавить/изменить слово: введите его, нажмите «Показать буквы», "
+                "щёлкните по ударной гласной, «Сохранить». Действует сразу для всех книг."
+            ),
+            wraplength=720, justify="left",
+        ).pack(anchor="w")
+
+        entry_row = ttk.Frame(win, padding=(10, 4))
+        entry_row.pack(side="top", fill="x")
+        word_var = tk.StringVar()
+        word_entry = ttk.Entry(entry_row, textvariable=word_var, width=30)
+        word_entry.pack(side="left")
+
+        letters_holder = ttk.Frame(win, padding=(10, 10))
+        letters_holder.pack(side="top", fill="x")
+
+        status_label = ttk.Label(win, text="", padding=(10, 0))
+        status_label.pack(side="top", anchor="w")
+
+        btn_row = ttk.Frame(win, padding=(10, 8))
+        btn_row.pack(side="bottom", fill="x")
+        save_btn = ttk.Button(btn_row, text="Сохранить", state="disabled")
+        save_btn.pack(side="right")
+        ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side="right", padx=(0, 8))
+
+        _RU_VOWELS = set("аеёиоуыэюя")
+        letter_font = ("Segoe UI", 14)
+        letter_font_selected = ("Segoe UI", 14, "bold", "underline")
+
+        state = {"word": "", "labels": [], "selected": None}
+
+        def select_letter(idx):
+            labels = state["labels"]
+            prev = state["selected"]
+            if prev == idx:
+                labels[idx].configure(font=letter_font, foreground="black")
+                state["selected"] = None
+                save_btn.configure(state="disabled")
+                return
+            if prev is not None:
+                labels[prev].configure(font=letter_font, foreground="black")
+            labels[idx].configure(font=letter_font_selected, foreground="#c00")
+            state["selected"] = idx
+            save_btn.configure(state="normal")
+
+        def show_letters():
+            word = word_var.get().strip().lower()
+            for w in letters_holder.winfo_children():
+                w.destroy()
+            state["word"] = word
+            state["labels"] = []
+            state["selected"] = None
+            save_btn.configure(state="disabled")
+            status_label.configure(text="")
+            if not word:
+                return
+            _RU_LETTERS = set("абвгдежзийклмнопрстуфхцчшщъыьэюяё-")
+            if not all(ch in _RU_LETTERS for ch in word):
+                status_label.configure(
+                    text="Похоже, это не одно русское слово — проверьте ввод.",
+                    foreground="#a60",
+                )
+            for idx, ch in enumerate(word):
+                is_vowel = ch in _RU_VOWELS
+                lbl = tk.Label(
+                    letters_holder, text=ch, font=letter_font,
+                    cursor="hand2" if is_vowel else "arrow", padx=0,
+                )
+                lbl.pack(side="left")
+                state["labels"].append(lbl)
+                if is_vowel:
+                    lbl.bind("<Button-1>", lambda e, i=idx: select_letter(i))
+
+        word_entry.bind("<Return>", lambda e: show_letters())
+        ttk.Button(entry_row, text="Показать буквы", command=show_letters).pack(
+            side="left", padx=(6, 0)
+        )
+
+        def on_tree_select(_event):
+            sel = tree.selection()
+            if not sel:
+                return
+            word, _stress, _source_display = tree.item(sel[0], "values")
+            word_var.set(word)
+            show_letters()
+
+        tree.bind("<<TreeviewSelect>>", on_tree_select)
+
+        def do_save():
+            idx = state["selected"]
+            word = state["word"]
+            if idx is None or not word:
+                return
+            replacement = word[:idx] + "+" + word[idx:]
+            try:
+                dest = fb2_reader.add_preferred_stress(word, replacement)
+            except Exception as e:
+                messagebox.showerror("Словарь ударений", f"Не удалось сохранить: {e}")
+                return
+            self.log(f'Словарь ударений: "{word}" → "{replacement}" (сохранено в {dest.name})')
+            status_label.configure(text=f"Сохранено в {dest.name}.", foreground="#080")
+            word_var.set("")
+            for w in letters_holder.winfo_children():
+                w.destroy()
+            save_btn.configure(state="disabled")
+            word_entry.focus_set()
+            reload_entries()
+
+        save_btn.configure(command=do_save)
+
+        reload_entries()
+        word_entry.focus_set()
+
+    def _open_file_externally(self, path: Path):
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as e:
+            messagebox.showerror("Не удалось открыть файл", f"{path}\n\n{e}")
 
     def start_synthesis(self):
         if self._worker and self._worker.is_alive():
@@ -2695,6 +1460,10 @@ class AudiobookApp(tk.Tk):
                         attribution=attribution,
                         should_stop=lambda: self._stop_requested,
                         play_fn=self._embedded_play,
+                        book_stress_overrides_path=(
+                            book_manual_stress_overrides_path(self.book_path)
+                            if self.book_path else None
+                        ),
                     )
                 elif mode == "silero_rest":
                     rest_url = self.rest_url_var.get().strip()
@@ -2730,6 +1499,10 @@ class AudiobookApp(tk.Tk):
                         attribution=attribution,
                         should_stop=lambda: self._stop_requested,
                         play_fn=self._embedded_play,
+                        book_stress_overrides_path=(
+                            book_manual_stress_overrides_path(self.book_path)
+                            if self.book_path else None
+                        ),
                     )
                 elif mode == "yandex":
                     run_yandex(
@@ -2749,6 +1522,55 @@ class AudiobookApp(tk.Tk):
                         should_stop=lambda: self._stop_requested,
                         play_fn=self._embedded_play,
                     )
+                elif mode == "qwen_tts":
+                    run_qwen_tts(
+                        self.chapters,
+                        outdir,
+                        start,
+                        play,
+                        self.qwen_api_key_var.get().strip(),
+                        voice=self._selected_qwen_voice(),
+                        on_progress=self._on_synthesis_progress,
+                        chapter_indices=chapter_indices,
+                        char_ranges=char_ranges,
+                        dialogue_voices=dialogue_voices,
+                        attribution=attribution,
+                        should_stop=lambda: self._stop_requested,
+                        play_fn=self._embedded_play,
+                    )
+                elif mode == "qwen_tts_local":
+                    q_local_url = self.qwen_local_url_var.get().strip() or QWEN_TTS_LOCAL_DEFAULT_URL
+                    self.after(0, lambda: self.log(
+                        "Проверяю локальный сервер Qwen3-TTS (при необходимости запущу "
+                        "автоматически, без отдельной консоли)…"
+                    ))
+                    if not self._ensure_qwen_local_service_running(
+                        q_local_url, self.qwen_local_start_cmd_var.get().strip()
+                    ):
+                        raise RuntimeError(
+                            "Не удалось автоматически запустить локальный сервер Qwen3-TTS. "
+                            "Подробности — в журнале выше и в logs\\fb2_reader_gui.log. "
+                            "Проверьте команду автозапуска в блоке «Qwen3-TTS» справа."
+                        )
+                    try:
+                        run_qwen_tts_local(
+                            self.chapters,
+                            outdir,
+                            start,
+                            play,
+                            q_local_url,
+                            voice=self._selected_qwen_voice(),
+                            on_progress=self._on_synthesis_progress,
+                            chapter_indices=chapter_indices,
+                            char_ranges=char_ranges,
+                            dialogue_voices=dialogue_voices,
+                            attribution=attribution,
+                            should_stop=lambda: self._stop_requested,
+                            play_fn=self._embedded_play,
+                        )
+                    finally:
+                        if self.qwen_local_auto_stop_var.get():
+                            self._stop_qwen_local_service()
                 elif mode == "cosyvoice":
                     cv_rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
                     if self._rest_url_is_local(cv_rest_url):
@@ -2880,320 +1702,22 @@ class AudiobookApp(tk.Tk):
     # срабатывает как проигрывание с начала (ограничение библиотеки, не
     # ошибка программы).
 
-    def _ensure_mixer(self):
-        """Лениво импортирует и инициализирует pygame.mixer — только когда
-        реально понадобилось проигрывание, чтобы не тормозить запуск
-        программы. Возвращает модуль pygame или None, если pygame не
-        установлен (тогда используется запасной вариант — системный
-        проигрыватель, без кнопок и перемотки)."""
-        try:
-            import pygame
-        except ImportError:
-            return None
-        except Exception as e:
-            # На некоторых системах модуль ставится, но не импортируется
-            # (например, не хватает системной DLL) — это не обычный
-            # "не установлен", покажем причину, чтобы было понятнее, что
-            # чинить.
-            err = f"{type(e).__name__}: {e}"
-            self.after(0, lambda t=err: self.log(f"pygame не загрузился ({t})"))
-            return None
-        if not self._mixer_ready:
-            try:
-                pygame.mixer.init()
-                self._mixer_ready = True
-            except Exception as e:
-                err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось инициализировать аудио (pygame.mixer): {t}"))
-                return None
-        return pygame
 
-    @staticmethod
-    def _fmt_player_time(seconds: float) -> str:
-        seconds = max(0, int(seconds or 0))
-        return f"{seconds // 60}:{seconds % 60:02d}"
 
-    def _audio_duration_seconds(self, path: Path) -> float:
-        """Длительность аудиофайла в секундах — точно для WAV (заголовок
-        файла), приблизительно для остальных форматов через pydub (если
-        установлен; иначе 0 — плеер тогда просто не покажет полосу
-        прокрутки, но проигрывание всё равно работает)."""
-        try:
-            if path.suffix.lower() == ".wav":
-                import wave
-                with wave.open(str(path), "rb") as wf:
-                    return wf.getnframes() / float(wf.getframerate())
-            from pydub import AudioSegment
-            return len(AudioSegment.from_file(str(path))) / 1000.0
-        except Exception:
-            return 0.0
 
-    def _get_chapter_audio_path(self, idx: int, title: str) -> Path | None:
-        outdir = Path(self.outdir_var.get().strip() or "audiobook_output")
-        from fb2_reader import sanitize_filename
-        for ext in (".wav", ".mp3"):
-            p = outdir / f"{idx:03d}_{sanitize_filename(title)}{ext}"
-            if p.exists():
-                return p
-        return None
 
-    def refresh_player_for_selection(self):
-        """Подгружает в плеер аудио выбранной в списке главы, если оно уже
-        есть — кнопка "Играть" включается, только если файл найден.
-        Вызывается при выборе главы в списке и после завершения озвучки
-        (чтобы свежесозданный файл сразу стал доступен для прослушивания).
-        Ничего не делает, пока идёт активное проигрывание/автопроигрывание
-        (чтобы не оборвать его сменой выделения)."""
-        if self._player_state == "playing" and self._player_block_event is not None:
-            return  # идёт автопроигрывание после синтеза — не перебиваем
-        sel = self.chapters_list.curselection()
-        path = None
-        if len(sel) == 1 and self.chapters:
-            idx = sel[0] + 1
-            title, _ = self.chapters[idx - 1]
-            path = self._get_chapter_audio_path(idx, title)
-        if path is None:
-            self._clear_player()
-            return
-        if path == self._player_path:
-            return  # уже загружен этот же файл — не сбрасываем позицию
-        self._clear_player()
-        self.player_title_label.configure(text=f"⏳ {path.name} — читаю длительность…")
-        self._player_load_token += 1
-        token = self._player_load_token
 
-        def worker():
-            duration = self._audio_duration_seconds(path)
-            self.after(0, lambda: self._finish_load_player_track(path, duration, token))
 
-        threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_load_player_track(self, path: Path, duration: float, token: int):
-        if token != self._player_load_token:
-            return  # пользователь успел выбрать другую главу — отбрасываем
-        self._player_path = path
-        self._player_duration = duration
-        self._player_position = 0.0
-        self._player_state = "paused"
-        self.player_scale.configure(to=max(duration, 0.01), state="normal" if duration else "disabled")
-        self.player_pos_var.set(0.0)
-        self.player_title_label.configure(text=path.name)
-        self.player_time_label.configure(text=f"0:00 / {self._fmt_player_time(duration)}")
-        self.player_play_btn.configure(state="normal", text="▶ Играть")
-        self.player_stop_btn.configure(state="disabled")
 
-    def _clear_player(self, label: str | None = None):
-        pygame = None
-        try:
-            import pygame as _pg
-            pygame = _pg
-        except ImportError:
-            pass
-        if pygame is not None and self._player_state == "playing":
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-        self._stop_player_tick()
-        self._player_path = None
-        self._player_duration = 0.0
-        self._player_position = 0.0
-        self._player_state = "stopped"
-        self.player_title_label.configure(
-            text=label or ("Глава не озвучена — сначала озвучьте её" if self.chapters else "Глава не выбрана")
-        )
-        self.player_time_label.configure(text="")
-        self.player_pos_var.set(0.0)
-        self.player_scale.configure(state="disabled")
-        self.player_play_btn.configure(state="disabled", text="▶ Играть")
-        self.player_stop_btn.configure(state="disabled")
 
-    def _current_player_position(self) -> float:
-        if self._player_state == "playing":
-            pos = self._player_position + (time.time() - self._player_play_wall_start)
-            return min(pos, self._player_duration) if self._player_duration else pos
-        return self._player_position
 
-    def _player_play_pause(self):
-        pygame = self._ensure_mixer()
-        if pygame is None:
-            self.log(
-                "pygame не установлен — управление проигрыванием (пауза/перемотка) "
-                "недоступно. Запустите install.bat ещё раз, чтобы поставить pygame."
-            )
-            return
-        if self._player_path is None:
-            return
-        if self._player_state == "playing":
-            pygame.mixer.music.stop()
-            self._player_position = self._current_player_position()
-            self._player_state = "paused"
-            self.player_play_btn.configure(text="▶ Играть")
-            self.player_stop_btn.configure(state="normal")
-            self._stop_player_tick()
-            return
 
-        try:
-            pygame.mixer.music.load(str(self._player_path))
-            pygame.mixer.music.play(start=self._player_position)
-        except Exception as e:
-            self.log(f"Не удалось проиграть файл: {e}")
-            return
-        self._player_state = "playing"
-        self._player_play_wall_start = time.time()
-        self.player_play_btn.configure(text="⏸ Пауза")
-        self.player_stop_btn.configure(state="normal")
-        self._start_player_tick()
 
-    def _player_stop(self):
-        pygame = self._ensure_mixer()
-        if pygame is not None:
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-        self._player_position = 0.0
-        self._player_state = "paused" if self._player_path else "stopped"
-        self.player_play_btn.configure(text="▶ Играть")
-        self.player_stop_btn.configure(state="disabled")
-        self._stop_player_tick()
-        self._player_updating_scale = True
-        self.player_pos_var.set(0.0)
-        self._player_updating_scale = False
-        if self._player_duration:
-            self.player_time_label.configure(text=f"0:00 / {self._fmt_player_time(self._player_duration)}")
-        if self._player_block_event is not None:
-            self._player_block_event.set()
 
-    def _start_player_tick(self):
-        self._stop_player_tick()
-        self._player_tick_job = self.after(200, self._player_tick)
 
-    def _stop_player_tick(self):
-        if self._player_tick_job is not None:
-            try:
-                self.after_cancel(self._player_tick_job)
-            except Exception:
-                pass
-            self._player_tick_job = None
 
-    def _player_tick(self):
-        self._player_tick_job = None
-        if self._player_state != "playing":
-            return
-        pygame = self._ensure_mixer()
-        pos = self._current_player_position()
-        finished = pygame is not None and not pygame.mixer.music.get_busy()
-        if finished or (self._player_duration and pos >= self._player_duration):
-            self._player_position = 0.0
-            self._player_state = "paused" if self._player_path else "stopped"
-            self.player_play_btn.configure(text="▶ Играть")
-            self.player_stop_btn.configure(state="disabled")
-            self._player_updating_scale = True
-            self.player_pos_var.set(0.0)
-            self._player_updating_scale = False
-            if self._player_duration:
-                self.player_time_label.configure(text=f"0:00 / {self._fmt_player_time(self._player_duration)}")
-            if self._player_block_event is not None:
-                self._player_block_event.set()
-            return
-        if not self._player_seek_dragging:
-            self._player_updating_scale = True
-            self.player_pos_var.set(pos)
-            self._player_updating_scale = False
-        self.player_time_label.configure(
-            text=f"{self._fmt_player_time(pos)} / {self._fmt_player_time(self._player_duration)}"
-        )
-        self._player_tick_job = self.after(200, self._player_tick)
 
-    def _on_player_scale_move(self, _value):
-        # Срабатывает и от перетаскивания мышью, и от программного
-        # .set() (тик плеера) — здесь только обновляем подпись времени
-        # вживую при перетаскивании; сама перемотка применяется в
-        # _on_player_seek_commit (по отпусканию кнопки мыши), не на
-        # каждое промежуточное движение.
-        if getattr(self, "_player_updating_scale", False) or not self._player_seek_dragging:
-            return
-        pos = self.player_pos_var.get()
-        self.player_time_label.configure(
-            text=f"{self._fmt_player_time(pos)} / {self._fmt_player_time(self._player_duration)}"
-        )
-
-    def _on_player_seek_start(self, _event):
-        if self._player_path is None or not self._player_duration:
-            return "break"
-        self._player_seek_dragging = True
-
-    def _on_player_seek_commit(self, _event):
-        if not self._player_seek_dragging:
-            return
-        self._player_seek_dragging = False
-        if self._player_path is None or not self._player_duration:
-            return
-        target = max(0.0, min(self._player_duration, self.player_pos_var.get()))
-        pygame = self._ensure_mixer()
-        was_playing = self._player_state == "playing"
-        if pygame is not None:
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-        self._player_position = target
-        if was_playing and pygame is not None:
-            try:
-                pygame.mixer.music.load(str(self._player_path))
-                pygame.mixer.music.play(start=target)
-                self._player_play_wall_start = time.time()
-                self._player_state = "playing"
-                self._start_player_tick()
-            except Exception as e:
-                self.log(f"Не удалось перемотать: {e}")
-                self._player_state = "paused"
-        else:
-            self._player_state = "paused"
-        self.player_time_label.configure(
-            text=f"{self._fmt_player_time(target)} / {self._fmt_player_time(self._player_duration)}"
-        )
-
-    def _embedded_play(self, path: Path):
-        """play_fn для run_* — автопроигрывание сразу после озвучки главы
-        (галочка "Проигрывать после озвучки каждой главы"). Вызывается из
-        потока озвучки и должна там же и блокировать выполнение (иначе
-        следующая глава начнёт озвучиваться поверх ещё звучащей) — поэтому
-        ждём threading.Event, который выставляется по естественному
-        окончанию трека или по нажатию "Стоп" (см. _player_stop/_player_tick)."""
-        pygame = self._ensure_mixer()
-        if pygame is None:
-            self.after(0, lambda: self.log(
-                "pygame не установлен — играю через системный проигрыватель "
-                "(без кнопок паузы/стопа/перемотки здесь). Запустите install.bat "
-                "ещё раз, чтобы поставить pygame и получить управление проигрыванием."
-            ))
-            try:
-                play_file(path)
-            except Exception as e:
-                err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось проиграть файл: {t}"))
-            return
-
-        duration = self._audio_duration_seconds(path)
-        done_event = threading.Event()
-        self._player_block_event = done_event
-
-        def start_on_ui_thread():
-            self._clear_player()
-            self._player_load_token += 1
-            self._player_path = path
-            self._player_duration = duration
-            self._player_position = 0.0
-            self._player_state = "paused"
-            self.player_scale.configure(to=max(duration, 0.01), state="normal" if duration else "disabled")
-            self.player_title_label.configure(text=f"▶ {path.name}")
-            self._player_play_pause()
-
-        self.after(0, start_on_ui_thread)
-        done_event.wait()
-        self._player_block_event = None
 
     def _on_close(self):
         if self._worker and self._worker.is_alive():
@@ -3249,7 +1773,7 @@ def _install_error_logging(app: "AudiobookApp"):
 
     sys.excepthook = on_sys_excepthook
 
-    if _log_file_open_failed:
+    if gui_shared._log_file_open_failed:
         try:
             app.log(
                 f"ПРЕДУПРЕЖДЕНИЕ: не удалось создать файл журнала в {LOGS_DIR} — "

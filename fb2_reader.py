@@ -160,6 +160,8 @@ TTS_MODES = {
     "cosyvoice": "CosyVoice (локально, GPU, клонирование голоса)",
     "piper": "Piper (локально, CPU, быстро, без клонирования)",
     "yandex": "Yandex SpeechKit (облако, платно, нужен API-ключ)",
+    "qwen_tts": "Qwen3-TTS (облако DashScope, платно, нужен API-ключ)",
+    "qwen_tts_local": "Qwen3-TTS (локально, GPU, без интернета/карты)",
     "online": "Google TTS (нужен интернет)",
     "offline": "Системный TTS (pyttsx3, без интернета)",
 }
@@ -226,6 +228,43 @@ YANDEX_DEFAULT_LANG = "ru-RU"
 
 def yandex_lang_for_voice(voice: str) -> str:
     return YANDEX_VOICE_LANGS.get(voice, YANDEX_DEFAULT_LANG)
+
+
+# Qwen3-TTS (Alibaba) через облачный DashScope API — модель "qwen3-tts-flash".
+# В отличие от CosyVoice (свои веса, отдельная GPU-среда, свой install-скрипт)
+# это облачный сервис по API-ключу, ближе по духу к Yandex SpeechKit: не
+# нужен GPU и локальная модель, но нужен интернет, ключ DashScope и,
+# вероятно, платный аккаунт (см. https://help.aliyun.com или
+# https://www.alibabacloud.com/help/en/model-studio для актуальных цен —
+# на момент добавления это не проверялось вживую).
+#
+# ВАЖНО (честно, чтобы не удивлять при первом запуске): этот режим написан
+# по документации DashScope (модель ответа, поля audio.url и т.п.), но НЕ
+# протестирован на живом аккаунте — в песочнице, где писался код, нет ни
+# доступа к dashscope.aliyuncs.com, ни API-ключа. Если формат ответа на
+# практике отличается — synth_qwen_tts_chunk бросит понятное исключение с
+# текстом ошибки/сырым ответом, а не упадёт молча; сообщите точный текст
+# ошибки, если она появится, и это будет легко поправить.
+#
+# Голоса — по офиц. списку голосов Qwen-TTS (см. Alibaba Cloud Model Studio,
+# "Qwen-TTS voice list"), многоязычные (не привязаны к одному языку) —
+# язык задаётся отдельно параметром language_type.
+QWEN_TTS_VOICES = {
+    "Cherry": "Cherry (жен.)",
+    "Serena": "Serena (жен.)",
+    "Ethan": "Ethan (муж.)",
+    "Vivian": "Vivian (жен.)",
+    "Ryan": "Ryan (муж.)",
+}
+QWEN_TTS_DEFAULT_VOICE = "Cherry"
+QWEN_TTS_LANGUAGE = "Russian"
+QWEN_TTS_MODEL = "qwen3-tts-flash"
+# У DashScope документированный лимит — 512 токенов на запрос. Токен для
+# кириллицы обычно "дороже" символа (BPE режет кириллицу на несколько
+# токенов на слово чаще, чем латиницу) — берём с большим запасом, пока не
+# проверено вживую, лучше мельче резать и чаще звать API, чем упереться в
+# ошибку "текст слишком длинный" на середине главы.
+QWEN_TTS_MAX_CHARS = 350
 
 
 # --------------------------------------------------------------------------
@@ -1400,6 +1439,379 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
 
 
+def _detect_audio_format(data: bytes) -> str:
+    """Определяет формат аудио по первым байтам — используется для
+    Qwen3-TTS, чей формат ответа не был проверен вживую (см. QWEN_TTS_*
+    выше), чтобы не хардкодить расширение файла наугад."""
+    if data[:4] == b"RIFF":
+        return "wav"
+    if data[:3] == b"ID3" or (len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0):
+        return "mp3"
+    return "wav"
+
+
+def synth_qwen_tts_chunk(text: str, api_key: str, voice: str, language: str = QWEN_TTS_LANGUAGE,
+                          log_fn=None) -> bytes:
+    """Один запрос к Qwen3-TTS через DashScope (модель qwen3-tts-flash).
+    Возвращает содержимое аудио. См. предупреждение у QWEN_TTS_VOICES выше —
+    это писалось по документации, без возможности проверить вживую в
+    песочнице; если формат ответа окажется иным — исключение ниже покажет
+    сырой ответ целиком, что нужно поправить.
+
+    log_fn(message), если передан — как у synth_yandex_chunk, для диагностики."""
+    if not api_key:
+        raise ValueError(
+            "Не указан API-ключ DashScope (переменная окружения DASHSCOPE_API_KEY "
+            "или поле в GUI). Получить ключ можно в консоли Alibaba Cloud Model "
+            "Studio (https://www.alibabacloud.com/help/en/model-studio/)."
+        )
+    try:
+        import dashscope
+    except ImportError as e:
+        raise RuntimeError(
+            "Пакет dashscope не установлен — нужен для режима Qwen3-TTS "
+            "(pip install dashscope)."
+        ) from e
+
+    if log_fn:
+        preview = f"[{len(text)} симв.] {text[:80]!r}…" if len(text) > 80 else text
+        log_fn(f"Запрос к Qwen3-TTS (DashScope): model={QWEN_TTS_MODEL}, voice={voice}, "
+               f"language={language}, text={preview}")
+
+    try:
+        response = dashscope.MultiModalConversation.call(
+            model=QWEN_TTS_MODEL,
+            api_key=api_key,
+            text=text,
+            voice=voice,
+            language_type=language,
+            stream=False,
+        )
+    except Exception as e:
+        if log_fn:
+            log_fn(f"Ошибка обращения к DashScope: {e}")
+        raise RuntimeError(f"Ошибка при обращении к Qwen3-TTS (DashScope): {e}") from e
+
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None and status_code != 200:
+        code = getattr(response, "code", "")
+        message = getattr(response, "message", "")
+        if log_fn:
+            log_fn(f"Qwen3-TTS (DashScope) вернул ошибку: HTTP {status_code} {code} {message}")
+        raise RuntimeError(
+            f"Qwen3-TTS (DashScope) вернул ошибку: HTTP {status_code} {code}: {message}\n"
+            "  Частые причины: неверный/просроченный API-ключ, не подключён "
+            "платёжный аккаунт, текст длиннее лимита в 512 токенов на запрос. "
+            "Проверить ключ и баланс: https://www.alibabacloud.com/help/en/model-studio/"
+        )
+
+    audio_url = None
+    try:
+        audio_url = response.output.audio["url"]
+    except Exception:
+        try:
+            audio_url = response.output.audio.url
+        except Exception:
+            pass
+    if not audio_url:
+        if log_fn:
+            log_fn(f"Не удалось найти ссылку на аудио в ответе Qwen3-TTS. Полный ответ: {response}")
+        raise RuntimeError(
+            "Qwen3-TTS (DashScope) ответил, но не удалось найти в ответе ссылку на "
+            f"аудио — формат ответа отличается от ожидаемого. Полный ответ (см. лог): {response}"
+        )
+
+    import urllib.request
+    with urllib.request.urlopen(audio_url, timeout=60) as resp:
+        return resp.read()
+
+
+def run_qwen_tts(chapters, outdir: Path, start: int, play: bool, api_key: str,
+                  voice: str = QWEN_TTS_DEFAULT_VOICE, language: str = QWEN_TTS_LANGUAGE,
+                  on_progress=None, chapter_indices=None, char_ranges=None,
+                  dialogue_voices=None, attribution=None, should_stop=None, play_fn=None):
+    """Озвучка через облачный Qwen3-TTS (DashScope, модель qwen3-tts-flash).
+    См. предупреждение у QWEN_TTS_VOICES/synth_qwen_tts_chunk — интеграция
+    написана по документации и не проверена на живом аккаунте.
+
+    Текст режется на куски по QWEN_TTS_MAX_CHARS (осторожная оценка лимита
+    в 512 токенов на запрос — см. константу) и склеивается через pydub,
+    если он установлен, иначе сохраняется частями, как у Yandex.
+
+    dialogue_voices — необязательный список голосов (ключи QWEN_TTS_VOICES)
+    для чередования на репликах прямой речи, как в run_yandex."""
+    import time as _time
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
+
+    log_path = outdir / "qwen_tts_client.log"
+
+    def log(message: str):
+        line = f"{_time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        print(f"  {message}")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
+
+        fingerprint = _params_fingerprint(
+            text, mode="qwen_tts", voice=voice, language=language,
+            dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
+            attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
+        )
+        # Расширение файла заранее не известно (см. _detect_audio_format) —
+        # проверяем "уже готово" по .wav и .mp3 сразу, на случай если формат
+        # ответа отличался между запусками.
+        existing_path = None
+        for ext in ("wav", "mp3"):
+            candidate = outdir / f"{idx:03d}_{sanitize_filename(title)}.{ext}"
+            if _is_already_done(candidate, fingerprint):
+                existing_path = candidate
+                break
+        if existing_path is not None:
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {existing_path.name}")
+            if play:
+                print("  Проигрывание...")
+                (play_fn or play_file)(existing_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
+            continue
+
+        print(f"[{idx}/{len(chapters)}] Озвучиваю (Qwen3-TTS): {title}")
+
+        voice_groups = resolve_voice_groups(text, voice, dialogue_voices, outdir,
+                                             attribution=attribution, log_fn=log)
+        segments = _chunk_voice_groups(voice_groups, QWEN_TTS_MAX_CHARS)
+        chunks_total = len(segments) or 1
+        if on_progress:
+            on_progress(pos, total, 0, chunks_total)
+
+        chunk_bytes = []
+        for chunk_no, (chunk, seg_voice) in enumerate(
+            tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
+        ):
+            if chunk.strip() and _text_has_speakable_content(chunk):
+                data = synth_qwen_tts_chunk(chunk, api_key, seg_voice, language, log_fn=log)
+                chunk_bytes.append(data)
+            if on_progress:
+                on_progress(pos, total, chunk_no, chunks_total)
+
+        if not chunk_bytes:
+            continue
+
+        audio_format = _detect_audio_format(chunk_bytes[0])
+        out_path = outdir / f"{idx:03d}_{sanitize_filename(title)}.{audio_format}"
+
+        if len(chunk_bytes) == 1:
+            out_path.write_bytes(chunk_bytes[0])
+        else:
+            try:
+                from pydub import AudioSegment
+                import io as _io
+                combined = AudioSegment.empty()
+                for data in chunk_bytes:
+                    combined += AudioSegment.from_file(_io.BytesIO(data), format=audio_format)
+                combined.export(str(out_path), format=audio_format)
+            except ImportError:
+                for i, data in enumerate(chunk_bytes):
+                    part_path = out_path.with_name(f"{out_path.stem}_part{i + 1}.{audio_format}")
+                    part_path.write_bytes(data)
+                print("  (pydub не установлен — глава сохранена частями *_partN)")
+
+        _save_fingerprint(out_path, fingerprint)
+
+        if play:
+            print("  Проигрывание...")
+            (play_fn or play_file)(out_path)
+
+    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+
+
+QWEN_TTS_LOCAL_DEFAULT_URL = "http://127.0.0.1:7860"
+# Сигнатура подтверждена вживую по странице <сервер>/?view=api конкретной
+# инсталляции Qwen3-TTS-Pinokio (SUP3RMASSIVE/Qwen3-TTS-Pinokio) — вкладка
+# "Custom Voice" её демо использует функцию /generate_custom_voice с
+# именованными параметрами text/language/speaker/instruct/model_size/seed
+# и возвращает (аудиофайл, статус-строка). Список голосов и языков у этого
+# сервера СВОЙ (не совпадает со списком голосов облачного DashScope) — см.
+# QWEN_TTS_LOCAL_VOICES ниже. Если у кого-то стоит другая сборка/версия
+# Gradio-демо с другой сигнатурой — сверьте на <URL сервера>/?view=api и
+# поправьте константы ниже.
+QWEN_TTS_LOCAL_API_NAME = "/generate_custom_voice"
+QWEN_TTS_LOCAL_VOICES = {
+    "Aiden": "Aiden (муж.)", "Dylan": "Dylan (муж.)", "Eric": "Eric (муж.)",
+    "Ono_anna": "Ono_anna (жен.)", "Ryan": "Ryan (муж.)", "Serena": "Serena (жен.)",
+    "Sohee": "Sohee (жен.)", "Uncle_fu": "Uncle_fu (муж.)", "Vivian": "Vivian (жен.)",
+}
+QWEN_TTS_LOCAL_DEFAULT_VOICE = "Serena"
+QWEN_TTS_LOCAL_MODEL_SIZE = "1.7B"
+
+
+def synth_qwen_tts_local_chunk(text: str, server_url: str, voice: str,
+                                language: str = QWEN_TTS_LANGUAGE,
+                                api_name: str = QWEN_TTS_LOCAL_API_NAME,
+                                model_size: str = QWEN_TTS_LOCAL_MODEL_SIZE,
+                                log_fn=None) -> bytes:
+    """Один запрос к локально запущенному Gradio-серверу Qwen3-TTS (без
+    DashScope/облака/карты — модель считается на видеокарте пользователя).
+    См. предупреждение у QWEN_TTS_LOCAL_API_NAME выше — сигнатура снята с
+    живого сервера (Qwen3-TTS-Pinokio), но у другой сборки может отличаться."""
+    try:
+        from gradio_client import Client
+    except ImportError as e:
+        raise RuntimeError(
+            "Пакет gradio_client не установлен — нужен для режима "
+            "«Qwen3-TTS (локально)» (pip install gradio_client)."
+        ) from e
+
+    if log_fn:
+        preview = f"[{len(text)} симв.] {text[:80]!r}…" if len(text) > 80 else text
+        log_fn(f"Запрос к локальному Qwen3-TTS ({server_url}): speaker={voice}, "
+               f"language={language}, text={preview}")
+
+    try:
+        client = Client(server_url)
+        result = client.predict(
+            text=text, language=language, speaker=voice, instruct="",
+            model_size=model_size, seed=-1, api_name=api_name,
+        )
+    except Exception as e:
+        if log_fn:
+            log_fn(f"Ошибка обращения к локальному серверу Qwen3-TTS: {e}")
+        raise RuntimeError(
+            f"Ошибка при обращении к локальному серверу Qwen3-TTS ({server_url}): {e}\n"
+            "  Проверьте, что сервер запущен и отвечает по этому адресу, и что "
+            "имя функции/порядок параметров совпадает с тем, что показано на "
+            f"{server_url.rstrip('/')}/?view=api — если нет, пришлите мне эту "
+            "страницу, поправлю вызов."
+        ) from e
+
+    # /generate_custom_voice возвращает (аудио, статус) — аудио у
+    # gradio_client приходит либо готовым путём к скачанному файлу (str),
+    # либо словарём FileData с ключом "path" — на всякий случай понимаем оба.
+    audio_part = result[0] if isinstance(result, (list, tuple)) else result
+    audio_path = audio_part.get("path") if isinstance(audio_part, dict) else audio_part
+    if not audio_path or not os.path.exists(str(audio_path)):
+        if log_fn:
+            log_fn(f"Неожиданный ответ локального сервера Qwen3-TTS: {result!r}")
+        raise RuntimeError(
+            f"Локальный сервер Qwen3-TTS вернул неожиданный ответ (не путь к "
+            f"файлу): {result!r}. Проверьте {server_url.rstrip('/')}/?view=api "
+            "и пришлите мне точную сигнатуру, если она отличается."
+        )
+    with open(audio_path, "rb") as f:
+        return f.read()
+
+
+def run_qwen_tts_local(chapters, outdir: Path, start: int, play: bool, server_url: str,
+                        voice: str = QWEN_TTS_LOCAL_DEFAULT_VOICE, language: str = QWEN_TTS_LANGUAGE,
+                        on_progress=None, chapter_indices=None, char_ranges=None,
+                        dialogue_voices=None, attribution=None, should_stop=None, play_fn=None):
+    """Озвучка через локальный Gradio-сервер Qwen3-TTS (без облака/карты —
+    структура идентична run_qwen_tts, только вызов синтеза другой, см.
+    synth_qwen_tts_local_chunk)."""
+    import time as _time
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
+
+    log_path = outdir / "qwen_tts_local_client.log"
+
+    def log(message: str):
+        line = f"{_time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        print(f"  {message}")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
+
+        fingerprint = _params_fingerprint(
+            text, mode="qwen_tts_local", voice=voice, language=language,
+            dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
+            attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
+        )
+        existing_path = None
+        for ext in ("wav", "mp3"):
+            candidate = outdir / f"{idx:03d}_{sanitize_filename(title)}.{ext}"
+            if _is_already_done(candidate, fingerprint):
+                existing_path = candidate
+                break
+        if existing_path is not None:
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {existing_path.name}")
+            if play:
+                print("  Проигрывание...")
+                (play_fn or play_file)(existing_path)
+            if on_progress:
+                on_progress(pos, total, 1, 1)
+            continue
+
+        print(f"[{idx}/{len(chapters)}] Озвучиваю (Qwen3-TTS, локально): {title}")
+
+        voice_groups = resolve_voice_groups(text, voice, dialogue_voices, outdir,
+                                             attribution=attribution, log_fn=log)
+        segments = _chunk_voice_groups(voice_groups, QWEN_TTS_MAX_CHARS)
+        chunks_total = len(segments) or 1
+        if on_progress:
+            on_progress(pos, total, 0, chunks_total)
+
+        chunk_bytes = []
+        for chunk_no, (chunk, seg_voice) in enumerate(
+            tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
+        ):
+            if chunk.strip() and _text_has_speakable_content(chunk):
+                data = synth_qwen_tts_local_chunk(chunk, server_url, seg_voice, language, log_fn=log)
+                chunk_bytes.append(data)
+            if on_progress:
+                on_progress(pos, total, chunk_no, chunks_total)
+
+        if not chunk_bytes:
+            continue
+
+        audio_format = _detect_audio_format(chunk_bytes[0])
+        out_path = outdir / f"{idx:03d}_{sanitize_filename(title)}.{audio_format}"
+
+        if len(chunk_bytes) == 1:
+            out_path.write_bytes(chunk_bytes[0])
+        else:
+            try:
+                from pydub import AudioSegment
+                import io as _io
+                combined = AudioSegment.empty()
+                for data in chunk_bytes:
+                    combined += AudioSegment.from_file(_io.BytesIO(data), format=audio_format)
+                combined.export(str(out_path), format=audio_format)
+            except ImportError:
+                for i, data in enumerate(chunk_bytes):
+                    part_path = out_path.with_name(f"{out_path.stem}_part{i + 1}.{audio_format}")
+                    part_path.write_bytes(data)
+                print("  (pydub не установлен — глава сохранена частями *_partN)")
+
+        _save_fingerprint(out_path, fingerprint)
+
+        if play:
+            print("  Проигрывание...")
+            (play_fn or play_file)(out_path)
+
+    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+
+
 def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, on_progress=None,
                chapter_indices=None, char_ranges=None, dialogue_voices=None, should_stop=None,
                play_fn=None):
@@ -1496,12 +1908,1274 @@ def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms:
     return segments
 
 
+# --------------------------------------------------------------------------
+# Ударения для локального режима silero: словарь книжных имён/терминов +
+# RUAccent как общая подстраховка. silero_rest_service.py (отдельный REST-
+# сервис) уже делает то же самое через RUAccent на сервере — здесь то же
+# самое добавляется для ЛОКАЛЬНОГО режима (--mode silero, апелляция к
+# model.apply_tts напрямую), у которого раньше не было ничего, кроме
+# встроенного в саму модель Silero угадывания ударений (put_accent=True),
+# которое на редких/составных словах и омографах иногда ошибается.
+# --------------------------------------------------------------------------
+
+DEFAULT_STRESS_DICT_PATH = Path(__file__).resolve().parent / "stress_dictionary.json"
+
+# Захватывает и дефисные составные слова целиком ("во-первых", "кто-то") —
+# иначе они виделись бы словарю как два отдельных слова ("во" + "первых"),
+# и нельзя было бы задать ударение именно для сочетания целиком.
+_STRESS_WORD_RE = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*")
+
+
+# --------------------------------------------------------------------------
+# Слова с ударением, зависящим от контекста (падежа/числа/части речи или
+# просто разных слов с одинаковым написанием — омографы вроде "за́мок"/
+# "замо́к", а также словоформы вроде "ка́зни"/"казни́", "ка́тера"/"катера́"):
+# для НИХ словарь в принципе не может дать один правильный ответ на все
+# случаи — единственный, кто в состоянии выбрать вариант по контексту
+# предложения, это RUAccent. Список — почти 1200 слов из открытого списка
+# омографов проекта Silero (https://github.com/snakers4/silero-stress,
+# wiki Homograph-List) — хранится рядом со скриптом в
+# ambiguous_stress_words_ru.txt, по одному слову в нижнем регистре на
+# строку. Используется и на входе (load_stress_dictionary отфильтровывает
+# такие слова, если они вдруг оказались в stress_dictionary.json — вручную
+# добавлены или остались от старого автопополнения), и при автопоиске
+# (enrich_stress_dictionary_online такие слова даже не пытается искать).
+# --------------------------------------------------------------------------
+
+DEFAULT_AMBIGUOUS_STRESS_WORDS_PATH = (
+    Path(__file__).resolve().parent / "ambiguous_stress_words_ru.txt"
+)
+
+_ambiguous_stress_words: "set | None" = None
+_ambiguous_stress_words_load_failed = False
+
+
+def _load_ambiguous_stress_words(path: "Path | str | None" = None) -> set:
+    """Лениво загружает и кэширует список контекстно-зависимых слов (см.
+    выше). Файл необязателен: если его нет — просто ничего не
+    фильтруется, работает как раньше. Ошибка чтения тоже не прерывает
+    синтез — только предупреждение один раз."""
+    global _ambiguous_stress_words, _ambiguous_stress_words_load_failed
+    if _ambiguous_stress_words is not None:
+        return _ambiguous_stress_words
+    if _ambiguous_stress_words_load_failed:
+        return set()
+    p = Path(path) if path else DEFAULT_AMBIGUOUS_STRESS_WORDS_PATH
+    if not p.exists():
+        _ambiguous_stress_words_load_failed = True
+        return set()
+    try:
+        raw_words = {line.strip().lower() for line in p.read_text(encoding="utf-8").splitlines()
+                     if line.strip()}
+        # Слово с одной гласной буквой (или вовсе без гласных) физически не
+        # может иметь неоднозначное ударение — ударить там попросту больше
+        # некуда, кроме этой единственной гласной. Список омографов взят из
+        # чужого источника (см. комментарий выше) и в нём попадаются такие
+        # ложные срабатывания (однослоговые слова) — здесь их отфильтровываем,
+        # чтобы они не блокировали спокойно правильные слова в
+        # stress_dictionary.json и не засоряли список "сомнительных" в
+        # диалоге проверки ударений GUI.
+        _RU_VOWELS = set("аеёиоуыэюя")
+
+        def _vowel_count(w: str) -> int:
+            return sum(1 for ch in w if ch in _RU_VOWELS)
+
+        words = {w for w in raw_words if _vowel_count(w) >= 2}
+        dropped = len(raw_words) - len(words)
+        if dropped:
+            print(f"Список контекстно-зависимых слов {p}: пропущено {dropped} "
+                  f"слов(о) с одной гласной — там ударение однозначно, путать нечего.")
+
+        # Дополнительно вычитаем слова, которые пользователь (или я по его
+        # просьбе) явно проверил и признал НЕ омографом на самом деле — см.
+        # not_ambiguous_stress_words_ru.txt / mark_word_not_ambiguous. Список
+        # взят из внешнего источника (вики-страница Silero) и, помимо
+        # однослоговых слов (см. выше), в нём попадаются слова, у которых
+        # теоретически есть другое написание/разбор, но на практике спутать
+        # почти невозможно, — в отличие от фильтра по гласным, автоматически
+        # доказать это для конкретного слова нельзя, поэтому такие слова
+        # исключаются только по одному, по факту проверки, а не общим
+        # правилом.
+        not_ambiguous = _load_not_ambiguous_stress_words()
+        if not_ambiguous:
+            before = len(words)
+            words -= not_ambiguous
+            if len(words) != before:
+                print(f"Список контекстно-зависимых слов {p}: дополнительно исключено "
+                      f"{before - len(words)} слов(о), отмеченных вручную как "
+                      f"НЕ омографы (not_ambiguous_stress_words_ru.txt).")
+
+        _ambiguous_stress_words = words
+        return words
+    except Exception as e:
+        _ambiguous_stress_words_load_failed = True
+        print(f"Не удалось загрузить список контекстно-зависимых слов {p}: {e} — "
+              "продолжаю без этого фильтра.")
+        return set()
+
+
+DEFAULT_NOT_AMBIGUOUS_STRESS_WORDS_PATH = (
+    Path(__file__).resolve().parent / "not_ambiguous_stress_words_ru.txt"
+)
+
+_not_ambiguous_stress_words: "set | None" = None
+
+
+def _load_not_ambiguous_stress_words(path: "Path | str | None" = None) -> set:
+    """Слова, которые пользователь явно отметил как НЕ омографы (кнопка «Это
+    не омограф» в диалоге проверки ударений GUI) — файл может отсутствовать,
+    тогда просто ничего не вычитается. Не кэшируется так же агрессивно, как
+    _load_ambiguous_stress_words (её саму читаем заново при каждом вызове
+    _load_ambiguous_stress_words благодаря отсутствию собственного кэша
+    здесь), потому что список может пополняться прямо во время работы GUI."""
+    p = Path(path) if path else DEFAULT_NOT_AMBIGUOUS_STRESS_WORDS_PATH
+    if not p.exists():
+        return set()
+    try:
+        return {line.strip().lower() for line in p.read_text(encoding="utf-8").splitlines()
+                if line.strip()}
+    except Exception:
+        return set()
+
+
+def mark_word_not_ambiguous(word: str, path: "Path | str | None" = None) -> None:
+    """Дописывает word в not_ambiguous_stress_words_ru.txt (создаёт файл при
+    необходимости, не дублирует уже существующие записи) и сбрасывает кэш
+    _load_ambiguous_stress_words, чтобы изменение подхватилось без
+    перезапуска программы."""
+    global _ambiguous_stress_words
+    p = Path(path) if path else DEFAULT_NOT_AMBIGUOUS_STRESS_WORDS_PATH
+    existing = _load_not_ambiguous_stress_words(p)
+    word = word.strip().lower()
+    if word in existing:
+        return
+    existing.add(word)
+    p.write_text("\n".join(sorted(existing)) + "\n", encoding="utf-8")
+    _ambiguous_stress_words = None  # сбрасываем кэш — перечитается со следующим вызовом
+
+
+def load_stress_dictionary(path: "Path | str | None" = None,
+                            book_overrides_path: "Path | str | None" = None) -> dict:
+    """Загружает пользовательский словарь ударений — JSON вида
+    {"слово": "сл+ово"} (значение — слово с "+" перед ударной гласной,
+    в том виде, который понимает Silero). Ключи ищутся без учёта регистра.
+    Файл необязателен: если его нет — просто используется только RUAccent.
+    Ошибки чтения не прерывают синтез, а только выводятся в консоль,
+    чтобы опечатка в словаре не ломала всю озвучку.
+
+    Слова, у которых ударение зависит от контекста (см.
+    _load_ambiguous_stress_words выше), из словаря отфильтровываются — для
+    них решение всегда должен принимать RUAccent по контексту предложения,
+    а не единственный жёстко заданный вариант.
+
+    ИСКЛЮЧЕНИЕ: слова из manual_stress_overrides.json (см.
+    save_manual_stress_overrides/DEFAULT_MANUAL_STRESS_OVERRIDES_PATH) и из
+    book_overrides_path (см. book_manual_stress_overrides_path) НЕ
+    фильтруются, даже если входят в список омографов — это осознанный выбор
+    пользователя (сделанный в GUI кнопкой «Проверить ударения» после
+    просмотра примеров из текста), а не автоматическая догадка, поэтому
+    здесь ему разрешено переопределить решение RUAccent.
+
+    book_overrides_path — ударения, назначенные вручную ДЛЯ КОНКРЕТНОЙ
+    КНИГИ (файл рядом с книгой, см. book_manual_stress_overrides_path).
+    Они применяются ПОВЕРХ общих manual_stress_overrides.json — то есть
+    если одно и то же слово по-разному размечено глобально и для этой
+    книги, побеждает книжная запись. Так разные книги могут расходиться в
+    том, как читать одно и то же неоднозначное слово."""
+    p = Path(path) if path else DEFAULT_STRESS_DICT_PATH
+    result = {}
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("ожидался JSON-объект {слово: слово_с_ударением}")
+            result = {str(k).lower(): str(v) for k, v in raw.items()}
+            ambiguous = _load_ambiguous_stress_words()
+            skipped = [k for k in result if k in ambiguous]
+            if skipped:
+                for k in skipped:
+                    del result[k]
+                print(f"В словаре ударений {p} пропущено {len(skipped)} слов(о) с "
+                      f"ударением, зависящим от контекста (омографы/словоформы вроде "
+                      f"«за́мок/замо́к», «ка́зни/казни́») — для них решает RUAccent по "
+                      f"контексту предложения, а не фиксированная запись в словаре.")
+        except Exception as e:
+            print(f"Не удалось прочитать словарь ударений {p}: {e} — продолжаю без него.")
+            result = {}
+
+    overrides = _load_manual_stress_overrides()
+    if overrides:
+        result.update(overrides)
+
+    if book_overrides_path:
+        book_overrides = _load_manual_stress_overrides(book_overrides_path)
+        if book_overrides:
+            result.update(book_overrides)
+            print(f"Применено {len(book_overrides)} вручную заданных ударений для этой "
+                  f"книги ({Path(book_overrides_path)}).")
+
+    return result
+
+
+DEFAULT_MANUAL_STRESS_OVERRIDES_PATH = (
+    Path(__file__).resolve().parent / "manual_stress_overrides.json"
+)
+
+
+def book_manual_stress_overrides_path(book_path: "Path | str") -> Path:
+    """Путь к файлу с вручную заданными ударениями ДЛЯ КОНКРЕТНОЙ КНИГИ —
+    рядом с самой книгой, как и check_ambiguous_stress.py кладёт свой
+    текстовый отчёт (книга.fb2 -> книга.manual_stress_overrides.json).
+    Отдельно от общего manual_stress_overrides.json: слово может по-разному
+    читаться в разных книгах, поэтому решение, принятое для одной книги, не
+    должно молча становиться глобальным правилом для всех остальных."""
+    return Path(str(Path(book_path).with_suffix("")) + ".manual_stress_overrides.json")
+
+
+def _load_manual_stress_overrides(path: "Path | str | None" = None) -> dict:
+    """Читает manual_stress_overrides.json — отдельный файл для ударений,
+    которые пользователь явно указал вручную (через диалог «Проверить
+    ударения» в GUI) для конкретных слов из конкретной книги. Специально
+    отдельно от stress_dictionary.json и НЕ фильтруется по списку
+    омографов — см. load_stress_dictionary."""
+    p = Path(path) if path else DEFAULT_MANUAL_STRESS_OVERRIDES_PATH
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k).lower(): str(v) for k, v in raw.items()}
+    except Exception as e:
+        print(f"Не удалось прочитать {p}: {e} — продолжаю без ручных ударений.")
+        return {}
+
+
+def save_manual_stress_overrides(entries: dict, path: "Path | str | None" = None) -> None:
+    """Дописывает entries ({слово: 'сл+ово'}) в manual_stress_overrides.json,
+    сохраняя уже имеющиеся там записи (читает-объединяет-пишет, как
+    enrich_stress_dictionary_online). Бросает исключение наружу при ошибке
+    записи — вызывающий (GUI) сам решает, как её показать пользователю."""
+    p = Path(path) if path else DEFAULT_MANUAL_STRESS_OVERRIDES_PATH
+    existing = {}
+    if p.exists():
+        try:
+            existing = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
+    existing.update({str(k).lower(): str(v) for k, v in entries.items()})
+    p.write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def add_preferred_stress(word: str, replacement: str) -> Path:
+    """Добавляет слово с личным предпочтением по ударению (не привязано к
+    конкретной книге и не найдено сканированием текста — просто «мне так
+    привычнее», см. GUI-кнопку «Словарь ударений») в подходящий файл:
+
+    - если слово НЕ входит в список омографов (_load_ambiguous_stress_words)
+      — прямо в общий stress_dictionary.json, как обычная словарная запись;
+    - если слово омограф (не всегда однозначно, RUAccent сам решает по
+      контексту) — в manual_stress_overrides.json, потому что
+      load_stress_dictionary отфильтровывает омографы из stress_dictionary.json
+      и запись туда молча пропадала бы при следующей загрузке.
+
+    В обоих случаях действует ГЛОБАЛЬНО, для всех книг (в отличие от
+    book_manual_stress_overrides_path — тех ударений, что назначены для
+    конкретной книги через «Проверить ударения» по конкретному тексту).
+    Возвращает путь к файлу, куда фактически записано — для сообщения
+    пользователю."""
+    word_l = word.strip().lower()
+    ambiguous = _load_ambiguous_stress_words()
+    if word_l in ambiguous:
+        save_manual_stress_overrides({word_l: replacement})
+        return DEFAULT_MANUAL_STRESS_OVERRIDES_PATH
+    else:
+        save_manual_stress_overrides({word_l: replacement}, DEFAULT_STRESS_DICT_PATH)
+        return DEFAULT_STRESS_DICT_PATH
+
+
+def _read_json_dict(path: "Path | str") -> dict:
+    """Общая маленькая утилита: читает JSON-файл вида {слово: значение},
+    возвращает {} на любую ошибку/отсутствие файла — не бросает исключений."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def list_stress_entries(book_path: "Path | str | None" = None) -> list:
+    """Собирает ВСЕ записи ударений из всех источников для показа/управления
+    в GUI (кнопка «Словарь ударений»): основной stress_dictionary.json,
+    общий manual_stress_overrides.json и, если передан book_path — ещё и
+    книжный <книга>.manual_stress_overrides.json. Возвращает список
+    {"word": ..., "stress": ..., "source": <путь к файлу, откуда запись>},
+    отсортированный по слову. Одно и то же слово может встретиться из
+    нескольких источников сразу отдельными строками (например, есть и в
+    общем словаре, и переопределено для конкретной книги) — это нормально,
+    видно, что применится (книжная запись имеет приоритет при синтезе)."""
+    sources = [DEFAULT_STRESS_DICT_PATH, DEFAULT_MANUAL_STRESS_OVERRIDES_PATH]
+    if book_path:
+        sources.append(book_manual_stress_overrides_path(book_path))
+    entries = []
+    for p in sources:
+        for word, stress in _read_json_dict(p).items():
+            entries.append({"word": str(word).lower(), "stress": str(stress), "source": p})
+    entries.sort(key=lambda e: (e["word"], str(e["source"])))
+    return entries
+
+
+def delete_stress_entry(word: str, source: "Path | str") -> bool:
+    """Удаляет word из конкретного файла source (один из путей, которые
+    возвращает list_stress_entries). Возвращает True, если запись была и
+    удалена, False, если её там не было (ничего не делает). Бросает
+    исключение наружу только при ошибке ЗАПИСИ — GUI сам решает, как её
+    показать."""
+    p = Path(source)
+    data = _read_json_dict(p)
+    word_l = word.strip().lower()
+    if word_l not in data:
+        return False
+    del data[word_l]
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return True
+
+
+def _prepare_stress_replacement(word: str, replacement: str) -> str:
+    """Готовит значение из словаря ударений к вставке в текст, отдельно от
+    самого поиска в словаре — общая часть для apply_stress_dictionary и
+    apply_stress_dictionary_protected.
+
+    Два преобразования:
+    1) сохраняем регистр первой буквы оригинала (простая эвристика — не
+       пытаемся повторить регистр каждой буквы, этого достаточно для
+       "Имя"/"имя"/"ИМЯ" в начале предложения);
+    2) если исходное слово-ключ составное, через дефис ("во-первых",
+       "по-русски", "в-третьих" и т.п.) — дефис из ЗАМЕНЫ убираем (только
+       из неё, не из остального текста книги). Причина: Silero сам
+       разбивает текст на слова по дефису для своего ВСТРОЕННОГО put_accent
+       (это отдельный механизм, до которого apply_stress_dictionary_protected
+       не дотягивается — тот защищает только от RUAccent) — увидев "во"
+       отдельным "словом" без явного "+", он присваивает ему собственное
+       ударение, и получается заметное, лишнее ударение на "во" вдобавок к
+       правильному на "первых". Дефис в исходном тексте книги (обычные
+       тире/составные слова, которых нет в словаре) при этом никак не
+       затрагивается — это только для конкретных слов из словаря."""
+    if word[0].isupper() and replacement:
+        replacement = replacement[0].upper() + replacement[1:]
+    if "-" in word:
+        replacement = replacement.replace("-", "")
+    return replacement
+
+
+# --- Контекстное разрешение ударения по падежу для отдельных омографов ----
+#
+# Часть слов вроде "звезды" не получится корректно занести в обычный
+# словарь ударений (stress_dictionary.json), потому что у них РАЗНОЕ
+# правильное ударение в зависимости от падежа/числа: "звезды́" (род.п. ед.ч.,
+# "командным пунктом звезды́") vs "зв+ёзды" (им./вин.п. мн.ч., "на небе
+# зажглись звёзды"). Такие слова были исключены из словаря целиком (см.
+# ambiguous_stress_words_ru.txt), и по умолчанию решение отдаётся на откуп
+# RUAccent — но RUAccent тоже иногда ошибается на таких примерах. Ниже —
+# небольшой, вручную проверенный список самых частых слов с чередованием
+# ударения по типу "род.п. ед.ч. (на окончании) / им.п. мн.ч. (на основе)"
+# (это регулярный для русского языка тип склонения — т.н. "тип b" по
+# Зализняку) и простая эвристика на pymorphy3 + локальный контекст, чтобы
+# выбрать нужную форму. Если pymorphy3 не установлен или ничего не удаётся
+# определить — слово просто не трогаем (оставляем RUAccent как раньше),
+# никогда не гадаем вслепую.
+_CASE_AMBIGUOUS_NOUNS = {
+    "звезды":  {"gen_sg": "звезд+ы",  "nom_pl": "зв+ёзды"},
+    "сестры":  {"gen_sg": "сестр+ы",  "nom_pl": "с+ёстры"},
+    "стены":   {"gen_sg": "стен+ы",   "nom_pl": "ст+ены"},
+    "страны":  {"gen_sg": "стран+ы",  "nom_pl": "стр+аны"},
+    "горы":    {"gen_sg": "гор+ы",    "nom_pl": "г+оры"},
+    "слезы":   {"gen_sg": "слез+ы",   "nom_pl": "сл+ёзы"},
+    "руки":    {"gen_sg": "рук+и",    "nom_pl": "р+уки"},
+    "ноги":    {"gen_sg": "ног+и",    "nom_pl": "н+оги"},
+    "головы":  {"gen_sg": "голов+ы",  "nom_pl": "г+оловы"},
+    "души":    {"gen_sg": "душ+и",    "nom_pl": "д+уши"},
+    # Расширение списка (по просьбе пользователя — "мало 10 слов") тем же
+    # регулярным типом склонения ("тип b" по Зализняку): ударение на
+    # окончании в род.п. ед.ч., на основе — в им.п. мн.ч. Каждое слово
+    # проверено вручную по таблицам склонения, не сгенерировано автоматически.
+    "волны":   {"gen_sg": "волн+ы",   "nom_pl": "в+олны"},
+    "весны":   {"gen_sg": "весн+ы",   "nom_pl": "в+ёсны"},
+    "вёсны":   {"gen_sg": "весн+ы",   "nom_pl": "в+ёсны"},
+    "иглы":    {"gen_sg": "игл+ы",    "nom_pl": "+иглы"},
+    "козы":    {"gen_sg": "коз+ы",    "nom_pl": "к+озы"},
+    "овцы":    {"gen_sg": "овц+ы",    "nom_pl": "+овцы"},
+    "свечи":   {"gen_sg": "свеч+и",   "nom_pl": "св+ечи"},
+    "скалы":   {"gen_sg": "скал+ы",   "nom_pl": "ск+алы"},
+    "земли":   {"gen_sg": "земл+и",   "nom_pl": "з+емли"},
+    "семьи":   {"gen_sg": "семь+и",   "nom_pl": "с+емьи"},
+    "толпы":   {"gen_sg": "толп+ы",   "nom_pl": "т+олпы"},
+    "доски":   {"gen_sg": "доск+и",   "nom_pl": "д+оски"},
+    "полосы":  {"gen_sg": "полос+ы",  "nom_pl": "п+олосы"},
+    "травы":   {"gen_sg": "трав+ы",   "nom_pl": "тр+авы"},
+    "игры":    {"gen_sg": "игр+ы",    "nom_pl": "+игры"},
+    "стрелы":  {"gen_sg": "стрел+ы",  "nom_pl": "стр+елы"},
+    "пилы":    {"gen_sg": "пил+ы",    "nom_pl": "п+илы"},
+    "дыры":    {"gen_sg": "дыр+ы",    "nom_pl": "д+ыры"},
+    "совы":    {"gen_sg": "сов+ы",    "nom_pl": "с+овы"},
+    "беды":    {"gen_sg": "бед+ы",    "nom_pl": "б+еды"},
+    "плиты":   {"gen_sg": "плит+ы",   "nom_pl": "пл+иты"},
+    "воды":    {"gen_sg": "вод+ы",    "nom_pl": "в+оды"},
+    "косы":    {"gen_sg": "кос+ы",    "nom_pl": "к+осы"},
+}
+
+# Предлоги/слова непосредственно перед словом, однозначно требующие
+# родительного падежа — сильный локальный сигнал, не требующий pymorphy3.
+_GENITIVE_CONTEXT_RE = re.compile(
+    r"(?:без|для|около|вокруг|среди|кроме|после|вместо|ради|вдоль|возле|"
+    r"напротив|сверх|накануне|из-за|из-под|от|из|до|у|с|со|против)\s*$",
+    re.IGNORECASE,
+)
+# Числительные-счётчики 2-4 (и "оба"/"обе") тоже требуют род.п. ед.ч.
+_COUNTING_CONTEXT_RE = re.compile(
+    r"(?:два|две|три|четыре|оба|обе)\s*$", re.IGNORECASE,
+)
+
+# Симметричные признаки им./вин.п. МНОЖЕСТВЕННОГО числа — раньше их не было
+# вовсе, решение при отсутствии род.падежного предлога/числительного
+# целиком отдавалось на откуп статистике pymorphy3 (которая по чистой
+# частотности форм часто выигрывает у им.п. мн.ч. даже там, где по факту
+# в тексте множественное число). Указательные/притяжательные местоимения и
+# количественные слова во мн.ч. перед существительным — сильный сигнал
+# "это точно множественное число", не менее надёжный, чем предлог для
+# родительного падежа.
+_PLURAL_CONTEXT_RE = re.compile(
+    r"(?:эти|те|какие|некоторые|многие|немногие|все|всех|наши|ваши|мои|твои|"
+    r"свои|их|other|несколько|сколько)\s*$",
+    re.IGNORECASE,
+)
+# Прилагательное/причастие непосредственно перед словом, согласованное во
+# мн.ч. (типичные окончания им./вин.п. мн.ч. "-ые"/"-ие") — например
+# "далёкие звезды", "родные сестры". Не идеально (у род.п. ед.ч.
+# прилагательных окончание "-ой"/"-ей", так что коллизий с этим паттерном
+# практически не бывает), но не исключает и других формально возможных
+# грамматических категорий — поэтому это тоже только один из сигналов, а
+# не абсолютное правило.
+_PLURAL_ADJECTIVE_CONTEXT_RE = re.compile(
+    r"[а-яё]*(?:ые|ие)\s*$", re.IGNORECASE,
+)
+
+_pymorphy_analyzer = None
+_pymorphy_load_failed = False
+
+
+def _get_pymorphy_analyzer():
+    """Лениво создаёт pymorphy3.MorphAnalyzer(). Необязательная зависимость:
+    если pymorphy3 не установлен, просто возвращаем None и больше не
+    пытаемся (без пятен на консоль при каждом слове)."""
+    global _pymorphy_analyzer, _pymorphy_load_failed
+    if _pymorphy_analyzer is not None or _pymorphy_load_failed:
+        return _pymorphy_analyzer
+    try:
+        import pymorphy3
+        _pymorphy_analyzer = pymorphy3.MorphAnalyzer()
+    except Exception:
+        _pymorphy_load_failed = True
+        _pymorphy_analyzer = None
+    return _pymorphy_analyzer
+
+
+def _resolve_case_ambiguous_noun(word_lower: str):
+    """Возвращает "gen_sg" или "nom_pl" (или None, если не удалось решить)
+    для слова word_lower на основе суммарной уверенности разборов pymorphy3
+    (без учёта контекста предложения — контекст проверяется отдельно,
+    до вызова этой функции, как более сильный сигнал)."""
+    analyzer = _get_pymorphy_analyzer()
+    if analyzer is None:
+        return None
+    try:
+        parses = analyzer.parse(word_lower)
+    except Exception:
+        return None
+    gen_sg_score = 0.0
+    nom_pl_score = 0.0
+    for p in parses:
+        tag = str(p.tag)
+        score = p.score or 0.0
+        if "sing" in tag and "gent" in tag:
+            gen_sg_score += score
+        elif "plur" in tag and ("nomn" in tag or "accs" in tag):
+            nom_pl_score += score
+    if gen_sg_score == 0.0 and nom_pl_score == 0.0:
+        return None
+    return "gen_sg" if gen_sg_score >= nom_pl_score else "nom_pl"
+
+
+def resolve_case_ambiguous_nouns(text: str) -> dict:
+    """Сканирует text на предмет слов из _CASE_AMBIGUOUS_NOUNS и для каждого
+    вхождения пытается определить нужную форму (род.п. ед.ч. или им.п.
+    мн.ч.) по локальному контексту — сначала проверяются ЯВНЫЕ грамматические
+    признаки в обе стороны (предлог/числительное => род.п. ед.ч.;
+    указательное/притяжательное местоимение или согласованное прилагательное
+    во мн.ч. => им.п. мн.ч.), и только если ни один явный признак не
+    сработал — решение отдаётся pymorphy3 (по чистой частотности форм слова
+    вне контекста, без учёта соседних слов). Возвращает {слово_lower:
+    "сл+ово"} — временный, НЕ сохраняемый в JSON словарь для подмешивания в
+    stress_dict перед apply_stress_dictionary(_protected) для конкретного
+    фрагмента текста. Никогда не бросает исключений — в худшем случае
+    вернёт {}."""
+    result = {}
+    try:
+        for m in _STRESS_WORD_RE.finditer(text):
+            word = m.group(0)
+            word_lower = word.lower()
+            forms = _CASE_AMBIGUOUS_NOUNS.get(word_lower)
+            if forms is None or word_lower in result:
+                continue
+            prefix = text[:m.start()]
+            has_genitive_marker = bool(
+                _GENITIVE_CONTEXT_RE.search(prefix) or _COUNTING_CONTEXT_RE.search(prefix)
+            )
+            has_plural_marker = bool(
+                _PLURAL_CONTEXT_RE.search(prefix) or _PLURAL_ADJECTIVE_CONTEXT_RE.search(prefix)
+            )
+            if has_genitive_marker and not has_plural_marker:
+                choice = "gen_sg"
+            elif has_plural_marker and not has_genitive_marker:
+                choice = "nom_pl"
+            elif has_genitive_marker and has_plural_marker:
+                # Оба признака одновременно — противоречие (например, ошибка
+                # в самом тексте или наложение из соседнего предложения),
+                # надёжнее довериться pymorphy3, чем выбирать наугад.
+                choice = _resolve_case_ambiguous_noun(word_lower)
+            else:
+                choice = _resolve_case_ambiguous_noun(word_lower)
+            if choice is not None:
+                result[word_lower] = forms[choice]
+    except Exception:
+        return result
+    return result
+
+
+# --- Омографы, у которых совпадает написание СОВЕРШЕННО РАЗНЫХ слов ------
+#
+# Отдельный случай, не сводящийся к падежу одного и того же слова: "графа"
+# может быть либо род.п. ед.ч. слова "граф" (дворянский титул — "не было
+# графа" -> "гр+афа"), либо им.п. ед.ч. отдельного слова "графа" (колонка
+# таблицы — "заполните графу" -> "им.п. графа́" -> "граф+а"). Это разные
+# леммы с разными исходными словами, а не словоформы одного слова — поэтому
+# решаем не по падежу/числу, а по тому, какую НОРМАЛЬНУЮ ФОРМУ (лемму)
+# pymorphy3 считает более вероятной для этого написания.
+_LEMMA_HOMOGRAPHS = {
+    "графа": {"граф": "гр+афа", "графа": "граф+а"},
+}
+
+
+def _resolve_lemma_homograph(word_lower: str):
+    """Возвращает готовую строку с ударением (или None) для word_lower из
+    _LEMMA_HOMOGRAPHS, выбирая между вариантами по суммарной уверенности
+    разборов pymorphy3, сгруппированных по нормальной форме (лемме)."""
+    variants = _LEMMA_HOMOGRAPHS.get(word_lower)
+    if not variants:
+        return None
+    analyzer = _get_pymorphy_analyzer()
+    if analyzer is None:
+        return None
+    try:
+        parses = analyzer.parse(word_lower)
+    except Exception:
+        return None
+    scores = {}
+    for p in parses:
+        if p.normal_form in variants:
+            scores[p.normal_form] = scores.get(p.normal_form, 0.0) + (p.score or 0.0)
+    if not scores:
+        return None
+    best_lemma = max(scores, key=scores.get)
+    return variants[best_lemma]
+
+
+def resolve_lemma_homographs(text: str) -> dict:
+    """Аналог resolve_case_ambiguous_nouns, но для _LEMMA_HOMOGRAPHS (разные
+    слова с одинаковым написанием, не падежные формы одного слова). Тоже
+    временный результат для подмешивания в stress_dict, ничего не пишет в
+    JSON, никогда не бросает исключений."""
+    result = {}
+    try:
+        for m in _STRESS_WORD_RE.finditer(text):
+            word_lower = m.group(0).lower()
+            if word_lower in result or word_lower not in _LEMMA_HOMOGRAPHS:
+                continue
+            replacement = _resolve_lemma_homograph(word_lower)
+            if replacement is not None:
+                result[word_lower] = replacement
+    except Exception:
+        return result
+    return result
+
+
+def apply_stress_dictionary(text: str, stress_dict: dict) -> str:
+    """Заменяет слова из пользовательского словаря на их вариант с "+" перед
+    ударной гласной — раньше, чем текст попадёт в RUAccent/put_accent, чтобы
+    словарь имел приоритет над автоматическим угадыванием (для имён
+    персонажей и специфических терминов книги, которые модель не знает)."""
+    if not stress_dict:
+        return text
+
+    def repl(m: "re.Match") -> str:
+        word = m.group(0)
+        replacement = stress_dict.get(word.lower())
+        if replacement is None:
+            return word
+        return _prepare_stress_replacement(word, replacement)
+
+    return _STRESS_WORD_RE.sub(repl, text)
+
+
+# Маркер-обёртка для apply_stress_dictionary_protected/restore_stress_placeholders
+# ниже — заведомо не встречается в обычном тексте книги (не кириллица, не
+# цифры, так что numbers_to_words_ru его не тронет) и не похожа на слово,
+# которое RUAccent попытался бы акцентировать.
+_STRESS_PLACEHOLDER_RE = re.compile(r"STRESSDICT(\d+)")
+
+
+def apply_stress_dictionary_protected(text: str, stress_dict: dict) -> "tuple[str, dict]":
+    """То же самое, что apply_stress_dictionary, но вместо того чтобы сразу
+    подставить в текст готовое "сл+ово" из словаря, подставляет временный
+    непечатаемый маркер-плейсхолдер и возвращает (текст_с_плейсхолдерами,
+    {плейсхолдер: готовая_замена}). Используется, когда после словаря текст
+    ещё пройдёт через RUAccent (apply_ruaccent) — RUAccent разбирает текст
+    на токены сам и на составных словах через дефис ("во-первых",
+    "по-русски" и т.п.) может не распознать уже стоящее "+"-ударение и
+    добавить своё собственное ЕЩЁ РАЗ, поверх — из-за двух ударений в одном
+    слове получается характерное "странное растягивание" при синтезе.
+    Плейсхолдер (не кириллица, не похож на слово) RUAccent не трогает
+    вообще, а после него исходная словарная форма возвращается на место
+    через restore_stress_placeholders — так словарь остаётся полностью
+    защищён от повторной обработки, а не просто "обычно не переписывается"."""
+    if not stress_dict:
+        return text, {}
+
+    placeholders: dict = {}
+    counter = [0]
+
+    def repl(m: "re.Match") -> str:
+        word = m.group(0)
+        replacement = stress_dict.get(word.lower())
+        if replacement is None:
+            return word
+        replacement = _prepare_stress_replacement(word, replacement)
+        idx = counter[0]
+        counter[0] += 1
+        placeholder = f"STRESSDICT{idx}"
+        placeholders[placeholder] = replacement
+        return placeholder
+
+    protected = _STRESS_WORD_RE.sub(repl, text)
+    return protected, placeholders
+
+
+def restore_stress_placeholders(text: str, placeholders: dict) -> str:
+    """Возвращает на место словарные ударения, спрятанные
+    apply_stress_dictionary_protected под плейсхолдерами — после того, как
+    RUAccent (или что угодно ещё) обработал остальной текст. Заменяет все
+    плейсхолдеры ЗА ОДИН проход регулярным выражением, а не по очереди
+    через text.replace() для каждого — иначе, например, "STRESSDICT1"
+    случайно совпал бы с началом "STRESSDICT10" (это реальная подстрока)
+    и испортил бы его; \\d+ в _STRESS_PLACEHOLDER_RE жадный, поэтому при
+    поиске по тексту сразу захватывает число целиком и такой коллизии не
+    возникает. Если какой-то плейсхолдер вдруг не найден в placeholders
+    (не должно происходить, но на всякий случай) — на этом этапе он просто
+    вырезается, а не остаётся в тексте нечитаемым мусором."""
+    if not placeholders:
+        return text
+
+    def repl(m: "re.Match") -> str:
+        return placeholders.get(m.group(0), "")
+
+    text = _STRESS_PLACEHOLDER_RE.sub(repl, text)
+    return text
+
+
+# --------------------------------------------------------------------------
+# Онлайн-подстраховка для словаря ударений: если слова нет в локальном
+# stress_dictionary.json, пробуем найти его ударение в нескольких бесплатных
+# (без ключа API) онлайн-словарях по очереди — см. _STRESS_ONLINE_PROVIDERS
+# ниже. Первый источник, который нашёл слово, и используется; остальные не
+# опрашиваются. Найденное дописывается в тот же JSON, чтобы при следующих
+# запусках сеть больше не требовалась. Любая ошибка — нет интернета, сайт
+# недоступен, слова там нет, файл словаря нельзя записать — НЕ прерывает
+# синтез, а только пишется в консоль: в худшем случае слово просто
+# останется без словарного ударения и ударение расставит RUAccent/
+# put_accent, как и раньше.
+# --------------------------------------------------------------------------
+
+# Слова, для которых онлайн-поиск уже пробовали (по всем источникам) и не
+# нашли (или была ошибка сети) — чтобы не долбить сайты повторным запросом
+# на каждое вхождение одного и того же слова в книге.
+_online_stress_failed_cache: set = set()
+
+
+class _StressSourceRateLimited(Exception):
+    """Сигнал "источник ответил 429 (слишком много запросов)" — отдельно
+    от прочих ошибок, чтобы вызывающий код мог отключить именно этот
+    источник до конца запуска, а не просто залогировать единичную ошибку
+    (см. _provider_disabled в fetch_stress_online)."""
+    pass
+
+
+# --------------------------------------------------------------------------
+# Источник 0 (проверяется первым, БЕЗ обращения к сети): офлайн-корпус
+# ударений русского языка — TSV-датасет из открытого репозитория
+# https://github.com/Koziev/NLP_Datasets (Stress/all_accents.zip, собран
+# по Википедии/Викисловарю + грамматическому словарю словоформ, ~1.68 млн
+# слов и словоформ). Файл лежит рядом со скриптом в сжатом виде
+# (stress_corpus_ru.tsv.gz, формат каждой строки: "слово<TAB>слово_с_^_
+# перед_ударной_буквой"). Основной смысл: у большинства слов ударение
+# находится мгновенно и локально, без единого HTTP-запроса — Викисловарь
+# (см. ниже) при этом используется гораздо реже и почти не упирается в
+# лимит запросов (429 Too Many Requests), с которым раньше сталкивались
+# при прогоне книги целиком через один онлайн-источник.
+# --------------------------------------------------------------------------
+
+DEFAULT_OFFLINE_STRESS_CORPUS_PATH = (
+    Path(__file__).resolve().parent / "stress_corpus_ru.tsv.gz"
+)
+
+# None = ещё не пробовали загрузить; {} = пробовали, но не получилось
+# (файла нет / битый / кончилась память и т.п.) — в обоих случаях больше
+# не пытаемся загружать повторно в рамках одного процесса.
+_offline_stress_corpus: "dict | None" = None
+_offline_stress_corpus_load_failed = False
+
+
+def _load_offline_stress_corpus(path: "Path | str | None" = None) -> dict:
+    """Лениво загружает и кэширует офлайн-корпус ударений (см. описание
+    выше) в память как {слово_в_нижнем_регистре: "сл+ово"}. Загружается
+    один раз за весь запуск (несколько секунд на ~1.7 млн строк). Файл
+    необязателен: если его нет рядом со скриптом (например, кто-то не
+    скачал/не скопировал stress_corpus_ru.tsv.gz) — молча используется
+    пустой словарь, синтез продолжается через RUAccent/онлайн-источники,
+    как и раньше. Любая ошибка чтения (битый gzip, нехватка памяти и
+    т.п.) тоже не прерывает синтез — только один раз печатается
+    предупреждение."""
+    global _offline_stress_corpus, _offline_stress_corpus_load_failed
+    if _offline_stress_corpus is not None:
+        return _offline_stress_corpus
+    if _offline_stress_corpus_load_failed:
+        return {}
+    p = Path(path) if path else DEFAULT_OFFLINE_STRESS_CORPUS_PATH
+    if not p.exists():
+        _offline_stress_corpus_load_failed = True
+        return {}
+    try:
+        import gzip
+        corpus = {}
+        opener = gzip.open if p.suffix == ".gz" else open
+        with opener(p, "rt", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 2:
+                    continue
+                word, accented = parts
+                # Формат исходного датасета — "^" перед ударной гласной,
+                # переводим в формат Silero ("+").
+                corpus[word.lower()] = accented.replace("^", "+").lower()
+        _offline_stress_corpus = corpus
+        print(f"Загружен офлайн-корпус ударений: {len(corpus)} слов(о/форм) из {p}")
+        return corpus
+    except Exception as e:
+        _offline_stress_corpus_load_failed = True
+        print(f"Не удалось загрузить офлайн-корпус ударений {p}: {e} — "
+              "продолжаю без него (останутся RUAccent/онлайн-источники).")
+        return {}
+
+
+def fetch_stress_from_offline_corpus(word: str, timeout: float = None) -> "str | None":
+    """Источник 0: локальный офлайн-корпус (см. выше). timeout принимается
+    для единообразия сигнатуры с остальными источниками, но не
+    используется — обращения к сети тут нет."""
+    corpus = _load_offline_stress_corpus()
+    if not corpus:
+        return None
+    return corpus.get(word.lower())
+
+
+_WIKTIONARY_ACCENT_RE = re.compile(
+    r"[А-Яа-яЁё]*[АаЕеЁёИиОоУуЫыЭэЮюЯя]́[А-Яа-яЁё]*"
+)
+
+
+def _wiktionary_accent_to_silero(cand: str) -> str:
+    """Переводит найденную форму слова с объединяющим акутом (U+0301) в
+    формат Silero: "+" перед ударной гласной, например "молоко́" -> "молок+о"."""
+    chars = []
+    i = 0
+    while i < len(cand):
+        if i + 1 < len(cand) and cand[i + 1] == "́":
+            chars.append("+")
+            chars.append(cand[i])
+            i += 2
+        else:
+            chars.append(cand[i])
+            i += 1
+    return "".join(chars)
+
+
+def _find_stress_in_wiktionary_content(content: str, word: str,
+                                        section: "str | None" = None) -> "str | None":
+    """Ищет в тексте страницы Викисловаря (вики-разметка) форму word,
+    отмеченную ударением (объединяющий акут). Если задан section (например
+    "Russian" — так называется раздел на en.wiktionary.org для русских
+    слов), ищет только внутри него, отрезая текст по следующему заголовку
+    того же уровня ("==...==") — иначе на многоязычных страницах
+    en.wiktionary.org можно случайно найти совпадающее по написанию слово
+    из другого языка с другим ударением."""
+    if section:
+        m = re.search(rf"==\s*{re.escape(section)}\s*==", content)
+        if not m:
+            return None
+        rest = content[m.end():]
+        m_next = re.search(r"\n==[^=]", rest)
+        content = rest[:m_next.start()] if m_next else rest
+
+    target = word.lower()
+    for cand in _WIKTIONARY_ACCENT_RE.findall(content):
+        if cand.replace("́", "").lower() == target:
+            return _wiktionary_accent_to_silero(cand)
+    return None
+
+
+def _fetch_wiktionary_page(api_url: str, word: str, timeout: float) -> "str | None":
+    """Общая часть запроса к API MediaWiki (одинакова для ru.wiktionary.org
+    и en.wiktionary.org — оба на движке MediaWiki с тем же action=query).
+    Возвращает сырой вики-текст страницы или None, если страницы нет/
+    ответ пустой. Исключения (нет сети, таймаут и т.п.) не ловятся здесь —
+    их ловит вызывающий код каждого источника отдельно (fetch_stress_from_*).
+    Исключение: HTTP 429 (слишком много запросов) поднимается отдельным
+    типом _StressSourceRateLimited, чтобы fetch_stress_online мог отличить
+    "сайт временно ограничил частоту запросов" (нет смысла пробовать снова
+    в этом запуске) от прочих ошибок."""
+    import requests
+    resp = requests.get(
+        api_url,
+        params={
+            "action": "query",
+            "titles": word,
+            "prop": "revisions",
+            "rvprop": "content",
+            "rvslots": "main",
+            "format": "json",
+            "formatversion": "2",
+        },
+        timeout=timeout,
+        headers={"User-Agent": "audiobook-fb2-reader/1.0 (stress lookup)"},
+    )
+    if resp.status_code == 429:
+        raise _StressSourceRateLimited(f"HTTP 429 от {api_url}")
+    resp.raise_for_status()
+    data = resp.json()
+    pages = (data.get("query") or {}).get("pages") or []
+    if not pages or pages[0].get("missing"):
+        return None
+    revisions = pages[0].get("revisions") or []
+    if not revisions:
+        return None
+    return ((revisions[0].get("slots") or {}).get("main") or {}).get("content") or None
+
+
+def fetch_stress_from_ru_wiktionary(word: str, timeout: float = 4.0) -> "str | None":
+    """Источник 1: русский Викисловарь (https://ru.wiktionary.org) — вся
+    страница на русском, ищем ударение по всему тексту статьи (включая
+    формы словоизменения в таблицах)."""
+    content = _fetch_wiktionary_page("https://ru.wiktionary.org/w/api.php", word, timeout)
+    if not content:
+        return None
+    return _find_stress_in_wiktionary_content(content, word)
+
+
+def fetch_stress_from_en_wiktionary(word: str, timeout: float = 4.0) -> "str | None":
+    """Источник 2 (резервный): англоязычный Викисловарь
+    (https://en.wiktionary.org) тоже содержит статьи о русских словах (в
+    разделе "==Russian=="), нередко с более полными таблицами
+    словоизменения, чем на ru.wiktionary.org — полезно, когда слова не
+    нашлось (или ещё не заведено) на русском Викисловаре."""
+    content = _fetch_wiktionary_page("https://en.wiktionary.org/w/api.php", word, timeout)
+    if not content:
+        return None
+    return _find_stress_in_wiktionary_content(content, word, section="Russian")
+
+
+# Порядок важен: источники опрашиваются по очереди, пока один из них не
+# найдёт слово. Офлайн-корпус проверяется первым (мгновенно, без сети) —
+# у большинства слов ударение находится уже на этом шаге, и до
+# Викисловарей дело просто не доходит. Каждый источник — независимая
+# функция (word, timeout) -> "+"-форма или None; добавить ещё один
+# словарь — значит дописать сюда ещё одну такую функцию.
+_STRESS_ONLINE_PROVIDERS = [
+    ("офлайн-корпус (Koziev/NLP_Datasets)", fetch_stress_from_offline_corpus),
+    ("ru.wiktionary.org", fetch_stress_from_ru_wiktionary),
+    ("en.wiktionary.org", fetch_stress_from_en_wiktionary),
+]
+
+# Источники (по имени из _STRESS_ONLINE_PROVIDERS), которые в этом запуске
+# уже ответили 429 (слишком много запросов) — дальше не опрашиваются
+# вовсе, чтобы не продолжать долбить сайт, который и так попросил
+# притормозить. Офлайн-корпус сюда никогда не попадает — 429 у него не
+# бывает физически.
+_stress_provider_rate_limited: set = set()
+
+
+def fetch_stress_online(word: str, timeout: float = 4.0) -> "str | None":
+    """Пробует по очереди все источники из _STRESS_ONLINE_PROVIDERS
+    (сначала офлайн-корпус, затем Викисловари) и возвращает первый
+    найденный результат (слово в формате Silero: "сл+ово" — "+" перед
+    ударной гласной). Возвращает None, если слово не нашлось ни в одном
+    источнике. Ошибка одного источника (нет сети, сайт лежит, странный
+    ответ) не мешает попробовать следующий — падает функция только если
+    откажут вообще все, и то не исключением, а возвратом None с
+    предупреждением в консоль. HTTP 429 у онлайн-источника отключает
+    именно его до конца текущего запуска (см. _stress_provider_rate_limited),
+    вместо того чтобы продолжать получать 429 на каждом следующем слове."""
+    errors = []
+    for name, provider in _STRESS_ONLINE_PROVIDERS:
+        if name in _stress_provider_rate_limited:
+            continue
+        try:
+            found = provider(word, timeout=timeout)
+        except _StressSourceRateLimited as e:
+            _stress_provider_rate_limited.add(name)
+            print(f"Источник «{name}» ответил 429 (слишком много запросов, {e}) — "
+                  "отключаю его до конца текущего запуска, использую другие источники.")
+            continue
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {e}")
+            continue
+        if found:
+            return found
+    if errors:
+        print(f"Не удалось найти ударение для «{word}» в интернете "
+              f"({'; '.join(errors)}) — пропускаю, продолжаю без него.")
+    return None
+
+
+def enrich_stress_dictionary_online(text: str, stress_dict: dict,
+                                     dict_path: "Path | str | None" = None,
+                                     enabled: bool = True) -> None:
+    """Для слов из text, которых ещё нет в stress_dict (и для которых
+    онлайн-поиск ещё не проваливался в этом запуске), пробует найти
+    ударение в интернете (fetch_stress_online). Найденное сразу
+    добавляется в stress_dict (в памяти — используется тем же вызовом
+    apply_stress_dictionary дальше) и дописывается в JSON-файл словаря
+    dict_path (по умолчанию DEFAULT_STRESS_DICT_PATH), чтобы при
+    следующих запусках слово уже не требовало обращения к сети.
+
+    Ничего не бросает: нет пакета requests, нет сети, Викисловарь лежит,
+    файл словаря нельзя прочитать/записать — во всех случаях просто
+    печатается предупреждение и функция возвращается, ничего не сломав."""
+    if not enabled:
+        return
+    try:
+        ambiguous = _load_ambiguous_stress_words()
+        words_to_try = []
+        seen = set()
+        for m in _STRESS_WORD_RE.finditer(text):
+            word = m.group(0)
+            key = word.lower()
+            if (key in stress_dict or key in _online_stress_failed_cache
+                    or key in seen or key in ambiguous):
+                continue
+            seen.add(key)
+            words_to_try.append(word)
+        if not words_to_try:
+            return
+
+        new_entries = {}
+        for word in words_to_try:
+            found = fetch_stress_online(word)
+            if found:
+                new_entries[word.lower()] = found.lower()
+            else:
+                _online_stress_failed_cache.add(word.lower())
+
+        if not new_entries:
+            return
+        stress_dict.update(new_entries)
+
+        p = Path(dict_path) if dict_path else DEFAULT_STRESS_DICT_PATH
+        try:
+            existing = {}
+            if p.exists():
+                existing = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    existing = {}
+            existing.update(new_entries)
+            p.write_text(
+                json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            print(f"Словарь ударений пополнен из интернета: {len(new_entries)} "
+                  f"слов(о) добавлено в {p}")
+        except Exception as e:
+            print(f"Нашёл ударения в интернете для {len(new_entries)} слов(а), но не "
+                  f"смог сохранить их в {p}: {e} — они будут использоваться только в "
+                  "этом запуске.")
+    except Exception as e:
+        # Подстраховка на случай непредвиденной ошибки в самой функции —
+        # онлайн-словарь ударений вспомогательный, он не должен ронять
+        # синтез книги.
+        print(f"Онлайн-поиск ударений не удался ({type(e).__name__}: {e}) — "
+              "продолжаю без него.")
+
+
+_ruaccent_instance = None
+_ruaccent_load_failed = False
+
+
+def _load_ruaccent():
+    """Лениво загружает и кэширует RUAccent (тот же пакет и тот же патч
+    token_type_ids, что и в silero_rest_service.py — см. его
+    _patch_ruaccent_token_type_ids для подробного объяснения, зачем патч
+    нужен). При любой ошибке (пакет не установлен, модель не грузится)
+    возвращает None один раз печатает предупреждение и больше не
+    пытается — остальная озвучка продолжается без RUAccent, полагаясь на
+    встроенный в Silero put_accent."""
+    global _ruaccent_instance, _ruaccent_load_failed
+    if _ruaccent_instance is not None or _ruaccent_load_failed:
+        return _ruaccent_instance
+    try:
+        from ruaccent import RUAccent
+        accentizer = RUAccent()
+        accentizer.load(omograph_model_size='turbo3.1', use_dictionary=True)
+
+        # Патч token_type_ids — см. подробный комментарий в
+        # silero_rest_service.py._patch_ruaccent_token_type_ids. Без него
+        # некоторые версии onnxruntime/ruaccent падают на КАЖДОМ вызове.
+        try:
+            import numpy as np
+            inner = getattr(accentizer, "accent_model", None)
+            session = getattr(inner, "session", None) if inner is not None else None
+            if session is not None:
+                required_inputs = {i.name for i in session.get_inputs()}
+                if "token_type_ids" in required_inputs:
+                    original_run = session.run
+
+                    def patched_run(output_names, input_feed, run_options=None):
+                        if "token_type_ids" not in input_feed and "input_ids" in input_feed:
+                            input_feed = dict(input_feed)
+                            input_feed["token_type_ids"] = np.zeros_like(input_feed["input_ids"])
+                        return original_run(output_names, input_feed, run_options)
+
+                    session.run = patched_run
+        except Exception:
+            pass  # патч — best-effort, без него RUAccent просто может упасть при вызове ниже
+
+        _ruaccent_instance = accentizer
+        print("RUAccent загружен — ударения для локального Silero будут дополнительно "
+              "проверяться этой моделью (в дополнение к встроенному put_accent).")
+    except Exception as e:
+        _ruaccent_load_failed = True
+        print(f"RUAccent недоступен ({e}) — использую только встроенный в Silero put_accent. "
+              "Чтобы включить RUAccent: pip install ruaccent")
+        _ruaccent_instance = None
+    return _ruaccent_instance
+
+
+def _sane_yo(text: str) -> str:
+    """"ё" в русском языке всегда ударная. RUAccent расставляет "+" и меняет
+    "е" на "ё" одной и той же моделью за один проход — если он поставил
+    "ё", но САМ же не пометил её "+" (ударение по его же мнению оказалось
+    на другой гласной того же слова или не отмечено вовсе), это внутренне
+    противоречиво — на практике так и проявляется жалоба "часто вместо е
+    ставит ё" (например "самое" -> "самоё"). Такую неподтверждённую "ё"
+    возвращаем обратно в "е": "е" вместо "ё" на письме — обычное дело
+    (так печатают почти всегда), а вот лишняя услышанная "ё" очень
+    заметна на слух, так что при сомнении лучше промолчать про "ё"."""
+    chars = list(text)
+    for i, ch in enumerate(chars):
+        if ch not in ("ё", "Ё"):
+            continue
+        prev = chars[i - 1] if i > 0 else ""
+        if prev != "+":
+            chars[i] = "е" if ch == "ё" else "Е"
+    return "".join(chars)
+
+
+def apply_ruaccent(text: str, accentizer) -> str:
+    """Прогоняет текст через RUAccent (расставляет "+" перед ударными
+    гласными и, где нужно, "ё"). Слова, которые словарь (apply_stress_dictionary)
+    уже пометил "+", RUAccent при повторном проходе не трогает — так
+    словарь остаётся приоритетнее автоматической модели. "ё", которую сам
+    RUAccent не считает ударной (см. _sane_yo), откатывается обратно в "е"."""
+    if accentizer is None:
+        return text
+    try:
+        return _sane_yo(accentizer.process_all(text))
+    except Exception as e:
+        print(f"RUAccent не смог обработать фрагмент ({e}) — использую текст без его правок.")
+        return text
+
+
+def _emphasis_kind(part_text: str) -> "str | None":
+    """По завершающему знаку куска текста определяет, нужно ли усилить
+    интонацию — "question" для "?", "exclaim" для "!". Возвращает None,
+    если куск не заканчивается одним из этих знаков (например, это
+    середина предложения, отрезанная по запятой/тире)."""
+    stripped = part_text.rstrip()
+    if stripped.endswith("?"):
+        return "question"
+    if stripped.endswith("!"):
+        return "exclaim"
+    return None
+
+
+def apply_emphasis(audio: "np.ndarray", sample_rate: int, kind: "str | None") -> "np.ndarray":
+    """Лёгкое усиление интонации на уровне уже готового звука — локальный
+    режим silero (в отличие от silero_rest) не принимает SSML/<prosody>, но
+    вопросительные и восклицательные фразы всё равно должны звучать не
+    совсем ровно. Здесь используется простое (без дополнительных
+    зависимостей вроде librosa) изменение скорости проигрывания через
+    ресемплинг: небольшое ускорение "поднимает" тон вверх (классический
+    эффект "бурундука", в малой дозе не режет слух) — так же в сторону
+    "выше и быстрее" двигает интонацию <prosody pitch="high"[ rate="fast"]>
+    в text_to_ssml() для silero_rest. Восклицание ускоряется заметнее
+    вопроса, как там же.
+
+    Это приближение, а не настоящий питч-шифтер (меняется и высота, и
+    темп вместе) — но для коротких вопросительных/восклицательных фраз
+    разница на слух небольшая, а плюс к выразительности заметный."""
+    import numpy as np
+    if kind is None or audio.size == 0:
+        return audio
+    speed = 1.05 if kind == "question" else 1.10
+    new_len = max(1, int(round(audio.shape[0] / speed)))
+    old_idx = np.linspace(0, audio.shape[0] - 1, num=audio.shape[0])
+    new_idx = np.linspace(0, audio.shape[0] - 1, num=new_len)
+    return np.interp(new_idx, old_idx, audio).astype(audio.dtype)
+
+
+def apply_fade(audio: "np.ndarray", sample_rate: int, fade_ms: float = 6.0) -> "np.ndarray":
+    """Плавный fade-in/fade-out (полу-косинус) на самом краю фрагмента —
+    убирает щелчки/потрескивание на стыках при склейке кусков через
+    np.concatenate. Модель почти никогда не начинает и не заканчивает
+    ровно с нулевой амплитуды, поэтому прямая склейка "конец одного куска
+    впритык к началу следующего" даёт резкий скачок амплитуды — на слух
+    это как раз и звучит как "шум"/потрескивание на границах фраз, а не
+    как гладкая речь. Фрагменты со вставленной тишиной (retry-fallback)
+    фейдить не нужно — там и так тишина."""
+    import numpy as np
+    n = audio.shape[0]
+    fade_len = min(n // 2, int(sample_rate * fade_ms / 1000))
+    if fade_len <= 1:
+        return audio
+    ramp = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, fade_len))
+    audio = audio.copy()
+    audio[:fade_len] *= ramp
+    audio[-fade_len:] *= ramp[::-1]
+    return audio
+
+
+# --------------------------------------------------------------------------
+# silero-vad (https://github.com/snakers4/silero-vad) — тот же автор, что и
+# у Silero TTS, ~2МБ модель, без новых тяжёлых зависимостей (тот же torch).
+# Точно находит, где в куске реально начинается/заканчивается речь —
+# используется, чтобы обрезать реальную тишину по краям КАЖДОГО куска
+# перед склейкой (точнее, чем фиксированный fade_ms в apply_fade, который
+# не знает, есть ли внутри этих 6мс уже начавшаяся речь или ещё тишина),
+# и чтобы точнее ловить "пустые" фрагменты — сейчас пустота определяется
+# грубо, по максимальной громкости (см. cosyvoice-часть), а VAD реально
+# ищет речь, а не просто "не тишина ли это".
+# --------------------------------------------------------------------------
+
+_vad_model = None
+_vad_get_speech_timestamps = None
+_vad_load_failed = False
+
+
+def _load_silero_vad():
+    """Лениво загружает и кэширует silero-vad. При любой ошибке (пакет не
+    установлен, модель не грузится) возвращает (None, None) один раз,
+    печатает предупреждение и больше не пытается — остальная озвучка
+    продолжается без VAD-обрезки, на одном fade по фиксированному времени
+    (см. apply_fade)."""
+    global _vad_model, _vad_get_speech_timestamps, _vad_load_failed
+    if _vad_model is not None or _vad_load_failed:
+        return _vad_model, _vad_get_speech_timestamps
+    try:
+        from silero_vad import load_silero_vad, get_speech_timestamps
+        _vad_model = load_silero_vad()
+        _vad_get_speech_timestamps = get_speech_timestamps
+        print("silero-vad загружен — границы речи в кусках будут обрезаться точно, "
+              "а не по фиксированному времени.")
+    except Exception as e:
+        _vad_load_failed = True
+        print(f"silero-vad недоступен ({e}) — обрезка тишины по границам речи отключена, "
+              "используется только fade по фиксированному времени. "
+              "Чтобы включить: pip install silero-vad")
+        _vad_model = None
+    return _vad_model, _vad_get_speech_timestamps
+
+
+def trim_silence(audio: "np.ndarray", sample_rate: int, vad_model, get_speech_timestamps,
+                  margin_ms: float = 25.0):
+    """Обрезает реальную тишину по краям audio, используя silero-vad —
+    оставляет небольшой запас (margin_ms) с каждой стороны, чтобы не
+    подрезать начало/конец самого звука (взрывные согласные и т.п.).
+
+    Возвращает (обрезанный_audio, has_speech) — has_speech=False означает,
+    что VAD вообще не нашёл речи в куске (похоже на "пустой"/неудавшийся
+    синтез — вызывающий код может залогировать это как подозрение на
+    пропуск, отдельно от обычных ошибок HTTP/исключений).
+
+    Если VAD недоступен или в куске всего пара сэмплов — возвращает audio
+    как есть с has_speech=True (не мешаем обычной работе)."""
+    import numpy as np
+    if vad_model is None or audio.size < 100:
+        return audio, True
+    try:
+        import torch
+        target_sr = 16000
+        if sample_rate != target_sr:
+            n_target = max(1, int(round(audio.shape[0] * target_sr / sample_rate)))
+            old_idx = np.linspace(0, audio.shape[0] - 1, num=audio.shape[0])
+            new_idx = np.linspace(0, audio.shape[0] - 1, num=n_target)
+            audio_16k = np.interp(new_idx, old_idx, audio).astype(np.float32)
+        else:
+            audio_16k = audio.astype(np.float32)
+
+        timestamps = get_speech_timestamps(
+            torch.from_numpy(audio_16k), vad_model,
+            sampling_rate=target_sr, return_seconds=False,
+        )
+        if not timestamps:
+            return audio, False
+
+        ratio = sample_rate / target_sr
+        margin = int(sample_rate * margin_ms / 1000)
+        start = max(0, int(timestamps[0]["start"] * ratio) - margin)
+        end = min(audio.shape[0], int(timestamps[-1]["end"] * ratio) + margin)
+        if end <= start:
+            return audio, True
+        return audio[start:end], True
+    except Exception:
+        # VAD - необязательное улучшение, любая его ошибка не должна
+        # ронять сам синтез
+        return audio, True
+
+
 def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: int, play: bool,
                model_id: str = DEFAULT_SILERO_MODEL, sentence_break_ms: int = 320,
                paragraph_break_ms: int = 550, comma_break_ms: int = 180,
                put_accent: bool = True, put_yo: bool = True, on_progress=None,
                chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None,
-               should_stop=None, play_fn=None):
+               should_stop=None, play_fn=None,
+               use_ruaccent: bool = True, stress_dict_path: "Path | str | None" = None,
+               emphasize: bool = True, use_vad_trim: bool = True,
+               use_stress_online: bool = False,
+               book_stress_overrides_path: "Path | str | None" = None):
     """Озвучка через Silero TTS — нейросетевой русский голос, локально.
     По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
 
@@ -1528,9 +3202,32 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     speakers_for_model(model_id)), которыми по очереди озвучиваются реплики
     прямой речи (абзацы, начинающиеся с тире) — см. _group_paragraphs_by_voice.
     Остальной текст (авторская речь) звучит голосом speaker, как обычно.
+
+    use_ruaccent — дополнительно прогонять текст через RUAccent перед
+    put_accent (см. apply_ruaccent) — обычно заметно снижает число
+    ошибок ударения по сравнению с одним только встроенным в Silero
+    угадыванием, особенно на омографах. stress_dict_path — свой словарь
+    "слово": "сл+ово" (JSON) для конкретных имён/терминов книги, которые
+    ни RUAccent, ни Silero не знают; словарь применяется раньше RUAccent и
+    имеет приоритет над ним (см. apply_stress_dictionary,
+    load_stress_dictionary). По умолчанию ищется файл
+    stress_dictionary.json рядом со скриптом — его не обязательно
+    указывать явно.
+
+    emphasize — небольшое усиление интонации для кусков текста,
+    заканчивающихся "?"/"!" (см. apply_emphasis) — приближение к тому,
+    что для silero_rest даёт SSML <prosody>, но на уровне уже готового
+    звука, так как локальный Silero не принимает SSML.
     """
     import numpy as np
     import wave
+
+    stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
+    accentizer = _load_ruaccent() if use_ruaccent else None
+    if stress_dict:
+        print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
+              f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
+    vad_model, vad_get_timestamps = _load_silero_vad() if use_vad_trim else (None, None)
 
     allowed = speakers_for_model(model_id)
     if speaker not in allowed:
@@ -1558,12 +3255,54 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         # разворачивать числа в слова — без этого цифры либо пропускаются,
         # либо звучат странно.
         part_text = numbers_to_words_ru(part_text)
+        # Порядок важен: сначала свой словарь (высший приоритет — конкретные
+        # имена/термины книги), потом RUAccent (общая подстраховка для
+        # всего остального). Слова из словаря на время RUAccent прячутся за
+        # плейсхолдерами (apply_stress_dictionary_protected) и возвращаются
+        # обратно уже после него (restore_stress_placeholders) — иначе на
+        # составных словах через дефис ("во-первых", "по-русски" и т.п.)
+        # RUAccent может не узнать уже стоящее "+"-ударение и добавить своё
+        # ещё раз, поверх; два ударения в одном слове звучат как заметное
+        # "растягивание"/искажение при синтезе. put_accent=True ниже
+        # остаётся включённым как ещё один, третий по счёту, уровень
+        # подстраховки — он расставляет ударения только там, где их ещё не
+        # оказалось (в защищённые плейсхолдерами слова он тоже не попадает).
+        enrich_stress_dictionary_online(part_text, stress_dict, stress_dict_path,
+                                         enabled=use_stress_online)
+        # Слова вроде "звезды" (см. resolve_case_ambiguous_nouns) требуют
+        # разного ударения в зависимости от падежа/числа — их нет в общем
+        # stress_dict (исключены как омографы), поэтому решение по
+        # конкретному фрагменту подмешиваем во ВРЕМЕННУЮ копию словаря,
+        # ничего не сохраняя в JSON.
+        _case_overrides = resolve_case_ambiguous_nouns(part_text)
+        _case_overrides.update(resolve_lemma_homographs(part_text))
+        _effective_stress_dict = stress_dict
+        if _case_overrides:
+            _effective_stress_dict = dict(stress_dict)
+            _effective_stress_dict.update(_case_overrides)
+        part_text, _stress_placeholders = apply_stress_dictionary_protected(part_text, _effective_stress_dict)
+        if accentizer is not None:
+            part_text = apply_ruaccent(part_text, accentizer)
+        part_text = restore_stress_placeholders(part_text, _stress_placeholders)
+        # put_yo — тоже встроенный механизм САМОГО Silero (не RUAccent), и он
+        # применяется к уже восстановленному тексту целиком, без разбора, что
+        # именно пришло из словаря — в отличие от put_accent (который, судя
+        # по всему, не трогает буквы там, где уже стоит "+"), put_yo может
+        # заменить "е" на "ё" даже в словарном слове, где это не нужно
+        # (например "самое" -> ошибочно "самоё"). Полагаться тут не на что —
+        # поэтому для фрагментов, где сработал словарь, put_yo на этот
+        # фрагмент просто отключается: словам ИЗ словаря "ё" при
+        # необходимости нужно проставлять прямо в самом stress_dictionary.json
+        # (там, где она действительно нужна), а не надеяться на угадывание.
+        # На остальные (более частые) фрагменты без словарных слов это не
+        # влияет — там put_yo работает как раньше.
+        effective_put_yo = put_yo and not _stress_placeholders
         return model.apply_tts(
             text=part_text,
             speaker=part_speaker,
             sample_rate=sample_rate,
             put_accent=put_accent,
-            put_yo=put_yo,
+            put_yo=effective_put_yo,
         ).numpy()
 
     def synth_with_fallback(part_text: str, idx: int, title: str, part_speaker: str) -> "np.ndarray":
@@ -1616,6 +3355,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             comma_break_ms=comma_break_ms, put_accent=put_accent, put_yo=put_yo,
             dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
+            use_ruaccent=use_ruaccent, emphasize=emphasize,
+            stress_dict_size=len(stress_dict), use_vad_trim=use_vad_trim,
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -1650,6 +3391,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         if on_progress:
             on_progress(pos, total, 0, segs_total)
 
+        prev_seg_speaker = None
         for seg_i, (part_text, pause_ms, seg_speaker) in enumerate(
             tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
         ):
@@ -1657,7 +3399,24 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                 if on_progress:
                     on_progress(pos, total, seg_i, segs_total)
                 continue
+            # Небольшая дополнительная пауза перед репликой другого голоса
+            # (смена seg_speaker внутри диалога) — короткая "пауза для
+            # вдоха" перед сменой говорящего звучит естественнее, чем
+            # реплики впритык друг к другу без какой-либо границы.
+            if prev_seg_speaker is not None and seg_speaker != prev_seg_speaker and audio_parts:
+                audio_parts.append(np.zeros(int(sample_rate * 0.09), dtype=np.float32))
+            prev_seg_speaker = seg_speaker
+
             audio = synth_with_fallback(part_text, idx, title, seg_speaker)
+            if vad_model is not None:
+                audio, had_speech = trim_silence(audio, sample_rate, vad_model, vad_get_timestamps)
+                if not had_speech and _text_has_speakable_content(part_text):
+                    print(f"  [Гл.{idx} «{title}»] ПРЕДУПРЕЖДЕНИЕ: silero-vad не нашёл речи "
+                          f"во фрагменте {part_text[:80]!r} — похоже на пропуск, проверьте "
+                          f"результат на слух.")
+            audio = apply_fade(audio, sample_rate)
+            if emphasize:
+                audio = apply_emphasis(audio, sample_rate, _emphasis_kind(part_text))
             audio_parts.append(audio)
             if pause_ms > 0:
                 audio_parts.append(np.zeros(int(sample_rate * pause_ms / 1000), dtype=np.float32))
@@ -1784,7 +3543,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                      comma_break_ms: int, emphasize: bool = True, max_len: int = 700,
                      model_id: str = DEFAULT_SILERO_MODEL, on_progress=None,
                      chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None,
-                     should_stop=None, play_fn=None):
+                     should_stop=None, play_fn=None,
+                     stress_dict_path: "Path | str | None" = None,
+                     use_vad_trim: bool = True, use_stress_online: bool = False,
+                     book_stress_overrides_path: "Path | str | None" = None):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -1803,6 +3565,13 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
          и порядок остальных фрагментов не съезжали, а не пропускается
          совсем без следа.
     Все ошибки подробно пишутся в лог-файл рядом с аудио (см. LOG_FILE).
+
+    stress_dict_path — тот же словарь ударений "слово": "сл+ово" (JSON), что
+    и у run_silero (см. load_stress_dictionary) — здесь применяется на
+    стороне клиента, ДО построения SSML/отправки на сервер, поэтому у
+    слов из словаря приоритет над RUAccent, который сервис (silero_rest_service.py)
+    и так применяет к присланному тексту/SSML: RUAccent не переставляет
+    "+"-ударение там, где оно уже явно указано.
     """
     import io
     import time
@@ -1810,6 +3579,12 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     import requests
     import numpy as np
     import wave as wave_mod
+
+    stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
+    if stress_dict:
+        print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
+              f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
+    vad_model, vad_get_timestamps = _load_silero_vad() if use_vad_trim else (None, None)
 
     if dialogue_speakers:
         allowed = speakers_for_model(model_id)
@@ -1869,9 +3644,23 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                 raise e
         raise last_exc
 
+    def _effective_stress_dict_for(text_chunk: str) -> dict:
+        """См. resolve_case_ambiguous_nouns/resolve_lemma_homographs —
+        временно подмешивает решённые по контексту формы (не сохраняется
+        в JSON)."""
+        overrides = resolve_case_ambiguous_nouns(text_chunk)
+        overrides.update(resolve_lemma_homographs(text_chunk))
+        if not overrides:
+            return stress_dict
+        merged = dict(stress_dict)
+        merged.update(overrides)
+        return merged
+
     def synth_via_ssml(plain_text_chunk: str, chunk_speaker: str) -> bytes:
+        enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
+                                         enabled=use_stress_online)
         ssml = text_to_ssml(
-            plain_text_chunk,
+            apply_stress_dictionary(plain_text_chunk, _effective_stress_dict_for(plain_text_chunk)),
             sentence_break_ms=sentence_break_ms,
             paragraph_break_ms=paragraph_break_ms,
             comma_break_ms=comma_break_ms,
@@ -1889,8 +3678,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         return resp.content
 
     def synth_via_plain_text(plain_text_chunk: str, chunk_speaker: str) -> bytes:
+        enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
+                                         enabled=use_stress_online)
         resp = _get_with_retry(plain_endpoint, {
-            "text_to_speech": plain_text_chunk,
+            "text_to_speech": apply_stress_dictionary(plain_text_chunk, _effective_stress_dict_for(plain_text_chunk)),
             "speaker": chunk_speaker,
             "sample_rate": sample_rate,
         })
@@ -1923,7 +3714,14 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         with wave_mod.open(io.BytesIO(wav_bytes), "rb") as wf:
             n = wf.getnframes()
             pcm = wf.readframes(n)
-            return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
+            audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
+        if vad_model is not None:
+            audio, had_speech = trim_silence(audio, sample_rate, vad_model, vad_get_timestamps)
+            if not had_speech:
+                log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] ПРЕДУПРЕЖДЕНИЕ: silero-vad не "
+                    f"нашёл речи во фрагменте {plain_text_chunk[:80]!r} — похоже на пропуск, "
+                    f"проверьте результат на слух.")
+        return apply_fade(audio, sample_rate)
 
     selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
                                   char_ranges=char_ranges)
@@ -1942,6 +3740,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             comma_break_ms=comma_break_ms, emphasize=emphasize, max_len=max_len,
             dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
+            stress_dict_size=len(stress_dict), use_vad_trim=use_vad_trim,
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -2150,7 +3949,11 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
                 f"пустой или практически беззвучный WAV (без ошибки HTTP) — если это "
                 f"повторяется на каждом фрагменте, скорее всего профиль голоса "
                 f"{chunk_voice!r} не загрузился на сервисе (см. cosyvoice_rest_service.log).")
-        return audio
+            return audio
+        # Fade-in/out на границах — убирает щелчки/потрескивание на стыках
+        # кусков при склейке (см. apply_fade); тишину (ветка выше) фейдить
+        # не нужно.
+        return apply_fade(audio, sample_rate)
 
     selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
                                   char_ranges=char_ranges)
@@ -2537,7 +4340,8 @@ def main():
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
     ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
     ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
-    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "cosyvoice", "piper", "yandex"],
+    ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "cosyvoice", "piper",
+                                        "yandex", "qwen_tts", "qwen_tts_local"],
                      default="silero",
                      help="silero = нейросетевой голос локально через torch.hub; "
                           "silero_rest = синтез через Silero-REST-Service с интонационными паузами "
@@ -2547,7 +4351,10 @@ def main():
                           "piper = Piper TTS (локально, CPU, быстро, без клонирования — "
                           "см. --piper-voice); "
                           "yandex = облачный Yandex SpeechKit (платно, нужны "
-                          "--yandex-api-key и --yandex-folder-id); online = gTTS (интернет); "
+                          "--yandex-api-key и --yandex-folder-id); "
+                          "qwen_tts = облачный Qwen3-TTS через DashScope (платно, нужен "
+                          "--qwen-api-key; не проверено на живом аккаунте — см. комментарий у "
+                          "QWEN_TTS_VOICES в коде); online = gTTS (интернет); "
                           "offline = pyttsx3 (без интернета)")
     ap.add_argument("--outdir", type=Path, default=Path("audiobook_output"),
                      help="папка для сохранения аудио (online и silero режимы)")
@@ -2608,14 +4415,44 @@ def main():
                      help="пауза на запятых/тире/двоеточиях в silero/silero_rest-режимах (мс)")
     ap.add_argument("--no-emphasis", action="store_true",
                      help="не усиливать интонацию вопросительных/восклицательных "
-                          "предложений через <prosody> в silero_rest-режиме "
-                          "(по умолчанию усиление включено)")
+                          "предложений (через <prosody> в silero_rest-режиме, через лёгкую "
+                          "обработку звука в silero-режиме) — по умолчанию усиление включено")
     ap.add_argument("--no-accent", action="store_true",
                      help="не расставлять ударения автоматически в silero-режиме "
                           "(по умолчанию расставляются)")
     ap.add_argument("--no-yo", action="store_true",
                      help="не заменять 'е' на 'ё' там, где нужно, в silero-режиме "
                           "(по умолчанию заменяется)")
+    ap.add_argument("--no-ruaccent", action="store_true",
+                     help="не использовать RUAccent в дополнение к встроенному в Silero "
+                          "put_accent в silero-режиме (по умолчанию используется, если "
+                          "пакет ruaccent установлен)")
+    ap.add_argument("--stress-dict", type=str, default="",
+                     help="свой словарь ударений (JSON: {\"слово\": \"сл+ово\"}) для "
+                          "silero-режима — приоритетнее RUAccent, для имён/терминов книги. "
+                          "По умолчанию: stress_dictionary.json рядом со скриптом, если есть")
+    ap.add_argument("--no-vad-trim", action="store_true",
+                     help="не обрезать тишину по краям фрагментов через silero-vad в "
+                          "silero/silero_rest-режимах (по умолчанию обрезается, если пакет "
+                          "silero-vad установлен) — используется только фиксированный fade")
+    ap.add_argument("--stress-online", action="store_true",
+                     help="искать ударения слов, которых нет в --stress-dict, в "
+                          "офлайн-корпусе (stress_corpus_ru.tsv.gz) и в интернете "
+                          "(Викисловарь) в silero/silero_rest-режимах, и дописывать найденное "
+                          "в словарь. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: и офлайн-корпус, и Викисловарь "
+                          "на практике не различают грамматические формы одного слова с разным "
+                          "ударением (например 'катера' — 'ка́тера' в родительном падеже "
+                          "единственного числа, но 'катера́' во множественном — а в словарь "
+                          "может попасть не тот вариант) и содержат отдельные готовые ошибки "
+                          "даже на простых словах ('пока', 'именно') — включённое по "
+                          "умолчанию, это раньше портило произношение обычных слов, которые "
+                          "RUAccent и без словаря обычно угадывает по контексту правильно. "
+                          "Включайте только если специально хотите пополнить словарь и готовы "
+                          "потом вручную проверять/чистить stress_dictionary.json.")
+    ap.add_argument("--no-stress-online", action="store_true",
+                     help="(оставлено для обратной совместимости, ничего не делает — "
+                          "автопоиск в интернете/офлайн-корпусе теперь и так выключен по "
+                          "умолчанию; используйте просто без --stress-online)")
     ap.add_argument("--yandex-api-key", type=str, default="",
                      help="API-ключ Yandex SpeechKit (режим yandex); можно также задать "
                           "переменной окружения YANDEX_API_KEY")
@@ -2636,6 +4473,23 @@ def main():
                           "очереди озвучены этими голосами вместо голоса --yandex-voice, "
                           "чтобы диалоги не звучали одним монотонным голосом; по умолчанию "
                           "не задано — вся книга одним голосом, как раньше")
+    ap.add_argument("--qwen-api-key", type=str, default="",
+                     help="API-ключ DashScope (режим qwen_tts); можно также задать переменной "
+                          "окружения DASHSCOPE_API_KEY")
+    ap.add_argument("--qwen-voice", type=str, default=QWEN_TTS_DEFAULT_VOICE,
+                     choices=list(QWEN_TTS_VOICES.keys()),
+                     help="голос Qwen3-TTS (режим qwen_tts)")
+    ap.add_argument("--qwen-dialogue-voices", type=str, default="",
+                     help="список голосов Qwen3-TTS через запятую для чередования на репликах "
+                          "диалогов — аналог --yandex-dialogue-voices")
+    ap.add_argument("--qwen-local-url", type=str, default=QWEN_TTS_LOCAL_DEFAULT_URL,
+                     help=f"адрес локального Gradio-сервера Qwen3-TTS (режим qwen_tts_local), "
+                          f"по умолчанию {QWEN_TTS_LOCAL_DEFAULT_URL}")
+    ap.add_argument("--qwen-local-voice", type=str, default=QWEN_TTS_LOCAL_DEFAULT_VOICE,
+                     choices=list(QWEN_TTS_LOCAL_VOICES.keys()),
+                     help="голос для локального Qwen3-TTS (режим qwen_tts_local) — список "
+                          "голосов у локального сервера свой, отличается от облачного "
+                          "(--qwen-voice); см. QWEN_TTS_LOCAL_VOICES в коде")
     ap.add_argument("--check-model-updates", action="store_true",
                      help="проверить на GitHub, не появилась ли более новая модель "
                           "Silero для русского языка, и выйти")
@@ -2734,13 +4588,22 @@ def main():
                    paragraph_break_ms=args.paragraph_break_ms, comma_break_ms=args.comma_break_ms,
                    put_accent=not args.no_accent, put_yo=not args.no_yo,
                    chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
-                   attribution=attribution)
+                   attribution=attribution,
+                   use_ruaccent=not args.no_ruaccent, emphasize=not args.no_emphasis,
+                   stress_dict_path=args.stress_dict or None,
+                   use_vad_trim=not args.no_vad_trim,
+                   use_stress_online=args.stress_online,
+                   book_stress_overrides_path=book_manual_stress_overrides_path(args.book))
     elif args.mode == "silero_rest":
         run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                          args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,
                          args.comma_break_ms, emphasize=not args.no_emphasis, model_id=args.model,
                          chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
-                         attribution=attribution)
+                         attribution=attribution,
+                         stress_dict_path=args.stress_dict or None,
+                         use_vad_trim=not args.no_vad_trim,
+                         use_stress_online=args.stress_online,
+                         book_stress_overrides_path=book_manual_stress_overrides_path(args.book))
     elif args.mode == "cosyvoice":
         cosyvoice_dialogue_voices = [v.strip() for v in args.cosyvoice_dialogue_voices.split(",") if v.strip()] or None
         run_cosyvoice(chapters, args.outdir, args.start, args.cosyvoice_voice, args.sample_rate, args.play,
@@ -2764,6 +4627,19 @@ def main():
                    voice=args.yandex_voice, speed=args.yandex_speed, emotion=args.yandex_emotion,
                    chapter_indices=chapter_indices, dialogue_voices=dialogue_voices,
                    attribution=attribution)
+    elif args.mode == "qwen_tts":
+        api_key = args.qwen_api_key or os.environ.get("DASHSCOPE_API_KEY", "")
+        dialogue_voices = [v.strip() for v in args.qwen_dialogue_voices.split(",") if v.strip()] or None
+        run_qwen_tts(chapters, args.outdir, args.start, args.play, api_key,
+                     voice=args.qwen_voice,
+                     chapter_indices=chapter_indices, dialogue_voices=dialogue_voices,
+                     attribution=attribution)
+    elif args.mode == "qwen_tts_local":
+        dialogue_voices = [v.strip() for v in args.qwen_dialogue_voices.split(",") if v.strip()] or None
+        run_qwen_tts_local(chapters, args.outdir, args.start, args.play, args.qwen_local_url,
+                            voice=args.qwen_local_voice,
+                            chapter_indices=chapter_indices, dialogue_voices=dialogue_voices,
+                            attribution=attribution)
     else:
         run_offline(chapters, args.start, args.rate, args.voice, voice_id=args.voice,
                     chapter_indices=chapter_indices, dialogue_voice_ids=dialogue_voice_ids,
