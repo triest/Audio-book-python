@@ -562,11 +562,30 @@ class UIBuilderMixin:
         ).grid(row=yrow, column=1, sticky="w", pady=3)
 
         yrow += 1
+        ttk.Label(yandex_frame, text="Эмоция (ermil/jane):").grid(row=yrow, column=0, sticky="w", pady=3)
+        self.yandex_emotion_var = tk.StringVar(value="")
+        ttk.Combobox(
+            yandex_frame, textvariable=self.yandex_emotion_var, state="readonly", width=12,
+            values=["", "good", "neutral", "evil"],
+        ).grid(row=yrow, column=1, sticky="w", pady=3)
+
+        yrow += 1
+        self.yandex_smart_emotion_var = tk.BooleanVar(value=False)
+        self.yandex_smart_emotion_check = ttk.Checkbutton(
+            yandex_frame,
+            text="Умная эмоция: LLM определяет эмоцию каждого абзаца по смыслу (вместо поля выше)",
+            variable=self.yandex_smart_emotion_var,
+        )
+        self.yandex_smart_emotion_check.grid(row=yrow, column=0, columnspan=3, sticky="w", pady=3)
+
+        yrow += 1
         ttk.Label(
             yandex_frame,
             text="Платный облачный сервис (после пробного периода) — нужен интернет\n"
                  "на каждую главу. Как получить ключ и Folder ID — см. README.\n"
-                 "Разные голоса для диалогов — в блоке «Разные голоса для диалогов» выше.",
+                 "Разные голоса для диалогов — в блоке «Разные голоса для диалогов» выше.\n"
+                 "Эмоции поддерживают только голоса ermil и jane. «Умная эмоция» использует\n"
+                 "тот же ключ LLM, что и атрибуция говорящих (блок «Диалоги» ниже).",
             foreground="#555", justify="left",
         ).grid(row=yrow, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
@@ -711,6 +730,25 @@ class UIBuilderMixin:
         self.accent_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
+        ttk.Label(intonation, text="Модуль ударений (silero/silero_rest):").grid(
+            row=irow, column=0, sticky="w", pady=3
+        )
+        self.stress_engine_var = tk.StringVar(value="ruaccent")
+        self.stress_engine_combo = ttk.Combobox(
+            intonation, textvariable=self.stress_engine_var, state="readonly", width=16,
+            values=["ruaccent", "silero_stress", "hybrid"],
+        )
+        self.stress_engine_combo.grid(row=irow, column=1, sticky="w", pady=3)
+
+        irow += 1
+        ttk.Label(
+            intonation,
+            text="ruaccent — как раньше; silero_stress — новая модель Silero целиком;\n"
+                 "hybrid — RUAccent + silero-stress только для слов-омографов",
+            foreground="gray", justify="left",
+        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
+
+        irow += 1
         self.yo_var = tk.BooleanVar(value=True)
         self.yo_check = ttk.Checkbutton(
             intonation, text='Заменять "е" на "ё" где нужно (только silero/silero_rest)',
@@ -726,6 +764,24 @@ class UIBuilderMixin:
             variable=self.emphasis_var,
         )
         self.emphasis_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+
+        irow += 1
+        self.smart_emotion_var = tk.BooleanVar(value=False)
+        self.smart_emotion_check = ttk.Checkbutton(
+            intonation,
+            text="Умная эмоция: LLM определяет эмоцию каждого абзаца по смыслу (только silero_rest)",
+            variable=self.smart_emotion_var,
+        )
+        self.smart_emotion_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+
+        irow += 1
+        ttk.Label(
+            intonation,
+            text="Абзац озвучивается с подстройкой громкости/высоты голоса (SSML <prosody>)\n"
+                 "под его эмоцию — радость, грусть, страх, злость, спокойствие, нейтрально.\n"
+                 "Использует тот же ключ LLM, что и атрибуция говорящих (блок «Диалоги» ниже).",
+            foreground="gray", justify="left",
+        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
 
         intonation.columnconfigure(1, weight=1)
 

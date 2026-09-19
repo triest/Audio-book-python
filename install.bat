@@ -101,7 +101,7 @@ rem Local Silero synthesis (the main, recommended mode)
 if errorlevel 1 goto :warn_partial
 
 rem Silero via a separate REST service (SSML pauses, optional)
-"%VENV_PY%" -m pip install fastapi uvicorn ruaccent num2words
+"%VENV_PY%" -m pip install fastapi uvicorn ruaccent silero-stress num2words
 if errorlevel 1 goto :warn_partial
 
 rem pymorphy3 - Russian morphology analyzer, used to pick the correct

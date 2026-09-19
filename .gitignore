@@ -73,3 +73,7 @@ docker/cosyvoice3/data/
 # источник: https://github.com/Koziev/NLP_Datasets) — скачивается сам
 # через install.bat (download_stress_corpus.py), в репозитории не нужен.
 stress_corpus_ru.tsv.gz
+
+# Ротированные логи (fb2_reader_gui.log.1, .2 и т.п.) - *.log их не ловит.
+*.log.*
+/logs/

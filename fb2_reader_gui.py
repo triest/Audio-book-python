@@ -119,8 +119,9 @@ SETTINGS_FIELDS = [
     "sample_rate_var", "rest_url_var", "auto_start_rest_var", "rate_var",
     "cosyvoice_rest_url_var", "cosyvoice_engine_var",
     "sentence_break_var", "paragraph_break_var", "comma_break_var",
-    "accent_var", "yo_var", "emphasis_var",
+    "accent_var", "yo_var", "emphasis_var", "stress_engine_var", "smart_emotion_var",
     "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
+    "yandex_emotion_var", "yandex_smart_emotion_var",
     "qwen_api_key_var", "qwen_voice_var",
     "qwen_local_url_var", "qwen_local_start_cmd_var", "qwen_local_auto_stop_var",
     "dialogue_var", "attribution_var", "attribution_provider_var",
@@ -815,11 +816,16 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             self.attribution_folder_label.master.pack_forget()
             self.attribution_use_yandex_btn.pack_forget()
 
-    def _selected_attribution(self):
+    def _selected_attribution(self, ignore_checkbox: bool = False):
         """{"api_key":..., "model":..., "provider":...}, если включена галочка
         «Определять, какой персонаж говорит» и есть ключ — иначе None
-        (тогда голоса для диалогов просто чередуются по кругу, без LLM)."""
-        if not self.attribution_var.get():
+        (тогда голоса для диалогов просто чередуются по кругу, без LLM).
+
+        ignore_checkbox=True — использовать те же поля ключа/модели/провайдера
+        независимо от этой галочки: нужно для «умной эмоции» Yandex
+        (--yandex-smart-emotion), которая пользуется тем же LLM-ключом, но не
+        обязана требовать одновременно включённой атрибуции говорящих."""
+        if not ignore_checkbox and not self.attribution_var.get():
             return None
         api_key = self.attribution_api_key_var.get().strip()
         if not api_key:
@@ -1453,6 +1459,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         comma_break_ms=int(self.comma_break_var.get()),
                         put_accent=self.accent_var.get(),
                         put_yo=self.yo_var.get(),
+                        stress_engine=self.stress_engine_var.get(),
                         on_progress=self._on_synthesis_progress,
                         chapter_indices=chapter_indices,
                         char_ranges=char_ranges,
@@ -1503,6 +1510,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                             book_manual_stress_overrides_path(self.book_path)
                             if self.book_path else None
                         ),
+                        stress_engine=self.stress_engine_var.get(),
+                        smart_emotion=self.smart_emotion_var.get(),
+                        emotion_attribution=self._selected_attribution(ignore_checkbox=True),
                     )
                 elif mode == "yandex":
                     run_yandex(
@@ -1514,6 +1524,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         self.yandex_folder_id_var.get().strip(),
                         voice=self._selected_yandex_voice(),
                         speed=float(self.yandex_speed_var.get()),
+                        emotion=self.yandex_emotion_var.get().strip(),
                         on_progress=self._on_synthesis_progress,
                         chapter_indices=chapter_indices,
                         char_ranges=char_ranges,
@@ -1521,6 +1532,8 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         attribution=attribution,
                         should_stop=lambda: self._stop_requested,
                         play_fn=self._embedded_play,
+                        smart_emotion=self.yandex_smart_emotion_var.get(),
+                        emotion_attribution=self._selected_attribution(ignore_checkbox=True),
                     )
                 elif mode == "qwen_tts":
                     run_qwen_tts(

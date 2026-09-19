@@ -955,6 +955,184 @@ def attribute_speakers_llm(text: str, api_key: str, model: str = DEFAULT_ATTRIBU
     return attribute_speakers_gemini(text, api_key, model, log_fn=log_fn)
 
 
+# --------------------------------------------------------------------------
+# «Умная» эмоциональная окраска (режим yandex, флаг --smart-emotion):
+# Yandex SpeechKit умеет менять эмоцию голоса ЗАПРОСОМ (параметр emotion),
+# но только у двух голосов — см. YANDEX_EMOTION_VOICES — и раньше в этом
+# проекте эмоция была ОДНА на всю озвучку (--yandex-emotion, из GUI/CLI).
+# Ниже — LLM (тот же провайдер/ключ, что и для атрибуции говорящих выше)
+# сама решает эмоцию ОТДЕЛЬНО ДЛЯ КАЖДОГО АБЗАЦА главы, по смыслу текста —
+# грустный абзац звучит иначе, чем бодрый или зловещий, без ручной разметки.
+# Используется ТЕКСТОВЫЙ ответ (не tool_use/function calling, как у
+# attribute_speakers_*) — для короткого списка меток из ограниченного
+# набора это надёжно работает у всех трёх провайдеров одинаково, и не
+# нужно поддерживать три разных JSON-схемы инструментов.
+# --------------------------------------------------------------------------
+
+YANDEX_EMOTION_VOICES = {
+    "ermil": ["good", "neutral"],
+    "jane": ["good", "neutral", "evil"],
+}
+
+# «Умная эмоция» для silero_rest (--smart-emotion): в отличие от Yandex
+# SpeechKit, у Silero нет отдельного параметра emotion — вместо него
+# используется универсальный SSML <prosody rate="..." pitch="...">, который
+# сервис уже умеет применять (см. _prosody_wrap/emphasize в text_to_ssml).
+# Поэтому набор меток здесь свой, более широкий (не привязан к вокабуляру
+# конкретного облачного API), и каждая метка сопоставлена с конкретными
+# rate/pitch — подобраны на глаз, для тонкой (не карикатурной) окраски;
+# при желании можно позже сделать настраиваемыми, но для начала это
+# разумные дефолты.
+SILERO_EMOTION_PROSODY = {
+    "neutral":  {"rate": "100%", "pitch": "+0%"},
+    "joy":      {"rate": "108%", "pitch": "+10%"},
+    "sadness":  {"rate": "92%",  "pitch": "-8%"},
+    "fear":     {"rate": "112%", "pitch": "+6%"},
+    "anger":    {"rate": "106%", "pitch": "-5%"},
+    "calm":     {"rate": "95%",  "pitch": "-3%"},
+}
+
+
+_EMOTION_LABEL_HINTS = {
+    "good": "тёплая/бодрая/доброжелательная интонация",
+    "neutral": "обычное повествование без выраженной окраски",
+    "evil": "злая/угрожающая/зловещая интонация",
+    "joy": "радость/приподнятое настроение",
+    "sadness": "грусть/уныние",
+    "fear": "страх/тревога/напряжение",
+    "anger": "злость/раздражение",
+    "calm": "спокойствие/умиротворение",
+}
+
+
+def _emotion_prompt(paragraphs: "list[str]", allowed_emotions: "list[str]") -> str:
+    labels = "/".join(allowed_emotions)
+    hints = "; ".join(f"'{e}' — {_EMOTION_LABEL_HINTS[e]}" for e in allowed_emotions if e in _EMOTION_LABEL_HINTS)
+    numbered = "\n".join(f"{i + 1}. {p[:400]}" for i, p in enumerate(paragraphs))
+    return (
+        "Ниже — пронумерованные абзацы одной главы книги на русском языке. Для КАЖДОГО "
+        f"абзаца определи наиболее подходящую эмоциональную окраску речи из набора: {labels}.\n"
+        f"Значения: {hints}. Опирайся на смысл и контекст абзаца (что происходит, "
+        "какие эмоции у персонажей/рассказчика), а не на отдельные слова.\n\n"
+        f"Верни ОТВЕТ СТРОГО в виде JSON-массива строк длиной ровно {len(paragraphs)} — "
+        "по одной метке на каждый абзац, в том же порядке, без каких-либо пояснений, "
+        f"markdown-разметки или текста до/после массива, например: "
+        + str(["neutral"] * min(3, len(paragraphs))) + "\n\n"
+        "--- АБЗАЦЫ ---\n" + numbered
+    )
+
+
+def _normalize_emotion_results(results, count: int, allowed_emotions: "list[str]", log_fn=None) -> "list[str]":
+    default = "neutral" if "neutral" in allowed_emotions else allowed_emotions[0]
+    out = []
+    for r in (results or []):
+        r = str(r).strip().lower()
+        out.append(r if r in allowed_emotions else default)
+    if len(out) != count:
+        if log_fn:
+            log_fn(f"Внимание: LLM вернула {len(out)} эмоций вместо {count} абзацев — "
+                   "выравниваю список (лишнее обрезаю/недостающее заполняю дефолтом).")
+        if len(out) < count:
+            out = out + [default] * (count - len(out))
+        else:
+            out = out[:count]
+    return out
+
+
+def classify_paragraph_emotions_anthropic(paragraphs, api_key, model, allowed_emotions, log_fn=None) -> "list[str]":
+    import requests
+    if not api_key:
+        raise ValueError("Не указан API-ключ для определения эмоций через Anthropic.")
+    prompt = _emotion_prompt(paragraphs, allowed_emotions)
+    resp = requests.post(
+        ANTHROPIC_MESSAGES_URL,
+        headers={"x-api-key": api_key, "anthropic-version": ANTHROPIC_API_VERSION,
+                 "content-type": "application/json"},
+        json={"model": model, "max_tokens": 2048,
+              "messages": [{"role": "user", "content": prompt}]},
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Anthropic API вернул ошибку HTTP {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    raw_text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    results = _extract_json_array(raw_text)
+    if results is None:
+        raise RuntimeError(f"Anthropic не вернул распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
+    return _normalize_emotion_results(results, len(paragraphs), allowed_emotions, log_fn)
+
+
+def classify_paragraph_emotions_gemini(paragraphs, api_key, model, allowed_emotions, log_fn=None) -> "list[str]":
+    import requests
+    if not api_key:
+        raise ValueError("Не указан API-ключ для определения эмоций через Gemini.")
+    prompt = _emotion_prompt(paragraphs, allowed_emotions)
+    resp = requests.post(
+        GEMINI_GENERATE_URL_TMPL.format(model=model),
+        params={"key": api_key}, headers={"content-type": "application/json"},
+        json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Gemini API вернул ошибку HTTP {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    raw_text = ""
+    for cand in data.get("candidates", []):
+        for part in (cand.get("content") or {}).get("parts", []):
+            raw_text += part.get("text", "")
+    results = _extract_json_array(raw_text)
+    if results is None:
+        raise RuntimeError(f"Gemini не вернул распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
+    return _normalize_emotion_results(results, len(paragraphs), allowed_emotions, log_fn)
+
+
+def classify_paragraph_emotions_yandexgpt(paragraphs, api_key, model, allowed_emotions,
+                                           folder_id: str = "", log_fn=None) -> "list[str]":
+    import requests
+    if not api_key:
+        raise ValueError("Не указан API-ключ YandexGPT для определения эмоций.")
+    if not folder_id:
+        raise ValueError("Не указан Folder ID YandexGPT для определения эмоций.")
+    prompt = _emotion_prompt(paragraphs, allowed_emotions)
+    model_uri = f"gpt://{folder_id}/{model}"
+    resp = requests.post(
+        YANDEXGPT_COMPLETION_URL,
+        headers={"Authorization": f"Api-Key {api_key}", "content-type": "application/json"},
+        json={"modelUri": model_uri,
+              "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": "2000"},
+              "messages": [{"role": "user", "text": prompt}]},
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"YandexGPT API вернул ошибку HTTP {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    try:
+        raw_text = data["result"]["alternatives"][0]["message"]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"YandexGPT не вернул ожидаемый текст ответа (ответ: {str(data)[:500]})")
+    results = _extract_json_array(raw_text)
+    if results is None:
+        raise RuntimeError(f"YandexGPT не вернул распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
+    return _normalize_emotion_results(results, len(paragraphs), allowed_emotions, log_fn)
+
+
+def classify_paragraph_emotions_llm(paragraphs, allowed_emotions, api_key, model=DEFAULT_ATTRIBUTION_MODEL,
+                                     provider=DEFAULT_ATTRIBUTION_PROVIDER, folder_id: str = "",
+                                     log_fn=None) -> "list[str]":
+    """Диспетчер, аналогичный attribute_speakers_llm — определяет эмоцию
+    КАЖДОГО абзаца из paragraphs (список строк) из набора allowed_emotions
+    (см. YANDEX_EMOTION_VOICES), тем же провайдером/ключом, что и атрибуция
+    говорящих. Пустой список абзацев -> пустой результат без обращения к API."""
+    if not paragraphs:
+        return []
+    if provider == "yandexgpt":
+        return classify_paragraph_emotions_yandexgpt(paragraphs, api_key, model, allowed_emotions,
+                                                       folder_id=folder_id, log_fn=log_fn)
+    if provider == "anthropic":
+        return classify_paragraph_emotions_anthropic(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
+    return classify_paragraph_emotions_gemini(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
+
+
 def _make_file_logger(outdir: Path, filename: str):
     """Возвращает log(message) — пишет и в консоль/GUI (через print,
     перехватываемый TextRedirector), и в файл рядом с аудио, чтобы можно
@@ -1318,7 +1496,8 @@ def synth_yandex_chunk(text: str, api_key: str, folder_id: str, voice: str, lang
 def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, folder_id: str,
                voice: str = "alena", lang: str = "", speed: float = 1.0,
                emotion: str = "", on_progress=None, chapter_indices=None, char_ranges=None,
-               dialogue_voices=None, attribution=None, should_stop=None, play_fn=None):
+               dialogue_voices=None, attribution=None, should_stop=None, play_fn=None,
+               smart_emotion: bool = False, emotion_attribution=None):
     """Озвучка через облачный Yandex SpeechKit. Требует интернет, ключ и
     Folder ID на каждый запуск, платный после пробного периода (см.
     README). Текст режется на куски по YANDEX_MAX_CHARS (лимит SpeechKit —
@@ -1333,7 +1512,23 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
     которыми по очереди озвучиваются реплики прямой речи (абзацы,
     начинающиеся с тире), чтобы диалоги не звучали одним и тем же
     монотонным голосом на протяжении всей книги — см. _build_voiced_segments.
-    Остальной текст (авторская речь) по-прежнему звучит голосом voice."""
+    Остальной текст (авторская речь) по-прежнему звучит голосом voice.
+
+    smart_emotion — вместо ОДНОЙ эмоции (emotion) на всю озвучку, LLM сама
+    определяет эмоцию для КАЖДОГО абзаца главы по смыслу текста (см.
+    classify_paragraph_emotions_llm). Работает только для голосов из
+    YANDEX_EMOTION_VOICES (ermil, jane) — для остальных голосов Yandex
+    SpeechKit эмоции не поддерживает в принципе, флаг тихо игнорируется
+    (с предупреждением в лог). При любой ошибке LLM откатывается на
+    единую emotion, как раньше, не срывая всю озвучку главы.
+
+    emotion_attribution — {"api_key":..., "model":..., "provider":...,
+    "folder_id":...} для LLM-вызова smart_emotion; по умолчанию (None)
+    используется тот же attribution, что и для атрибуции говорящих. Задан
+    ОТДЕЛЬНО от attribution намеренно: smart_emotion не должен незаметно
+    включать LLM-атрибуцию говорящих (resolve_voice_groups) там, где
+    пользователь её не просил — GUI подставляет сюда ключ независимо от
+    галочки «Определять, какой персонаж говорит»."""
     import time as _time
 
     # lang должен точно соответствовать голосу (см. YANDEX_VOICE_LANGS) —
@@ -1375,7 +1570,7 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
 
         fingerprint = _params_fingerprint(
             text, mode="yandex", voice=voice, lang=lang, speed=speed,
-            emotion=emotion, format=audio_format,
+            emotion=emotion, format=audio_format, smart_emotion=smart_emotion,
             dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
         )
@@ -1392,24 +1587,90 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
 
         voice_groups = resolve_voice_groups(text, voice, dialogue_voices, outdir,
                                              attribution=attribution, log_fn=log)
-        segments = _chunk_voice_groups(voice_groups, YANDEX_MAX_CHARS)
-        chunks_total = len(segments) or 1
-        if on_progress:
-            on_progress(pos, total, 0, chunks_total)
 
-        chunk_bytes = []
-        for chunk_no, (chunk, seg_voice) in enumerate(
-            tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
-        ):
-            if chunk.strip() and _text_has_speakable_content(chunk):
-                seg_lang = yandex_lang_for_voice(seg_voice)
-                data = synth_yandex_chunk(
-                    chunk, api_key, folder_id, seg_voice, seg_lang, speed, emotion, audio_format,
+        # smart_emotion работает только для голосов с поддержкой эмоций и
+        # только если хотя бы одна голосовая группа этой главы говорит
+        # именно таким голосом — иначе (обычный voice без dialogue_voices,
+        # либо диалоговые голоса без ermil/jane) ведём себя как раньше.
+        emotion_voices_in_use = {g_voice for g_voice, _ in voice_groups} & set(YANDEX_EMOTION_VOICES)
+        para_emotion_map: "dict[str, str] | None" = None
+        if smart_emotion and emotion_voices_in_use:
+            all_paras = [p for g_text in (t for _v, t in voice_groups) for p in g_text.split("\n") if p.strip()]
+            # Один общий набор допустимых эмоций на главу — пересечение
+            # поддерживаемых наборов используемых голосов (чтобы не
+            # присвоить 'evil' абзацу, который в итоге озвучит ermil, не
+            # умеющий в evil); если голосов с эмоциями несколько и наборы
+            # не пересекаются — берём объединение и подрезаем при подстановке.
+            allowed = sorted(set().union(*(YANDEX_EMOTION_VOICES[v] for v in emotion_voices_in_use)))
+            _emo_creds = emotion_attribution if emotion_attribution is not None else attribution
+            try:
+                para_emotion_list = classify_paragraph_emotions_llm(
+                    all_paras, allowed_emotions=allowed,
+                    api_key=(_emo_creds or {}).get("api_key", ""),
+                    model=(_emo_creds or {}).get("model", DEFAULT_ATTRIBUTION_MODEL),
+                    provider=(_emo_creds or {}).get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
+                    folder_id=(_emo_creds or {}).get("folder_id", ""),
                     log_fn=log,
                 )
-                chunk_bytes.append(data)
+                para_emotion_map = dict(zip(all_paras, para_emotion_list))
+                log(f"smart_emotion: определены эмоции для {len(all_paras)} абзац(ев) главы.")
+            except Exception as e:
+                log(f"smart_emotion не удался ({e}) — использую единую emotion={emotion or 'neutral'} "
+                    "для всей главы, как без этого флага.")
+                para_emotion_map = None
+
+        if para_emotion_map is not None:
+            # Отдельный путь синтеза: КАЖДЫЙ абзац — отдельный запрос к
+            # Yandex SpeechKit со своей emotion (обычный путь ниже пакует
+            # несколько абзацев в один запрос до YANDEX_MAX_CHARS — так
+            # быстрее, но тогда общая emotion была бы одна на весь пакет).
+            segments = []
+            for g_voice, g_text in voice_groups:
+                for para in g_text.split("\n"):
+                    if not para.strip():
+                        continue
+                    seg_emotion = (
+                        para_emotion_map.get(para, emotion) if g_voice in YANDEX_EMOTION_VOICES else ""
+                    )
+                    if seg_emotion and seg_emotion not in YANDEX_EMOTION_VOICES.get(g_voice, []):
+                        seg_emotion = "neutral" if "neutral" in YANDEX_EMOTION_VOICES.get(g_voice, []) else ""
+                    for sub in (split_text(para, YANDEX_MAX_CHARS) if len(para) > YANDEX_MAX_CHARS else [para]):
+                        segments.append((sub, g_voice, seg_emotion))
+            chunks_total = len(segments) or 1
             if on_progress:
-                on_progress(pos, total, chunk_no, chunks_total)
+                on_progress(pos, total, 0, chunks_total)
+            chunk_bytes = []
+            for chunk_no, (chunk, seg_voice, seg_emotion) in enumerate(
+                tqdm(segments, desc=f"Гл.{idx}", unit="абзац"), 1
+            ):
+                if chunk.strip() and _text_has_speakable_content(chunk):
+                    seg_lang = yandex_lang_for_voice(seg_voice)
+                    data = synth_yandex_chunk(
+                        chunk, api_key, folder_id, seg_voice, seg_lang, speed, seg_emotion, audio_format,
+                        log_fn=log,
+                    )
+                    chunk_bytes.append(data)
+                if on_progress:
+                    on_progress(pos, total, chunk_no, chunks_total)
+        else:
+            segments = _chunk_voice_groups(voice_groups, YANDEX_MAX_CHARS)
+            chunks_total = len(segments) or 1
+            if on_progress:
+                on_progress(pos, total, 0, chunks_total)
+
+            chunk_bytes = []
+            for chunk_no, (chunk, seg_voice) in enumerate(
+                tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
+            ):
+                if chunk.strip() and _text_has_speakable_content(chunk):
+                    seg_lang = yandex_lang_for_voice(seg_voice)
+                    data = synth_yandex_chunk(
+                        chunk, api_key, folder_id, seg_voice, seg_lang, speed, emotion, audio_format,
+                        log_fn=log,
+                    )
+                    chunk_bytes.append(data)
+                if on_progress:
+                    on_progress(pos, total, chunk_no, chunks_total)
 
         if not chunk_bytes:
             continue
@@ -3035,6 +3296,79 @@ def apply_ruaccent(text: str, accentizer) -> str:
         return text
 
 
+_silero_stress_instance = None
+_silero_stress_load_failed = False
+
+
+def _load_silero_stress():
+    """Лениво загружает и кэширует silero-stress — отдельную модель-акцентор
+    от Silero (https://github.com/snakers4/silero-stress, релиз сентября
+    2026, см. заметку в CLAUDE.md), в отличие от RUAccent специально
+    заточенную на разрешение омографов по контексту (2208 омографов,
+    F1 0.86). Формат вывода совпадает с RUAccent — "+" перед ударной
+    гласной, поэтому apply_stress_dictionary_protected/_sane_yo и т.д.
+    работают с ней без изменений. При любой ошибке (пакет не установлен)
+    возвращает None один раз, печатает предупреждение и больше не пытается."""
+    global _silero_stress_instance, _silero_stress_load_failed
+    if _silero_stress_instance is not None or _silero_stress_load_failed:
+        return _silero_stress_instance
+    try:
+        from silero_stress import load_accentor
+        _silero_stress_instance = load_accentor()
+        print("silero-stress загружен.")
+    except Exception as e:
+        _silero_stress_load_failed = True
+        print(f"silero-stress недоступен ({e}) — движок ударений 'silero_stress'/'hybrid' "
+              "недоступен, продолжаю без него. Чтобы включить: pip install silero-stress")
+        _silero_stress_instance = None
+    return _silero_stress_instance
+
+
+def apply_silero_stress(text: str, accentor) -> str:
+    """Прогоняет text через silero-stress целиком (движок ударений
+    'silero_stress' — полная замена RUAccent). Как и apply_ruaccent,
+    подчищает внутренне противоречивую "ё" через _sane_yo."""
+    if accentor is None:
+        return text
+    try:
+        return _sane_yo(accentor(text))
+    except Exception as e:
+        print(f"silero-stress не смог обработать фрагмент ({e}) — использую текст без его правок.")
+        return text
+
+
+def _silero_stress_omograph_overrides(text: str, accentor) -> dict:
+    """Для движка ударений 'hybrid': прогоняет text целиком через
+    silero-stress и достаёт ударение ТОЛЬКО для слов из списка омографов
+    (_load_ambiguous_stress_words) — именно там, где RUAccent слабее всего.
+    Возвращает {слово_в_нижнем_регистре: "сл+ово"}, пригодный для подмешивания
+    в stress_dict (как resolve_case_ambiguous_nouns/resolve_lemma_homographs)
+    перед apply_stress_dictionary_protected — остальной текст по-прежнему
+    достаётся RUAccent, как и в обычном режиме 'ruaccent'.
+    Полагается на то, что silero-stress не меняет число слов в тексте
+    (только вставляет "+" и иногда меняет "е"->"ё") — сопоставляет слова
+    входного и акцентированного текста по порядку встречи; при малейшем
+    расхождении просто теряет часть совпадений (не ошибка, best-effort)."""
+    if accentor is None:
+        return {}
+    ambiguous = _load_ambiguous_stress_words()
+    if not ambiguous:
+        return {}
+    try:
+        accented = accentor(text)
+    except Exception as e:
+        print(f"silero-stress (hybrid, омографы) не смог обработать фрагмент ({e}).")
+        return {}
+    src_words = _STRESS_WORD_RE.findall(text)
+    out_words = re.findall(r"[А-Яа-яЁё+]+(?:-[А-Яа-яЁё+]+)*", accented)
+    overrides = {}
+    for src, out in zip(src_words, out_words):
+        low = src.lower()
+        if low in ambiguous and "+" in out:
+            overrides[low] = out.lower()
+    return overrides
+
+
 def _emphasis_kind(part_text: str) -> "str | None":
     """По завершающему знаку куска текста определяет, нужно ли усилить
     интонацию — "question" для "?", "exclaim" для "!". Возвращает None,
@@ -3188,7 +3522,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                put_accent: bool = True, put_yo: bool = True, on_progress=None,
                chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None,
                should_stop=None, play_fn=None,
-               use_ruaccent: bool = True, stress_dict_path: "Path | str | None" = None,
+               stress_engine: str = "ruaccent", stress_dict_path: "Path | str | None" = None,
                emphasize: bool = True, use_vad_trim: bool = True,
                use_stress_online: bool = False,
                book_stress_overrides_path: "Path | str | None" = None):
@@ -3219,10 +3553,13 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     прямой речи (абзацы, начинающиеся с тире) — см. _group_paragraphs_by_voice.
     Остальной текст (авторская речь) звучит голосом speaker, как обычно.
 
-    use_ruaccent — дополнительно прогонять текст через RUAccent перед
-    put_accent (см. apply_ruaccent) — обычно заметно снижает число
-    ошибок ударения по сравнению с одним только встроенным в Silero
-    угадыванием, особенно на омографах. stress_dict_path — свой словарь
+    stress_engine — какой движок расставляет ударения помимо словаря
+    (stress_dict) и встроенного в Silero put_accent: "ruaccent" (по
+    умолчанию, как раньше), "silero_stress" (полная замена RUAccent на
+    silero-stress) или "hybrid" (RUAccent как основа + silero-stress только
+    для слов-омографов из ambiguous_stress_words_ru.txt). "none" (или любое
+    другое значение) — не использовать ни один из них, как раньше --no-ruaccent.
+    stress_dict_path — свой словарь
     "слово": "сл+ово" (JSON) для конкретных имён/терминов книги, которые
     ни RUAccent, ни Silero не знают; словарь применяется раньше RUAccent и
     имеет приоритет над ним (см. apply_stress_dictionary,
@@ -3239,7 +3576,9 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     import wave
 
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
-    accentizer = _load_ruaccent() if use_ruaccent else None
+    stress_engine = (stress_engine or "ruaccent").lower()
+    accentizer = _load_ruaccent() if stress_engine in ("ruaccent", "hybrid") else None
+    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid") else None
     if stress_dict:
         print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
               f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
@@ -3292,12 +3631,16 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         # ничего не сохраняя в JSON.
         _case_overrides = resolve_case_ambiguous_nouns(part_text)
         _case_overrides.update(resolve_lemma_homographs(part_text))
+        if stress_engine == "hybrid" and silero_stress_accentor is not None:
+            _case_overrides.update(_silero_stress_omograph_overrides(part_text, silero_stress_accentor))
         _effective_stress_dict = stress_dict
         if _case_overrides:
             _effective_stress_dict = dict(stress_dict)
             _effective_stress_dict.update(_case_overrides)
         part_text, _stress_placeholders = apply_stress_dictionary_protected(part_text, _effective_stress_dict)
-        if accentizer is not None:
+        if stress_engine == "silero_stress" and silero_stress_accentor is not None:
+            part_text = apply_silero_stress(part_text, silero_stress_accentor)
+        elif accentizer is not None:
             part_text = apply_ruaccent(part_text, accentizer)
         part_text = restore_stress_placeholders(part_text, _stress_placeholders)
         # put_yo — тоже встроенный механизм САМОГО Silero (не RUAccent), и он
@@ -3371,7 +3714,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             comma_break_ms=comma_break_ms, put_accent=put_accent, put_yo=put_yo,
             dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
-            use_ruaccent=use_ruaccent, emphasize=emphasize,
+            stress_engine=stress_engine, emphasize=emphasize,
             stress_dict_size=len(stress_dict), use_vad_trim=use_vad_trim,
         )
         if _is_already_done(out_path, fingerprint):
@@ -3489,7 +3832,7 @@ def _prosody_wrap(escaped_sentence: str, original_sentence: str, emphasize: bool
 
 def text_to_ssml(text: str, sentence_break_ms: int = 320,
                   paragraph_break_ms: int = 550, comma_break_ms: int = 180,
-                  emphasize: bool = True) -> str:
+                  emphasize: bool = True, paragraph_prosody: "list | None" = None) -> str:
     """Превращает обычный текст главы в SSML-документ для Silero.
 
     * абзацы -> <p>, между ними длинная пауза (paragraph_break_ms);
@@ -3502,6 +3845,16 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
       добавляется короткая пауза <break/> (comma_break_ms), имитирующая
       естественную интонационную паузу при чтении.
 
+    paragraph_prosody — необязательный список [{"rate":..,"pitch":..} | None, ...]
+    ДЛИНОЙ РОВНО КАК paragraphs (см. ниже) — по ПОЗИЦИИ абзаца, не по тексту
+    (текст абзаца тут уже может отличаться от исходного из-за расставленных
+    ударений "+", поэтому сопоставление по индексу, а не по строке) — см.
+    SILERO_EMOTION_PROSODY, --smart-emotion режима silero_rest. Если для
+    абзаца задана запись, весь <p>...</p> дополнительно оборачивается в
+    <prosody rate=".." pitch="..">, поверх локальных <prosody> усиления
+    вопросов/восклицаний (emphasize) — Silero поддерживает вложенные
+    <prosody>, внутренний переопределяет только то, что задаёт сам.
+
     Ударения (RUAccent) в готовый SSML не добавляются здесь — это делает
     сервер (silero_rest_service.py) при получении запроса, в том числе для
     уже готового SSML, который присылает этот клиент.
@@ -3509,7 +3862,7 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()] or [text.strip()]
 
     p_chunks = []
-    for para in paragraphs:
+    for para_idx, para in enumerate(paragraphs):
         sentences = [s.strip() for s in _SENT_SPLIT_RE.split(para) if s.strip()]
         s_chunks = []
         for sent in sentences:
@@ -3520,8 +3873,12 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
             )
             s_chunks.append(_prosody_wrap(escaped, sent, emphasize))
         if s_chunks:
-            joiner = f'<break time="{sentence_break_ms}ms"/>'
-            p_chunks.append("<p>" + joiner.join(s_chunks) + "</p>")
+            inner = f'<break time="{sentence_break_ms}ms"/>'.join(s_chunks)
+            para_prosody = paragraph_prosody[para_idx] if paragraph_prosody and para_idx < len(paragraph_prosody) else None
+            if para_prosody:
+                inner = (f'<prosody rate="{para_prosody["rate"]}" pitch="{para_prosody["pitch"]}">'
+                         f'{inner}</prosody>')
+            p_chunks.append("<p>" + inner + "</p>")
 
     joiner = f'<break time="{paragraph_break_ms}ms"/>'
     return "<speak>" + joiner.join(p_chunks) + "</speak>"
@@ -3562,7 +3919,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                      should_stop=None, play_fn=None,
                      stress_dict_path: "Path | str | None" = None,
                      use_vad_trim: bool = True, use_stress_online: bool = False,
-                     book_stress_overrides_path: "Path | str | None" = None):
+                     book_stress_overrides_path: "Path | str | None" = None,
+                     stress_engine: str = "ruaccent",
+                     smart_emotion: bool = False, emotion_attribution=None):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -3588,6 +3947,23 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     слов из словаря приоритет над RUAccent, который сервис (silero_rest_service.py)
     и так применяет к присланному тексту/SSML: RUAccent не переставляет
     "+"-ударение там, где оно уже явно указано.
+
+    smart_emotion — LLM (см. classify_paragraph_emotions_llm, тот же
+    механизм, что и --yandex-smart-emotion) определяет эмоцию КАЖДОГО
+    абзаца главы по смыслу текста, из набора SILERO_EMOTION_PROSODY.
+    В отличие от Yandex (там отдельный параметр emotion запроса), у Silero
+    нет такого API — вместо этого абзац оборачивается в SSML
+    <prosody rate=".." pitch="..> (см. text_to_ssml, paragraph_prosody),
+    поверх обычных пауз/усиления вопросов-восклицаний. Классификация
+    делается ОДИН РАЗ НА ГЛАВУ (не на каждый max_len-фрагмент), чтобы LLM
+    видела достаточно контекста и не тратился лишний запрос на каждый
+    маленький кусок. При ошибке LLM — глава озвучивается как обычно, без
+    эмоциональной окраски (не срывая синтез).
+    emotion_attribution — {"api_key":...,"model":...,"provider":...,
+    "folder_id":...} для этого LLM-вызова; по умолчанию (None) — тот же
+    attribution, что и для атрибуции говорящих (см. run_yandex — тот же
+    подход, разнесено намеренно, чтобы smart_emotion не требовал заодно
+    включённой атрибуции диалогов).
     """
     import io
     import time
@@ -3601,6 +3977,16 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
               f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
     vad_model, vad_get_timestamps = _load_silero_vad() if use_vad_trim else (None, None)
+
+    # stress_engine — тут применяется ЦЕЛИКОМ на клиенте, ДО отправки на
+    # сервис (silero_rest_service.py сам всегда прогоняет присланный текст
+    # через RUAccent, но не трогает слова, где уже стоит "+" — см.
+    # _protect_already_accented там же). Поэтому 'ruaccent' (по умолчанию)
+    # ничего здесь не меняет — RUAccent как и раньше отрабатывает на
+    # сервере; 'hybrid' и 'silero_stress' подмешивают/заменяют ударения
+    # ДО отправки, а сервер лишь не трогает уже проставленные "+".
+    stress_engine = (stress_engine or "ruaccent").lower()
+    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid") else None
 
     if dialogue_speakers:
         allowed = speakers_for_model(model_id)
@@ -3672,15 +4058,50 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         merged.update(overrides)
         return merged
 
+    def _accented_text_for_rest(plain_text_chunk: str) -> str:
+        """Готовит текст ПЕРЕД отправкой на silero_rest_service.py — см.
+        пояснение про stress_engine выше. Для 'ruaccent' — просто словарь,
+        как и раньше. Для 'hybrid' — словарь + ударения для слов-омографов
+        от silero-stress (остальное по-прежнему достаётся серверному
+        RUAccent). Для 'silero_stress' — словарь (под защитой плейсхолдеров,
+        чтобы silero-stress их не трогала) + вся оставшаяся расстановка
+        ударений тоже через silero-stress, целиком на клиенте — сервер в
+        этом случае почти ничего не добавляет, т.к. все слова уже придут
+        с "+"."""
+        effective_dict = _effective_stress_dict_for(plain_text_chunk)
+        if stress_engine == "hybrid" and silero_stress_accentor is not None:
+            effective_dict = dict(effective_dict)
+            effective_dict.update(_silero_stress_omograph_overrides(plain_text_chunk, silero_stress_accentor))
+        if stress_engine == "silero_stress" and silero_stress_accentor is not None:
+            protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, effective_dict)
+            protected = apply_silero_stress(protected, silero_stress_accentor)
+            return restore_stress_placeholders(protected, placeholders)
+        return apply_stress_dictionary(plain_text_chunk, effective_dict)
+
+    # Заполняется заново для каждой главы (см. основной цикл ниже) —
+    # {абзац_исходного_текста: {"rate":..,"pitch":..}} по классификации LLM.
+    _chapter_para_prosody: dict = {}
+
     def synth_via_ssml(plain_text_chunk: str, chunk_speaker: str) -> bytes:
         enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
                                          enabled=use_stress_online)
+        # paragraph_prosody передаётся ПО ПОЗИЦИИ абзаца (не по тексту) —
+        # расстановка ударений ("+") меняет текст абзаца, поэтому сопоставлять
+        # эмоцию нужно по номеру абзаца в чанке, а не по совпадению строк.
+        # Абзацы plain_text_chunk и accented-текста (который дальше режется
+        # на абзацы внутри text_to_ssml) идут в том же порядке 1:1 — сама
+        # расстановка ударений абзацы не добавляет и не убирает.
+        para_prosody_list = None
+        if _chapter_para_prosody:
+            plain_paras = [p for p in plain_text_chunk.split("\n") if p.strip()]
+            para_prosody_list = [_chapter_para_prosody.get(p) for p in plain_paras]
         ssml = text_to_ssml(
-            apply_stress_dictionary(plain_text_chunk, _effective_stress_dict_for(plain_text_chunk)),
+            _accented_text_for_rest(plain_text_chunk),
             sentence_break_ms=sentence_break_ms,
             paragraph_break_ms=paragraph_break_ms,
             comma_break_ms=comma_break_ms,
             emphasize=emphasize,
+            paragraph_prosody=para_prosody_list,
         )
         resp = _get_with_retry(ssml_endpoint, {
             "text_to_speech": ssml,
@@ -3697,7 +4118,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
                                          enabled=use_stress_online)
         resp = _get_with_retry(plain_endpoint, {
-            "text_to_speech": apply_stress_dictionary(plain_text_chunk, _effective_stress_dict_for(plain_text_chunk)),
+            "text_to_speech": _accented_text_for_rest(plain_text_chunk),
             "speaker": chunk_speaker,
             "sample_rate": sample_rate,
         })
@@ -3756,7 +4177,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             comma_break_ms=comma_break_ms, emphasize=emphasize, max_len=max_len,
             dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
-            stress_dict_size=len(stress_dict), use_vad_trim=use_vad_trim,
+            stress_dict_size=len(stress_dict), use_vad_trim=use_vad_trim, stress_engine=stress_engine,
+            smart_emotion=smart_emotion,
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -3768,6 +4190,27 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             continue
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю (silero_rest): {title} -> {fname}")
+
+        _chapter_para_prosody = {}
+        if smart_emotion:
+            chapter_paras = [p for p in text.split("\n") if p.strip()]
+            _emo_creds = emotion_attribution if emotion_attribution is not None else attribution
+            try:
+                emo_labels = classify_paragraph_emotions_llm(
+                    chapter_paras, allowed_emotions=list(SILERO_EMOTION_PROSODY.keys()),
+                    api_key=(_emo_creds or {}).get("api_key", ""),
+                    model=(_emo_creds or {}).get("model", DEFAULT_ATTRIBUTION_MODEL),
+                    provider=(_emo_creds or {}).get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
+                    folder_id=(_emo_creds or {}).get("folder_id", ""),
+                    log_fn=log,
+                )
+                _chapter_para_prosody = {
+                    p: SILERO_EMOTION_PROSODY[lbl] for p, lbl in zip(chapter_paras, emo_labels)
+                }
+                log(f"smart_emotion: определены эмоции для {len(chapter_paras)} абзац(ев) главы.")
+            except Exception as e:
+                log(f"smart_emotion не удался ({e}) — глава озвучивается без эмоциональной окраски.")
+                _chapter_para_prosody = {}
 
         # Группируем по голосу (диалоги/повествование и/или LLM-атрибуция
         # по персонажам, см. attribution), затем каждую группу — как
@@ -4442,7 +4885,16 @@ def main():
     ap.add_argument("--no-ruaccent", action="store_true",
                      help="не использовать RUAccent в дополнение к встроенному в Silero "
                           "put_accent в silero-режиме (по умолчанию используется, если "
-                          "пакет ruaccent установлен)")
+                          "пакет ruaccent установлен) — то же самое, что --stress-engine none")
+    ap.add_argument("--stress-engine", type=str, default="ruaccent",
+                     choices=["ruaccent", "silero_stress", "hybrid", "none"],
+                     help="движок автоматической расстановки ударений (сверх словаря "
+                          "stress_dict и put_accent) для silero/silero_rest-режимов: "
+                          "'ruaccent' (по умолчанию, как раньше) / 'silero_stress' (новая "
+                          "модель от Silero, https://github.com/snakers4/silero-stress, "
+                          "полная замена RUAccent) / 'hybrid' (RUAccent как основа + "
+                          "silero-stress только для слов-омографов из "
+                          "ambiguous_stress_words_ru.txt) / 'none' (ничего из этого)")
     ap.add_argument("--stress-dict", type=str, default="",
                      help="свой словарь ударений (JSON: {\"слово\": \"сл+ово\"}) для "
                           "silero-режима — приоритетнее RUAccent, для имён/терминов книги. "
@@ -4480,7 +4932,20 @@ def main():
                      help="голос Yandex SpeechKit (режим yandex)")
     ap.add_argument("--yandex-emotion", type=str, default="",
                      help="эмоция для голосов, которые её поддерживают (ermil, jane): "
-                          "good, neutral, evil")
+                          "good, neutral, evil — единая на всю озвучку. Игнорируется, если "
+                          "задан --yandex-smart-emotion")
+    ap.add_argument("--yandex-smart-emotion", action="store_true",
+                     help="вместо единой --yandex-emotion — LLM (тот же ключ/провайдер, что и "
+                          "--attribution-provider) сама определяет эмоцию КАЖДОГО абзаца по "
+                          "смыслу текста (режим yandex, только для голосов ermil/jane; для "
+                          "остальных голосов Yandex эмоции не поддерживает вообще, флаг "
+                          "тихо игнорируется)")
+    ap.add_argument("--smart-emotion", action="store_true",
+                     help="режим silero_rest: LLM (тот же ключ/провайдер, что и "
+                          "--attribution-provider) определяет эмоцию КАЖДОГО абзаца по смыслу "
+                          "текста и озвучивает его через SSML <prosody rate/pitch> (см. "
+                          "SILERO_EMOTION_PROSODY) — тоньше, чем фиксированные паузы/усиление "
+                          "вопросов-восклицаний. При ошибке LLM глава озвучивается как обычно.")
     ap.add_argument("--yandex-speed", type=float, default=1.0,
                      help="скорость речи Yandex SpeechKit, от 0.1 до 3.0 (по умолчанию 1.0)")
     ap.add_argument("--yandex-dialogue-voices", type=str, default="",
@@ -4605,7 +5070,8 @@ def main():
                    put_accent=not args.no_accent, put_yo=not args.no_yo,
                    chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
                    attribution=attribution,
-                   use_ruaccent=not args.no_ruaccent, emphasize=not args.no_emphasis,
+                   stress_engine=("none" if args.no_ruaccent else args.stress_engine),
+                   emphasize=not args.no_emphasis,
                    stress_dict_path=args.stress_dict or None,
                    use_vad_trim=not args.no_vad_trim,
                    use_stress_online=args.stress_online,
@@ -4619,7 +5085,9 @@ def main():
                          stress_dict_path=args.stress_dict or None,
                          use_vad_trim=not args.no_vad_trim,
                          use_stress_online=args.stress_online,
-                         book_stress_overrides_path=book_manual_stress_overrides_path(args.book))
+                         book_stress_overrides_path=book_manual_stress_overrides_path(args.book),
+                         stress_engine=("none" if args.no_ruaccent else args.stress_engine),
+                         smart_emotion=args.smart_emotion)
     elif args.mode == "cosyvoice":
         cosyvoice_dialogue_voices = [v.strip() for v in args.cosyvoice_dialogue_voices.split(",") if v.strip()] or None
         run_cosyvoice(chapters, args.outdir, args.start, args.cosyvoice_voice, args.sample_rate, args.play,
@@ -4642,7 +5110,7 @@ def main():
         run_yandex(chapters, args.outdir, args.start, args.play, api_key, folder_id,
                    voice=args.yandex_voice, speed=args.yandex_speed, emotion=args.yandex_emotion,
                    chapter_indices=chapter_indices, dialogue_voices=dialogue_voices,
-                   attribution=attribution)
+                   attribution=attribution, smart_emotion=args.yandex_smart_emotion)
     elif args.mode == "qwen_tts":
         api_key = args.qwen_api_key or os.environ.get("DASHSCOPE_API_KEY", "")
         dialogue_voices = [v.strip() for v in args.qwen_dialogue_voices.split(",") if v.strip()] or None
