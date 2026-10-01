@@ -120,12 +120,14 @@ SETTINGS_FIELDS = [
     "cosyvoice_rest_url_var", "cosyvoice_engine_var",
     "sentence_break_var", "paragraph_break_var", "comma_break_var",
     "accent_var", "yo_var", "emphasis_var", "stress_engine_var", "smart_emotion_var",
+    "stress_ollama_model_var",
     "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
     "yandex_emotion_var", "yandex_smart_emotion_var",
     "qwen_api_key_var", "qwen_voice_var",
     "qwen_local_url_var", "qwen_local_start_cmd_var", "qwen_local_auto_stop_var",
     "dialogue_var", "attribution_var", "attribution_provider_var",
     "attribution_api_key_var", "attribution_model_var", "attribution_folder_id_var",
+    "ollama_host_var",
 ]
 
 
@@ -216,6 +218,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self._on_dialogue_toggle()
         self._on_attribution_toggle()
         self._on_attribution_provider_change(reset_model=False)
+        self._on_stress_engine_change()
 
     def _save_settings(self):
         """Сохраняет текущие настройки в JSON-файл рядом со скриптом —
@@ -789,8 +792,15 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.attribution_api_key_entry.configure(state=state)
         self.attribution_model_entry.configure(state=state)
         self.attribution_folder_id_entry.configure(state=state)
+        self.attribution_ollama_host_entry.configure(state=state)
         self.attribution_use_yandex_btn.configure(state=state)
         self.attribution_provider_combo.configure(state="readonly" if self.attribution_var.get() else "disabled")
+
+    def _on_stress_engine_change(self):
+        if self.stress_engine_var.get() == "ollama":
+            self.stress_ollama_row.grid()
+        else:
+            self.stress_ollama_row.grid_remove()
 
     def _current_attribution_provider_key(self):
         return self._attribution_provider_by_title.get(
@@ -805,7 +815,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.attribution_key_hint_label.configure(text=info["key_hint"])
         key_labels = {
             "yandexgpt": "Yandex API-ключ:", "gemini": "Google API-ключ:",
-            "anthropic": "Anthropic API-ключ:",
+            "anthropic": "Anthropic API-ключ:", "ollama": "API-ключ (не используется):",
         }
         self.attribution_key_label.configure(text=key_labels.get(provider, "API-ключ:"))
         needs_folder = provider == "yandexgpt"
@@ -815,26 +825,35 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         else:
             self.attribution_folder_label.master.pack_forget()
             self.attribution_use_yandex_btn.pack_forget()
+        if provider == "ollama":
+            self.attribution_ollama_host_label.master.pack(fill="x", pady=(2, 2))
+        else:
+            self.attribution_ollama_host_label.master.pack_forget()
 
     def _selected_attribution(self, ignore_checkbox: bool = False):
-        """{"api_key":..., "model":..., "provider":...}, если включена галочка
-        «Определять, какой персонаж говорит» и есть ключ — иначе None
-        (тогда голоса для диалогов просто чередуются по кругу, без LLM).
+        """{"api_key":..., "model":..., "provider":..., "folder_id":...,
+        "ollama_host":...}, если включена галочка «Определять, какой
+        персонаж говорит» и (есть ключ, либо провайдер — локальный Ollama,
+        которому ключ не нужен) — иначе None (тогда голоса для диалогов
+        просто чередуются по кругу, без LLM).
 
         ignore_checkbox=True — использовать те же поля ключа/модели/провайдера
-        независимо от этой галочки: нужно для «умной эмоции» Yandex
-        (--yandex-smart-emotion), которая пользуется тем же LLM-ключом, но не
-        обязана требовать одновременно включённой атрибуции говорящих."""
+        независимо от этой галочки: нужно для «умной эмоции» Yandex/Silero
+        (--yandex-smart-emotion/--smart-emotion), которая пользуется тем же
+        LLM-ключом, но не обязана требовать одновременно включённой
+        атрибуции говорящих."""
         if not ignore_checkbox and not self.attribution_var.get():
             return None
-        api_key = self.attribution_api_key_var.get().strip()
-        if not api_key:
-            return None
         provider = self._current_attribution_provider_key()
+        api_key = self.attribution_api_key_var.get().strip()
+        if not api_key and provider != "ollama":
+            return None
         model = self.attribution_model_var.get().strip() \
             or ATTRIBUTION_PROVIDERS[provider]["default_model"]
         folder_id = self.attribution_folder_id_var.get().strip()
-        return {"api_key": api_key, "model": model, "provider": provider, "folder_id": folder_id}
+        ollama_host = self.ollama_host_var.get().strip()
+        return {"api_key": api_key, "model": model, "provider": provider,
+                "folder_id": folder_id, "ollama_host": ollama_host}
 
     def _selected_dialogue_voices(self):
         """Список ключей голосов для диалогов в текущем режиме, если
@@ -1460,6 +1479,8 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         put_accent=self.accent_var.get(),
                         put_yo=self.yo_var.get(),
                         stress_engine=self.stress_engine_var.get(),
+                        stress_ollama_model=self.stress_ollama_model_var.get().strip(),
+                        stress_ollama_host=self.ollama_host_var.get().strip(),
                         on_progress=self._on_synthesis_progress,
                         chapter_indices=chapter_indices,
                         char_ranges=char_ranges,
@@ -1511,6 +1532,8 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                             if self.book_path else None
                         ),
                         stress_engine=self.stress_engine_var.get(),
+                        stress_ollama_model=self.stress_ollama_model_var.get().strip(),
+                        stress_ollama_host=self.ollama_host_var.get().strip(),
                         smart_emotion=self.smart_emotion_var.get(),
                         emotion_attribution=self._selected_attribution(ignore_checkbox=True),
                     )

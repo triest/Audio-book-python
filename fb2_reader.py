@@ -606,6 +606,7 @@ ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 GEMINI_GENERATE_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 YANDEXGPT_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 
 ATTRIBUTION_PROVIDERS = {
     "yandexgpt": {
@@ -629,6 +630,16 @@ ATTRIBUTION_PROVIDERS = {
         "default_model": "claude-haiku-4-5",
         "key_hint": "Платный ключ: console.anthropic.com/settings/keys (нужна привязанная "
                      "иностранная карта — из России оплатить напрямую обычно нельзя).",
+    },
+    "ollama": {
+        "title": "Ollama (локально на вашей машине, бесплатно, без ключа)",
+        "default_model": "qwen2.5:7b-instruct",
+        "key_hint": "Ключ не нужен — используется уже запущенный локально Ollama "
+                     "(ollama.com, команда 'ollama serve') и заранее скачанная модель "
+                     "(например 'ollama pull qwen2.5:7b-instruct'). Поле 'API-ключ' можно "
+                     "оставить пустым или вписать туда что угодно — не используется. Укажите "
+                     "имя установленной модели в поле ниже и, если Ollama слушает не на "
+                     "localhost:11434, адрес сервера (поле 'Адрес Ollama').",
     },
 }
 DEFAULT_ATTRIBUTION_PROVIDER = "yandexgpt"
@@ -941,17 +952,97 @@ def attribute_speakers_yandexgpt(text: str, api_key: str, model: str, folder_id:
     return _normalize_attribution_results(results, dialogue_count, log_fn)
 
 
+def _ollama_chat_request(prompt: str, model: str, host: str = "", log_fn=None, timeout=180) -> str:
+    """Отправляет один запрос в локальный Ollama (/api/chat, без стриминга)
+    и возвращает текст ответа. Общий HTTP-транспорт для всех трёх
+    LLM-фич проекта, которые умеют работать через Ollama (атрибуция
+    говорящих, умная эмоция, расстановка ударений-омографов) — так же, как
+    attribute_speakers_{anthropic,gemini,yandexgpt} делят ANTHROPIC_MESSAGES_URL
+    и т.п. Ошибки подключения (Ollama не запущена, не тот адрес) и ошибки
+    модели (не скачана) оборачиваются в понятное сообщение."""
+    import requests
+
+    if not model:
+        raise ValueError(
+            "Не указана модель Ollama. Укажите имя заранее скачанной модели "
+            "(например 'qwen2.5:7b-instruct', 'ollama pull qwen2.5:7b-instruct')."
+        )
+    host = (host or OLLAMA_HOST_DEFAULT).rstrip("/")
+    try:
+        resp = requests.post(
+            f"{host}/api/chat",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": 0.1},
+            },
+            timeout=timeout,
+        )
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            f"Не удалось подключиться к Ollama по адресу {host} ({e}). Проверьте, что Ollama "
+            "запущена (команда 'ollama serve' или запущенное приложение Ollama) и адрес "
+            "указан верно (по умолчанию http://localhost:11434)."
+        )
+    if resp.status_code >= 400:
+        body = resp.text[:1000]
+        if log_fn:
+            log_fn(f"Ollama ({host}) ответила HTTP {resp.status_code}: {body}")
+        raise RuntimeError(
+            f"Ollama вернула ошибку HTTP {resp.status_code}: {body[:500]}\n"
+            f"  Если ошибка про модель {model!r} — скачайте её: 'ollama pull {model}'."
+        )
+    data = resp.json()
+    content = (data.get("message") or {}).get("content", "")
+    if not content:
+        raise RuntimeError(f"Ollama не вернула текст ответа (ответ: {str(data)[:500]})")
+    return content
+
+
+def attribute_speakers_ollama(text: str, model: str, host: str = "", log_fn=None) -> list:
+    """То же самое через локальный Ollama (ollama.com) — работает полностью
+    офлайн/бесплатно на машине пользователя, но без строгого function
+    calling у большинства моделей просим вернуть JSON текстом и парсим его
+    сами, как и для YandexGPT (см. _extract_json_array)."""
+    dialogue_count = _attribution_dialogue_count(text)
+    if dialogue_count == 0:
+        return []
+
+    prompt = (
+        _attribution_prompt(text, dialogue_count) +
+        "\n\nВерни ОТВЕТ СТРОГО в виде JSON-массива строк, без каких-либо пояснений, "
+        "markdown-разметки или текста до/после — только сам массив, например: "
+        '["Иван Петров", "unknown", "Мария"]'
+    )
+    if log_fn:
+        log_fn(f"Атрибуция говорящих через Ollama ({model}): {dialogue_count} реплик, "
+               f"{len(text)} симв. текста главы...")
+
+    raw_text = _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+    results = _extract_json_array(raw_text)
+    if results is None:
+        raise RuntimeError(
+            f"Ollama вернула ответ, из которого не удалось извлечь список говорящих "
+            f"(ответ модели: {raw_text[:500]})"
+        )
+    return _normalize_attribution_results(results, dialogue_count, log_fn)
+
+
 def attribute_speakers_llm(text: str, api_key: str, model: str = DEFAULT_ATTRIBUTION_MODEL,
                             provider: str = DEFAULT_ATTRIBUTION_PROVIDER, log_fn=None,
-                            folder_id: str = "") -> list:
+                            folder_id: str = "", ollama_host: str = "") -> list:
     """Диспетчер: вызывает attribute_speakers_yandexgpt (по умолчанию,
     работает из РФ без VPN), attribute_speakers_gemini (бесплатно, но
-    часто недоступен из РФ) или attribute_speakers_anthropic (платно), в
-    зависимости от provider — см. ATTRIBUTION_PROVIDERS."""
+    часто недоступен из РФ), attribute_speakers_anthropic (платно) или
+    attribute_speakers_ollama (локально, бесплатно, нужен запущенный
+    Ollama), в зависимости от provider — см. ATTRIBUTION_PROVIDERS."""
     if provider == "yandexgpt":
         return attribute_speakers_yandexgpt(text, api_key, model, folder_id=folder_id, log_fn=log_fn)
     if provider == "anthropic":
         return attribute_speakers_anthropic(text, api_key, model, log_fn=log_fn)
+    if provider == "ollama":
+        return attribute_speakers_ollama(text, model, host=ollama_host, log_fn=log_fn)
     return attribute_speakers_gemini(text, api_key, model, log_fn=log_fn)
 
 
@@ -1116,9 +1207,20 @@ def classify_paragraph_emotions_yandexgpt(paragraphs, api_key, model, allowed_em
     return _normalize_emotion_results(results, len(paragraphs), allowed_emotions, log_fn)
 
 
+def classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions, host: str = "",
+                                        log_fn=None) -> "list[str]":
+    """То же самое через локальный Ollama — см. attribute_speakers_ollama."""
+    prompt = _emotion_prompt(paragraphs, allowed_emotions)
+    raw_text = _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+    results = _extract_json_array(raw_text)
+    if results is None:
+        raise RuntimeError(f"Ollama не вернула распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
+    return _normalize_emotion_results(results, len(paragraphs), allowed_emotions, log_fn)
+
+
 def classify_paragraph_emotions_llm(paragraphs, allowed_emotions, api_key, model=DEFAULT_ATTRIBUTION_MODEL,
                                      provider=DEFAULT_ATTRIBUTION_PROVIDER, folder_id: str = "",
-                                     log_fn=None) -> "list[str]":
+                                     ollama_host: str = "", log_fn=None) -> "list[str]":
     """Диспетчер, аналогичный attribute_speakers_llm — определяет эмоцию
     КАЖДОГО абзаца из paragraphs (список строк) из набора allowed_emotions
     (см. YANDEX_EMOTION_VOICES), тем же провайдером/ключом, что и атрибуция
@@ -1130,6 +1232,9 @@ def classify_paragraph_emotions_llm(paragraphs, allowed_emotions, api_key, model
                                                        folder_id=folder_id, log_fn=log_fn)
     if provider == "anthropic":
         return classify_paragraph_emotions_anthropic(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
+    if provider == "ollama":
+        return classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions,
+                                                    host=ollama_host, log_fn=log_fn)
     return classify_paragraph_emotions_gemini(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
 
 
@@ -1238,6 +1343,7 @@ def resolve_voice_groups(text: str, main_voice, dialogue_voices, outdir: Path,
             text, attribution.get("api_key", ""), attribution.get("model", DEFAULT_ATTRIBUTION_MODEL),
             provider=attribution.get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
             folder_id=attribution.get("folder_id", ""),
+            ollama_host=attribution.get("ollama_host", ""),
             log_fn=log_fn,
         )
     except Exception as e:
@@ -1610,6 +1716,7 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
                     model=(_emo_creds or {}).get("model", DEFAULT_ATTRIBUTION_MODEL),
                     provider=(_emo_creds or {}).get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
                     folder_id=(_emo_creds or {}).get("folder_id", ""),
+                    ollama_host=(_emo_creds or {}).get("ollama_host", ""),
                     log_fn=log,
                 )
                 para_emotion_map = dict(zip(all_paras, para_emotion_list))
@@ -3369,6 +3476,92 @@ def _silero_stress_omograph_overrides(text: str, accentor) -> dict:
     return overrides
 
 
+_ollama_stress_cache: dict = {}
+
+
+def _ollama_stress_prompt(items: "list[tuple[str, str]]") -> str:
+    numbered = "\n".join(f"{i + 1}. слово «{w}», контекст: «...{ctx}...»" for i, (w, ctx) in enumerate(items))
+    return (
+        "Ниже — пронумерованный список русских слов-омографов (слов с неоднозначным "
+        "ударением в зависимости от смысла/падежа) вместе с контекстом их употребления в "
+        "книге. Для КАЖДОГО слова определи правильное ударение по смыслу контекста и верни "
+        "ТО ЖЕ САМОЕ слово (та же словоформа, без изменений) с символом '+' перед ударной "
+        "гласной буквой, например: 'за+мок' (сооружение) или 'замо+к' (на двери).\n\n"
+        f"Верни ОТВЕТ СТРОГО в виде JSON-массива строк длиной ровно {len(items)} — по одному "
+        "слову с расставленным '+' на каждый пункт списка, в том же порядке, без каких-либо "
+        "пояснений, markdown-разметки или текста до/после массива.\n\n" + numbered
+    )
+
+
+def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None) -> dict:
+    """Аналог _silero_stress_omograph_overrides (движок ударений 'ollama'):
+    вместо статической модели silero-stress ударение слов-омографов из
+    ambiguous_stress_words_ru.txt определяет локальная LLM через Ollama, по
+    контексту конкретного употребления в этом куске текста — у LLM, в
+    отличие от словаря/модели расстановки ударений, есть доступ к смыслу
+    всего предложения, а не только к форме слова. RUAccent по-прежнему
+    расставляет ударения во всём остальном тексте, как и в режиме 'hybrid'.
+
+    Результаты кэшируются в памяти процесса по (модель, адрес, слово,
+    контекст) — одинаковые фразы (например, повторяющиеся обращения) не
+    запрашиваются у Ollama повторно. При любой ошибке (Ollama не запущена,
+    модель не скачана, неожиданный ответ) — тихо возвращает {} и пишет
+    предупреждение в лог, не прерывая синтез."""
+    if not model:
+        return {}
+    ambiguous = _load_ambiguous_stress_words()
+    if not ambiguous:
+        return {}
+    src_words = _STRESS_WORD_RE.findall(text)
+    lower_text = text.lower()
+    items = []
+    seen_words = set()
+    for w in src_words:
+        low = w.lower()
+        if low not in ambiguous or low in seen_words:
+            continue
+        seen_words.add(low)
+        idx = lower_text.find(low)
+        if idx < 0:
+            continue
+        start = max(0, idx - 60)
+        end = min(len(text), idx + len(low) + 60)
+        ctx = text[start:end].replace("\n", " ").strip()
+        items.append((low, ctx))
+    if not items:
+        return {}
+
+    cache_key_prefix = (model, host or OLLAMA_HOST_DEFAULT)
+    to_query = [(w, ctx) for w, ctx in items if (cache_key_prefix, w, ctx) not in _ollama_stress_cache]
+    if to_query:
+        prompt = _ollama_stress_prompt(to_query)
+        try:
+            raw_text = _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+            results = _extract_json_array(raw_text)
+        except Exception as e:
+            if log_fn:
+                log_fn(f"Ollama (расстановка ударений) недоступна ({e}) — пропускаю для этого "
+                       "фрагмента, остальной текст по-прежнему обрабатывает RUAccent.")
+            results = None
+        if results is not None and len(results) == len(to_query):
+            for (w, ctx), out in zip(to_query, results):
+                out = str(out).strip().lower()
+                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = out if "+" in out else None
+        else:
+            if results is not None and log_fn:
+                log_fn(f"Ollama вернула {len(results)} ответов вместо {len(to_query)} — "
+                       "пропускаю расстановку ударений для этого фрагмента.")
+            for w, ctx in to_query:
+                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = None
+
+    overrides = {}
+    for w, ctx in items:
+        out = _ollama_stress_cache.get((cache_key_prefix, w, ctx))
+        if out:
+            overrides[w] = out
+    return overrides
+
+
 def _emphasis_kind(part_text: str) -> "str | None":
     """По завершающему знаку куска текста определяет, нужно ли усилить
     интонацию — "question" для "?", "exclaim" для "!". Возвращает None,
@@ -3525,7 +3718,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                stress_engine: str = "ruaccent", stress_dict_path: "Path | str | None" = None,
                emphasize: bool = True, use_vad_trim: bool = True,
                use_stress_online: bool = False,
-               book_stress_overrides_path: "Path | str | None" = None):
+               book_stress_overrides_path: "Path | str | None" = None,
+               stress_ollama_model: str = "", stress_ollama_host: str = ""):
     """Озвучка через Silero TTS — нейросетевой русский голос, локально.
     По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
 
@@ -3556,9 +3750,13 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     stress_engine — какой движок расставляет ударения помимо словаря
     (stress_dict) и встроенного в Silero put_accent: "ruaccent" (по
     умолчанию, как раньше), "silero_stress" (полная замена RUAccent на
-    silero-stress) или "hybrid" (RUAccent как основа + silero-stress только
-    для слов-омографов из ambiguous_stress_words_ru.txt). "none" (или любое
-    другое значение) — не использовать ни один из них, как раньше --no-ruaccent.
+    silero-stress), "hybrid" (RUAccent как основа + silero-stress только
+    для слов-омографов из ambiguous_stress_words_ru.txt) или "ollama"
+    (RUAccent как основа + локальная LLM через Ollama решает ударение
+    омографов по смыслу контекста конкретного предложения — требует
+    запущенного Ollama и модели в stress_ollama_model/stress_ollama_host).
+    "none" (или любое другое значение) — не использовать ни один из них,
+    как раньше --no-ruaccent.
     stress_dict_path — свой словарь
     "слово": "сл+ово" (JSON) для конкретных имён/терминов книги, которые
     ни RUAccent, ни Silero не знают; словарь применяется раньше RUAccent и
@@ -3577,7 +3775,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
     stress_engine = (stress_engine or "ruaccent").lower()
-    accentizer = _load_ruaccent() if stress_engine in ("ruaccent", "hybrid") else None
+    accentizer = _load_ruaccent() if stress_engine in ("ruaccent", "hybrid", "ollama") else None
     silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid") else None
     if stress_dict:
         print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
@@ -3633,6 +3831,9 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         _case_overrides.update(resolve_lemma_homographs(part_text))
         if stress_engine == "hybrid" and silero_stress_accentor is not None:
             _case_overrides.update(_silero_stress_omograph_overrides(part_text, silero_stress_accentor))
+        if stress_engine == "ollama":
+            _case_overrides.update(_ollama_stress_overrides(
+                part_text, stress_ollama_model, host=stress_ollama_host, log_fn=print))
         _effective_stress_dict = stress_dict
         if _case_overrides:
             _effective_stress_dict = dict(stress_dict)
@@ -3921,6 +4122,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                      use_vad_trim: bool = True, use_stress_online: bool = False,
                      book_stress_overrides_path: "Path | str | None" = None,
                      stress_engine: str = "ruaccent",
+                     stress_ollama_model: str = "", stress_ollama_host: str = "",
                      smart_emotion: bool = False, emotion_attribution=None):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
@@ -4072,6 +4274,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         if stress_engine == "hybrid" and silero_stress_accentor is not None:
             effective_dict = dict(effective_dict)
             effective_dict.update(_silero_stress_omograph_overrides(plain_text_chunk, silero_stress_accentor))
+        if stress_engine == "ollama":
+            effective_dict = dict(effective_dict)
+            effective_dict.update(_ollama_stress_overrides(
+                plain_text_chunk, stress_ollama_model, host=stress_ollama_host, log_fn=print))
         if stress_engine == "silero_stress" and silero_stress_accentor is not None:
             protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, effective_dict)
             protected = apply_silero_stress(protected, silero_stress_accentor)
@@ -4202,6 +4408,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                     model=(_emo_creds or {}).get("model", DEFAULT_ATTRIBUTION_MODEL),
                     provider=(_emo_creds or {}).get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
                     folder_id=(_emo_creds or {}).get("folder_id", ""),
+                    ollama_host=(_emo_creds or {}).get("ollama_host", ""),
                     log_fn=log,
                 )
                 _chapter_para_prosody = {
@@ -4887,14 +5094,25 @@ def main():
                           "put_accent в silero-режиме (по умолчанию используется, если "
                           "пакет ruaccent установлен) — то же самое, что --stress-engine none")
     ap.add_argument("--stress-engine", type=str, default="ruaccent",
-                     choices=["ruaccent", "silero_stress", "hybrid", "none"],
+                     choices=["ruaccent", "silero_stress", "hybrid", "ollama", "none"],
                      help="движок автоматической расстановки ударений (сверх словаря "
                           "stress_dict и put_accent) для silero/silero_rest-режимов: "
                           "'ruaccent' (по умолчанию, как раньше) / 'silero_stress' (новая "
                           "модель от Silero, https://github.com/snakers4/silero-stress, "
                           "полная замена RUAccent) / 'hybrid' (RUAccent как основа + "
                           "silero-stress только для слов-омографов из "
-                          "ambiguous_stress_words_ru.txt) / 'none' (ничего из этого)")
+                          "ambiguous_stress_words_ru.txt) / 'ollama' (RUAccent как основа + "
+                          "локальная LLM через Ollama решает ударение омографов по смыслу "
+                          "контекста, см. --stress-ollama-model/--ollama-host) / 'none' "
+                          "(ничего из этого)")
+    ap.add_argument("--stress-ollama-model", type=str, default="",
+                     help="модель Ollama для --stress-engine ollama (например "
+                          "'qwen2.5:7b-instruct') — должна быть заранее скачана "
+                          "('ollama pull <модель>')")
+    ap.add_argument("--ollama-host", type=str, default="",
+                     help="адрес сервера Ollama, если не стандартный http://localhost:11434 "
+                          "— используется и для --stress-engine ollama, и для "
+                          "--attribution-provider ollama")
     ap.add_argument("--stress-dict", type=str, default="",
                      help="свой словарь ударений (JSON: {\"слово\": \"сл+ово\"}) для "
                           "silero-режима — приоритетнее RUAccent, для имён/терминов книги. "
@@ -4978,8 +5196,10 @@ def main():
                      choices=list(ATTRIBUTION_PROVIDERS.keys()),
                      help="сервис для определения, какой персонаж говорит каждую реплику "
                           "диалога: yandexgpt (работает из РФ без VPN, есть бесплатный лимит), "
-                          "gemini (Google, бесплатно, но часто недоступен из РФ) или anthropic "
-                          f"(Claude, платно). По умолчанию {DEFAULT_ATTRIBUTION_PROVIDER}.")
+                          "gemini (Google, бесплатно, но часто недоступен из РФ), anthropic "
+                          "(Claude, платно) или ollama (локально на вашей машине, бесплатно, "
+                          "без ключа, нужен запущенный Ollama — см. --ollama-host и "
+                          f"--attribution-model). По умолчанию {DEFAULT_ATTRIBUTION_PROVIDER}.")
     ap.add_argument("--attribution-api-key", type=str, default="",
                      help="API-ключ для выбранного --attribution-provider (для yandexgpt можно "
                           "использовать тот же ключ, что и --yandex-api-key); можно также "
@@ -5057,7 +5277,8 @@ def main():
     attribution = {
         "api_key": attribution_api_key, "model": attribution_model,
         "provider": attribution_provider, "folder_id": attribution_folder_id,
-    } if attribution_api_key else None
+        "ollama_host": args.ollama_host,
+    } if (attribution_api_key or attribution_provider == "ollama") else None
 
     if args.mode == "online":
         run_online(chapters, args.outdir, args.play, args.start, voice_lang="ru",
@@ -5071,6 +5292,7 @@ def main():
                    chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
                    attribution=attribution,
                    stress_engine=("none" if args.no_ruaccent else args.stress_engine),
+                   stress_ollama_model=args.stress_ollama_model, stress_ollama_host=args.ollama_host,
                    emphasize=not args.no_emphasis,
                    stress_dict_path=args.stress_dict or None,
                    use_vad_trim=not args.no_vad_trim,
@@ -5087,6 +5309,7 @@ def main():
                          use_stress_online=args.stress_online,
                          book_stress_overrides_path=book_manual_stress_overrides_path(args.book),
                          stress_engine=("none" if args.no_ruaccent else args.stress_engine),
+                         stress_ollama_model=args.stress_ollama_model, stress_ollama_host=args.ollama_host,
                          smart_emotion=args.smart_emotion)
     elif args.mode == "cosyvoice":
         cosyvoice_dialogue_voices = [v.strip() for v in args.cosyvoice_dialogue_voices.split(",") if v.strip()] or None

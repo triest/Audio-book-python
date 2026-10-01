@@ -298,13 +298,45 @@ community-issue (`FunAudioLLM/CosyVoice#1704`):
   ТОЛЬКО для слов из `ambiguous_stress_words_ru.txt` (омографы) —
   результат подмешивается в эффективный словарь ударений перед RUAccent,
   как и `resolve_case_ambiguous_nouns`/`resolve_lemma_homographs`.
+- `ollama` (октябрь 2026) — тот же принцип, что и `hybrid` (RUAccent —
+  основа, подмена только для слов из `ambiguous_stress_words_ru.txt`), но
+  вместо статической модели silero-stress ударение омографа по контексту
+  конкретного предложения определяет локальная LLM через уже запущенный
+  Ollama (пользователь держит его локально) — модель задаётся в GUI
+  (`stress_ollama_model_var`, показывается только при выборе `ollama`) или
+  флагом `--stress-ollama-model`, адрес сервера — `ollama_host_var`/
+  `--ollama-host` (по умолчанию `http://localhost:11434`, см.
+  `OLLAMA_HOST_DEFAULT`). В отличие от словаря/silero-stress, у LLM есть
+  доступ к смыслу всего предложения, а не только к форме слова — это
+  должно давать точность там, где два значения омографа неразличимы по
+  одной лишь словоформе (например "за+мок" vs "замо+к").
 
 Реализация в `fb2_reader.py`: `_load_silero_stress`, `apply_silero_stress`,
-`_silero_stress_omograph_overrides`. В режиме `silero_rest` вся расстановка
-(кроме `ruaccent`) происходит НА КЛИЕНТЕ, до отправки текста на
-`silero_rest_service.py` — сам REST-сервис не менялся (по-прежнему всегда
-RUAccent, но не трогает уже проставленные клиентом "+"). `--no-ruaccent`
-в CLI трактуется как `--stress-engine none`.
+`_silero_stress_omograph_overrides` (silero-stress); `_ollama_chat_request`,
+`_ollama_stress_prompt`, `_ollama_stress_overrides` (Ollama — свой кэш в
+памяти процесса `_ollama_stress_cache`, чтобы не запрашивать одну и ту же
+фразу повторно). В режиме `silero_rest` вся расстановка (кроме `ruaccent`)
+происходит НА КЛИЕНТЕ, до отправки текста на `silero_rest_service.py` —
+сам REST-сервис не менялся (по-прежнему всегда RUAccent, но не трогает уже
+проставленные клиентом "+"). `--no-ruaccent` в CLI трактуется как
+`--stress-engine none`.
+
+### Ollama также как провайдер атрибуции говорящих и умной эмоции
+
+С октября 2026 `ollama` — четвёртый пункт в `ATTRIBUTION_PROVIDERS` (наравне
+с `yandexgpt`/`gemini`/`anthropic`), доступный и для атрибуции говорящих
+(`attribute_speakers_llm`/`attribute_speakers_ollama`), и для умной эмоции
+(`classify_paragraph_emotions_llm`/`classify_paragraph_emotions_ollama`) —
+эти две фичи и так делят один и тот же диспетчер/провайдера, см. раздел
+«Умная эмоция» выше. В отличие от остальных провайдеров, API-ключ не
+нужен (поле можно оставить пустым — `_selected_attribution` в GUI это
+учитывает отдельной веткой), но нужна заранее скачанная модель
+(`ollama pull <модель>`) и запущенный `ollama serve`/приложение Ollama;
+адрес сервера общий для атрибуции/эмоции и для `--stress-engine ollama`
+(`ollama_host_var`/`--ollama-host`). При ошибке (Ollama не запущена,
+модель не скачана, неожиданный ответ) — как и у остальных LLM-фич,
+тихий откат на простое чередование голосов / единую эмоцию, не срывая
+синтез главы.
 
 ## Рассмотренные и отложенные TTS-движки
 
