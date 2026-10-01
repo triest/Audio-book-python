@@ -315,6 +315,14 @@ community-issue (`FunAudioLLM/CosyVoice#1704`):
   `--ollama-host` (по умолчанию `http://localhost:11434`, см.
   `OLLAMA_HOST_DEFAULT`).
 
+  Отдельный нюанс (не везде есть буква "ё"): в тексте книги "ё" почти
+  всегда напечатана как "е" — часть омографов (например "все"/"всё")
+  различаются именно этой буквой, а не положением "+". Промпт
+  (`_ollama_stress_prompt`) явно просит LLM заменять "е" на "ё", когда
+  по смыслу ударение падает на неё, и не требовать для неё отдельного
+  "+" (она всегда ударная сама по себе) — валидным ответом считается
+  результат с "+" ИЛИ с буквой "ё" (см. проверку в `_ollama_stress_overrides`).
+
 Реализация в `fb2_reader.py`: `_load_silero_stress`, `apply_silero_stress`,
 `_silero_stress_omograph_overrides` (silero-stress); `_ollama_chat_request`,
 `_ollama_stress_prompt`, `_ollama_stress_overrides` (Ollama, принимает

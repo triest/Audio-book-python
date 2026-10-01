@@ -1,0 +1,22 @@
+{
+  "attribution": [
+    "ollama",
+    "qwen2.5:7b-instruct"
+  ],
+  "comma_break_ms": 180,
+  "dialogue_speakers": "",
+  "emphasize": true,
+  "max_chars": 350,
+  "mode": "silero",
+  "model": "v5_5_ru",
+  "paragraph_break_ms": 550,
+  "put_accent": true,
+  "put_yo": true,
+  "sample_rate": 48000,
+  "sentence_break_ms": 320,
+  "speaker": "xenia",
+  "stress_dict_size": 29419,
+  "stress_engine": "silero_stress",
+  "text_sha256": "85c8ac9eccc9b03b867e830d5dbe9f84c385714b0fb3f0ae3fdf9efcd7b30a3e",
+  "use_vad_trim": true
+}
