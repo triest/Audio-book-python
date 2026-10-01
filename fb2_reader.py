@@ -3479,34 +3479,53 @@ def _silero_stress_omograph_overrides(text: str, accentor) -> dict:
 _ollama_stress_cache: dict = {}
 
 
-def _ollama_stress_prompt(items: "list[tuple[str, str]]") -> str:
-    numbered = "\n".join(f"{i + 1}. слово «{w}», контекст: «...{ctx}...»" for i, (w, ctx) in enumerate(items))
+def _ollama_stress_prompt(items: "list[tuple[str, str, str]]") -> str:
+    """items: (слово, контекст, подсказка_от_silero_stress_или_""). Подсказка
+    передаётся LLM как мнение другой модели, а не как готовый ответ — чтобы
+    LLM могла с ней согласиться (обычный случай — она совпадает с контекстом)
+    либо поправить, если контекст говорит об обратном."""
+    lines = []
+    for i, (w, ctx, hint) in enumerate(items):
+        hint_part = f" (другая модель предполагает: «{hint}»)" if hint else ""
+        lines.append(f"{i + 1}. слово «{w}», контекст: «...{ctx}...»{hint_part}")
+    numbered = "\n".join(lines)
     return (
         "Ниже — пронумерованный список русских слов-омографов (слов с неоднозначным "
         "ударением в зависимости от смысла/падежа) вместе с контекстом их употребления в "
-        "книге. Для КАЖДОГО слова определи правильное ударение по смыслу контекста и верни "
-        "ТО ЖЕ САМОЕ слово (та же словоформа, без изменений) с символом '+' перед ударной "
-        "гласной буквой, например: 'за+мок' (сооружение) или 'замо+к' (на двери).\n\n"
+        "книге, и, где есть, предположение отдельной специализированной модели ударений — "
+        "она иногда ошибается, особенно если смысл неочевиден из одной словоформы, поэтому "
+        "решай по КОНТЕКСТУ, а не просто повторяй её предположение. Для КАЖДОГО слова "
+        "определи правильное ударение по смыслу контекста и верни ТО ЖЕ САМОЕ слово (та же "
+        "словоформа, без изменений) с символом '+' перед ударной гласной буквой, например: "
+        "'за+мок' (сооружение) или 'замо+к' (на двери).\n\n"
         f"Верни ОТВЕТ СТРОГО в виде JSON-массива строк длиной ровно {len(items)} — по одному "
         "слову с расставленным '+' на каждый пункт списка, в том же порядке, без каких-либо "
         "пояснений, markdown-разметки или текста до/после массива.\n\n" + numbered
     )
 
 
-def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None) -> dict:
+def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None,
+                              silero_stress_accentor=None) -> dict:
     """Аналог _silero_stress_omograph_overrides (движок ударений 'ollama'):
-    вместо статической модели silero-stress ударение слов-омографов из
-    ambiguous_stress_words_ru.txt определяет локальная LLM через Ollama, по
-    контексту конкретного употребления в этом куске текста — у LLM, в
-    отличие от словаря/модели расстановки ударений, есть доступ к смыслу
-    всего предложения, а не только к форме слова. RUAccent по-прежнему
-    расставляет ударения во всём остальном тексте, как и в режиме 'hybrid'.
+    ударение слов-омографов из ambiguous_stress_words_ru.txt определяет
+    локальная LLM через Ollama, по контексту конкретного употребления в
+    этом куске текста — у LLM, в отличие от словаря/модели расстановки
+    ударений, есть доступ к смыслу всего предложения, а не только к форме
+    слова. RUAccent по-прежнему расставляет ударения во всём остальном
+    тексте, как и в режиме 'hybrid'.
+
+    silero_stress_accentor — опционально (движок 'ollama' комбинируется с
+    silero-stress, если пакет установлен): её предположение по тому же
+    слову передаётся LLM как подсказка-мнение (не готовый ответ — см.
+    _ollama_stress_prompt) и используется как ОТКАТ, если сама Ollama
+    недоступна/вернула нераспознаваемый ответ — так комбинация надёжнее
+    любого из двух способов по отдельности, а не LLM "с нуля".
 
     Результаты кэшируются в памяти процесса по (модель, адрес, слово,
     контекст) — одинаковые фразы (например, повторяющиеся обращения) не
     запрашиваются у Ollama повторно. При любой ошибке (Ollama не запущена,
-    модель не скачана, неожиданный ответ) — тихо возвращает {} и пишет
-    предупреждение в лог, не прерывая синтез."""
+    модель не скачана, неожиданный ответ) — тихо откатывается на подсказку
+    silero-stress (если есть) или возвращает {}, не прерывая синтез."""
     if not model:
         return {}
     ambiguous = _load_ambiguous_stress_words()
@@ -3531,8 +3550,20 @@ def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None)
     if not items:
         return {}
 
+    # Подсказки от silero-stress — та же логика, что и в hybrid
+    # (_silero_stress_omograph_overrides), только результат не применяется
+    # напрямую, а идёт в промпт LLM и служит запасным вариантом.
+    silero_hints: dict = {}
+    if silero_stress_accentor is not None:
+        try:
+            silero_hints = _silero_stress_omograph_overrides(text, silero_stress_accentor)
+        except Exception as e:
+            if log_fn:
+                log_fn(f"silero-stress (подсказка для Ollama) не сработала ({e}) — продолжаю без неё.")
+
     cache_key_prefix = (model, host or OLLAMA_HOST_DEFAULT)
-    to_query = [(w, ctx) for w, ctx in items if (cache_key_prefix, w, ctx) not in _ollama_stress_cache]
+    items_with_hints = [(w, ctx, silero_hints.get(w, "")) for w, ctx in items]
+    to_query = [t for t in items_with_hints if (cache_key_prefix, t[0], t[1]) not in _ollama_stress_cache]
     if to_query:
         prompt = _ollama_stress_prompt(to_query)
         try:
@@ -3540,23 +3571,26 @@ def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None)
             results = _extract_json_array(raw_text)
         except Exception as e:
             if log_fn:
-                log_fn(f"Ollama (расстановка ударений) недоступна ({e}) — пропускаю для этого "
-                       "фрагмента, остальной текст по-прежнему обрабатывает RUAccent.")
+                log_fn(f"Ollama (расстановка ударений) недоступна ({e}) — "
+                       + ("использую подсказку silero-stress для этого фрагмента."
+                          if silero_hints else
+                          "пропускаю для этого фрагмента, остальной текст по-прежнему "
+                          "обрабатывает RUAccent."))
             results = None
         if results is not None and len(results) == len(to_query):
-            for (w, ctx), out in zip(to_query, results):
+            for (w, ctx, hint), out in zip(to_query, results):
                 out = str(out).strip().lower()
-                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = out if "+" in out else None
+                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = out if "+" in out else (hint or None)
         else:
             if results is not None and log_fn:
                 log_fn(f"Ollama вернула {len(results)} ответов вместо {len(to_query)} — "
-                       "пропускаю расстановку ударений для этого фрагмента.")
-            for w, ctx in to_query:
-                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = None
+                       "использую подсказки silero-stress там, где они есть.")
+            for w, ctx, hint in to_query:
+                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = hint or None
 
     overrides = {}
-    for w, ctx in items:
-        out = _ollama_stress_cache.get((cache_key_prefix, w, ctx))
+    for w, ctx, hint in items_with_hints:
+        out = _ollama_stress_cache.get((cache_key_prefix, w, ctx)) or hint
         if out:
             overrides[w] = out
     return overrides
@@ -3752,11 +3786,13 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     умолчанию, как раньше), "silero_stress" (полная замена RUAccent на
     silero-stress), "hybrid" (RUAccent как основа + silero-stress только
     для слов-омографов из ambiguous_stress_words_ru.txt) или "ollama"
-    (RUAccent как основа + локальная LLM через Ollama решает ударение
-    омографов по смыслу контекста конкретного предложения — требует
-    запущенного Ollama и модели в stress_ollama_model/stress_ollama_host).
-    "none" (или любое другое значение) — не использовать ни один из них,
-    как раньше --no-ruaccent.
+    (RUAccent как основа; для омографов — КОМБИНАЦИЯ: если silero-stress
+    установлена, её предположение передаётся локальной LLM через Ollama
+    как подсказка, а решает по смыслу контекста конкретного предложения
+    LLM — и служит откатом, если сама Ollama недоступна; без silero-stress
+    решает только LLM "с нуля". Требует запущенного Ollama и модели в
+    stress_ollama_model/stress_ollama_host). "none" (или любое другое
+    значение) — не использовать ни один из них, как раньше --no-ruaccent.
     stress_dict_path — свой словарь
     "слово": "сл+ово" (JSON) для конкретных имён/терминов книги, которые
     ни RUAccent, ни Silero не знают; словарь применяется раньше RUAccent и
@@ -3776,7 +3812,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
     stress_engine = (stress_engine or "ruaccent").lower()
     accentizer = _load_ruaccent() if stress_engine in ("ruaccent", "hybrid", "ollama") else None
-    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid") else None
+    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama") else None
     if stress_dict:
         print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
               f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
@@ -3833,7 +3869,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             _case_overrides.update(_silero_stress_omograph_overrides(part_text, silero_stress_accentor))
         if stress_engine == "ollama":
             _case_overrides.update(_ollama_stress_overrides(
-                part_text, stress_ollama_model, host=stress_ollama_host, log_fn=print))
+                part_text, stress_ollama_model, host=stress_ollama_host, log_fn=print,
+                silero_stress_accentor=silero_stress_accentor))
         _effective_stress_dict = stress_dict
         if _case_overrides:
             _effective_stress_dict = dict(stress_dict)
@@ -4188,7 +4225,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     # сервере; 'hybrid' и 'silero_stress' подмешивают/заменяют ударения
     # ДО отправки, а сервер лишь не трогает уже проставленные "+".
     stress_engine = (stress_engine or "ruaccent").lower()
-    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid") else None
+    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama") else None
 
     if dialogue_speakers:
         allowed = speakers_for_model(model_id)
@@ -4277,7 +4314,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         if stress_engine == "ollama":
             effective_dict = dict(effective_dict)
             effective_dict.update(_ollama_stress_overrides(
-                plain_text_chunk, stress_ollama_model, host=stress_ollama_host, log_fn=print))
+                plain_text_chunk, stress_ollama_model, host=stress_ollama_host, log_fn=print,
+                silero_stress_accentor=silero_stress_accentor))
         if stress_engine == "silero_stress" and silero_stress_accentor is not None:
             protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, effective_dict)
             protected = apply_silero_stress(protected, silero_stress_accentor)

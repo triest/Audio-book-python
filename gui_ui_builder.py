@@ -758,8 +758,8 @@ class UIBuilderMixin:
             intonation,
             text="ruaccent — как раньше; silero_stress — новая модель Silero целиком;\n"
                  "hybrid — RUAccent + silero-stress только для слов-омографов;\n"
-                 "ollama — RUAccent + локальная LLM (Ollama) решает ударение омографов по "
-                 "смыслу контекста",
+                 "ollama — RUAccent + для омографов: silero-stress (если установлена) как "
+                 "подсказка + локальная LLM (Ollama) решает по смыслу контекста",
             foreground="gray", justify="left",
         ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
 

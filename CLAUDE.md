@@ -300,20 +300,25 @@ community-issue (`FunAudioLLM/CosyVoice#1704`):
   как и `resolve_case_ambiguous_nouns`/`resolve_lemma_homographs`.
 - `ollama` (октябрь 2026) — тот же принцип, что и `hybrid` (RUAccent —
   основа, подмена только для слов из `ambiguous_stress_words_ru.txt`), но
-  вместо статической модели silero-stress ударение омографа по контексту
-  конкретного предложения определяет локальная LLM через уже запущенный
-  Ollama (пользователь держит его локально) — модель задаётся в GUI
+  решение для омографа — КОМБИНАЦИЯ, а не просто LLM вместо silero-stress:
+  если пакет silero-stress установлен, её предположение по слову сначала
+  считается (`_silero_stress_omograph_overrides`), затем передаётся
+  локальной LLM через Ollama КАК ПОДСКАЗКА ("другая модель предполагает: ...")
+  вместе с контекстом предложения — LLM видит и формальное предположение
+  модели ударений, и смысл текста, и либо соглашается, либо поправляет.
+  Подсказка silero-stress служит ещё и ОТКАТОМ: если сама Ollama
+  недоступна/вернула нераспознаваемый ответ — используется именно она, а
+  не пустой результат. Без установленной silero-stress движок работает как
+  чистая LLM "с нуля" (как было до этой комбинации). Модель задаётся в GUI
   (`stress_ollama_model_var`, показывается только при выборе `ollama`) или
   флагом `--stress-ollama-model`, адрес сервера — `ollama_host_var`/
   `--ollama-host` (по умолчанию `http://localhost:11434`, см.
-  `OLLAMA_HOST_DEFAULT`). В отличие от словаря/silero-stress, у LLM есть
-  доступ к смыслу всего предложения, а не только к форме слова — это
-  должно давать точность там, где два значения омографа неразличимы по
-  одной лишь словоформе (например "за+мок" vs "замо+к").
+  `OLLAMA_HOST_DEFAULT`).
 
 Реализация в `fb2_reader.py`: `_load_silero_stress`, `apply_silero_stress`,
 `_silero_stress_omograph_overrides` (silero-stress); `_ollama_chat_request`,
-`_ollama_stress_prompt`, `_ollama_stress_overrides` (Ollama — свой кэш в
+`_ollama_stress_prompt`, `_ollama_stress_overrides` (Ollama, принимает
+необязательный `silero_stress_accentor` для подсказки/отката — свой кэш в
 памяти процесса `_ollama_stress_cache`, чтобы не запрашивать одну и ту же
 фразу повторно). В режиме `silero_rest` вся расстановка (кроме `ruaccent`)
 происходит НА КЛИЕНТЕ, до отправки текста на `silero_rest_service.py` —
