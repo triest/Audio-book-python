@@ -503,14 +503,14 @@ class UIBuilderMixin:
 
         attr_ollama_host_row = ttk.Frame(attr_section)
         attr_ollama_host_row.pack(fill="x", pady=(2, 2))
-        self.attribution_ollama_host_label = ttk.Label(attr_ollama_host_row, text="Адрес Ollama:")
+        self.attribution_ollama_host_label = ttk.Label(attr_ollama_host_row, text="Адрес локального сервера (Ollama/LM Studio):")
         self.attribution_ollama_host_label.pack(side="left")
         self.ollama_host_var = tk.StringVar(value="")
         self.attribution_ollama_host_entry = add_context_menu(
             ttk.Entry(attr_ollama_host_row, textvariable=self.ollama_host_var)
         )
         self.attribution_ollama_host_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
-        ttk.Label(attr_ollama_host_row, text="(по умолчанию http://localhost:11434)",
+        ttk.Label(attr_ollama_host_row, text="(пусто = :11434 Ollama / :1234 LM Studio)",
                   foreground="#888").pack(side="left", padx=(6, 0))
 
         attr_model_row = ttk.Frame(attr_section)
@@ -752,7 +752,7 @@ class UIBuilderMixin:
         self.stress_engine_var = tk.StringVar(value="ruaccent")
         self.stress_engine_combo = ttk.Combobox(
             intonation, textvariable=self.stress_engine_var, state="readonly", width=16,
-            values=["ruaccent", "silero_stress", "hybrid", "ollama"],
+            values=["ruaccent", "silero_stress", "hybrid", "ollama", "lmstudio"],
         )
         self.stress_engine_combo.grid(row=irow, column=1, sticky="w", pady=3)
         self.stress_engine_combo.bind("<<ComboboxSelected>>", lambda e: self._on_stress_engine_change())
@@ -763,14 +763,15 @@ class UIBuilderMixin:
             text="ruaccent — как раньше; silero_stress — новая модель Silero целиком;\n"
                  "hybrid — RUAccent + silero-stress только для слов-омографов;\n"
                  "ollama — RUAccent + для омографов: silero-stress (если установлена) как "
-                 "подсказка + локальная LLM (Ollama) решает по смыслу контекста",
+                 "подсказка + локальная LLM (Ollama) решает по смыслу контекста;\n"
+                 "lmstudio — то же, но через локальный сервер LM Studio",
             foreground="gray", justify="left",
         ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
 
         irow += 1
         self.stress_ollama_row = ttk.Frame(intonation)
         self.stress_ollama_row.grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
-        ttk.Label(self.stress_ollama_row, text="Модель Ollama для ударений:").pack(side="left")
+        ttk.Label(self.stress_ollama_row, text="Модель (Ollama/LM Studio) для ударений:").pack(side="left")
         self.stress_ollama_model_var = tk.StringVar(value="qwen2.5:7b-instruct")
         self.stress_ollama_model_entry = add_context_menu(
             ttk.Entry(self.stress_ollama_row, textvariable=self.stress_ollama_model_var, width=22)

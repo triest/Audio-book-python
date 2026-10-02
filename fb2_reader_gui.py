@@ -799,7 +799,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.attribution_provider_combo.configure(state="readonly" if self.attribution_var.get() else "disabled")
 
     def _on_stress_engine_change(self):
-        if self.stress_engine_var.get() == "ollama":
+        if self.stress_engine_var.get() in ("ollama", "lmstudio"):
             self.stress_ollama_row.grid()
         else:
             self.stress_ollama_row.grid_remove()
@@ -818,6 +818,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         key_labels = {
             "yandexgpt": "Yandex API-ключ:", "gemini": "Google API-ключ:",
             "anthropic": "Anthropic API-ключ:", "ollama": "API-ключ (не используется):",
+            "lmstudio": "API-ключ (не используется):",
         }
         self.attribution_key_label.configure(text=key_labels.get(provider, "API-ключ:"))
         needs_folder = provider == "yandexgpt"
@@ -827,7 +828,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         else:
             self.attribution_folder_label.master.pack_forget()
             self.attribution_use_yandex_btn.pack_forget()
-        if provider == "ollama":
+        if provider in ("ollama", "lmstudio"):
             self.attribution_ollama_host_label.master.pack(fill="x", pady=(2, 2))
         else:
             self.attribution_ollama_host_label.master.pack_forget()
@@ -848,7 +849,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             return None
         provider = self._current_attribution_provider_key()
         api_key = self.attribution_api_key_var.get().strip()
-        if not api_key and provider != "ollama":
+        if not api_key and provider not in ("ollama", "lmstudio"):
             return None
         model = self.attribution_model_var.get().strip() \
             or ATTRIBUTION_PROVIDERS[provider]["default_model"]
@@ -1518,7 +1519,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         dialogue_voices = self._selected_dialogue_voices()
 
         if (self.attribution_var.get() and not self.attribution_api_key_var.get().strip()
-                and self._current_attribution_provider_key() != "ollama"):
+                and self._current_attribution_provider_key() not in ("ollama", "lmstudio")):
             messagebox.showwarning(
                 "Определение говорящих",
                 "Включена галочка «Определять, какой персонаж говорит», но не указан "

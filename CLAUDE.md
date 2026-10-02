@@ -334,6 +334,20 @@ community-issue (`FunAudioLLM/CosyVoice#1704`):
 проставленные клиентом "+"). `--no-ruaccent` в CLI трактуется как
 `--stress-engine none`.
 
+### LM Studio вместо Ollama (октябрь 2026)
+
+У пользователя локальные модели крутятся в LM Studio (не только в Ollama), поэтому
+`lmstudio` добавлен ровно туда же, где есть `ollama`: пятым провайдером в
+`ATTRIBUTION_PROVIDERS` (атрибуция, умная эмоция, пол персонажей) и значением
+`--stress-engine lmstudio` / пунктом движка ударений в GUI. Транспорт —
+OpenAI-совместимый `POST {host}/v1/chat/completions` (`_lmstudio_chat_request`,
+хост по умолчанию `LMSTUDIO_HOST_DEFAULT = http://localhost:1234`, сервер нужно
+запустить на вкладке Developer -> Start Server); общая точка выбора
+`_local_chat_request(..., backend="ollama"|"lmstudio")`. В поле «Модель» —
+идентификатор загруженной модели как в LM Studio; `<think>...</think>` из ответа
+вырезается. Поле адреса в GUI/`--ollama-host` общее для обоих (пусто = стандартный
+порт выбранного бэкенда). Ключ не нужен.
+
 ### Привязка голоса к персонажу (октябрь 2026)
 
 Атрибуция говорящих (`resolve_voice_groups`) закрепляет голос за именем

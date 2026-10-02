@@ -607,6 +607,7 @@ ANTHROPIC_API_VERSION = "2023-06-01"
 GEMINI_GENERATE_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 YANDEXGPT_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
+LMSTUDIO_HOST_DEFAULT = "http://localhost:1234"
 
 ATTRIBUTION_PROVIDERS = {
     "yandexgpt": {
@@ -640,6 +641,17 @@ ATTRIBUTION_PROVIDERS = {
                      "оставить пустым или вписать туда что угодно — не используется. Укажите "
                      "имя установленной модели в поле ниже и, если Ollama слушает не на "
                      "localhost:11434, адрес сервера (поле 'Адрес Ollama').",
+    },
+    "lmstudio": {
+        "title": "LM Studio (локально на вашей машине, бесплатно, без ключа)",
+        "default_model": "local-model",
+        "key_hint": "Ключ не нужен — используется локальный сервер LM Studio (вкладка "
+                     "Developer -> Start Server, по умолчанию http://localhost:1234, "
+                     "OpenAI-совместимый API). В поле 'Модель' впишите идентификатор "
+                     "загруженной модели ровно как он показан в LM Studio (например "
+                     "'qwen3.8-14b-instruct-turbo'); адрес сервера — в поле 'Адрес "
+                     "локального сервера', если он не стандартный. Поле 'API-ключ' не "
+                     "используется.",
     },
 }
 DEFAULT_ATTRIBUTION_PROVIDER = "yandexgpt"
@@ -1000,7 +1012,60 @@ def _ollama_chat_request(prompt: str, model: str, host: str = "", log_fn=None, t
     return content
 
 
-def attribute_speakers_ollama(text: str, model: str, host: str = "", log_fn=None) -> list:
+def _lmstudio_chat_request(prompt: str, model: str, host: str = "", log_fn=None, timeout=300) -> str:
+    """Один запрос к локальному серверу LM Studio (OpenAI-совместимый
+    /v1/chat/completions) -> текст ответа. Аналог _ollama_chat_request."""
+    import requests
+
+    host = (host or LMSTUDIO_HOST_DEFAULT).rstrip("/")
+    try:
+        resp = requests.post(
+            f"{host}/v1/chat/completions",
+            json={
+                "model": model or "local-model",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "stream": False,
+            },
+            timeout=timeout,
+        )
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            f"Не удалось подключиться к LM Studio по адресу {host} ({e}). Запустите локальный "
+            "сервер в LM Studio (вкладка Developer -> Start Server) и проверьте адрес "
+            "(по умолчанию http://localhost:1234)."
+        )
+    if resp.status_code >= 400:
+        body = resp.text[:1000]
+        if log_fn:
+            log_fn(f"LM Studio ({host}) ответил HTTP {resp.status_code}: {body}")
+        raise RuntimeError(
+            f"LM Studio вернул ошибку HTTP {resp.status_code}: {body[:500]}\n"
+            f"  Проверьте, что модель {model!r} загружена, а идентификатор в поле 'Модель' "
+            "совпадает с показанным в LM Studio."
+        )
+    try:
+        content = resp.json()["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise RuntimeError(f"LM Studio не вернул ожидаемый ответ (ответ: {resp.text[:500]})")
+    # Модели с "рассуждением" (Qwen3 thinking и т.п.) могут вернуть <think>...</think>
+    # прямо в тексте — для разбора JSON это только мешает.
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    if not content:
+        raise RuntimeError("LM Studio вернул пустой ответ")
+    return content
+
+
+def _local_chat_request(prompt: str, model: str, host: str = "", backend: str = "ollama",
+                         log_fn=None) -> str:
+    """Единая точка для локальных LLM-серверов: 'ollama' или 'lmstudio'."""
+    if backend == "lmstudio":
+        return _lmstudio_chat_request(prompt, model, host=host, log_fn=log_fn)
+    return _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+
+
+def attribute_speakers_ollama(text: str, model: str, host: str = "", log_fn=None,
+                               backend: str = "ollama") -> list:
     """То же самое через локальный Ollama (ollama.com) — работает полностью
     офлайн/бесплатно на машине пользователя, но без строгого function
     calling у большинства моделей просим вернуть JSON текстом и парсим его
@@ -1016,14 +1081,14 @@ def attribute_speakers_ollama(text: str, model: str, host: str = "", log_fn=None
         '["Иван Петров", "unknown", "Мария"]'
     )
     if log_fn:
-        log_fn(f"Атрибуция говорящих через Ollama ({model}): {dialogue_count} реплик, "
+        log_fn(f"Атрибуция говорящих через {backend} ({model}): {dialogue_count} реплик, "
                f"{len(text)} симв. текста главы...")
 
-    raw_text = _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn)
     results = _extract_json_array(raw_text)
     if results is None:
         raise RuntimeError(
-            f"Ollama вернула ответ, из которого не удалось извлечь список говорящих "
+            f"Локальная модель вернула ответ, из которого не удалось извлечь список говорящих "
             f"(ответ модели: {raw_text[:500]})"
         )
     return _normalize_attribution_results(results, dialogue_count, log_fn)
@@ -1041,8 +1106,8 @@ def attribute_speakers_llm(text: str, api_key: str, model: str = DEFAULT_ATTRIBU
         return attribute_speakers_yandexgpt(text, api_key, model, folder_id=folder_id, log_fn=log_fn)
     if provider == "anthropic":
         return attribute_speakers_anthropic(text, api_key, model, log_fn=log_fn)
-    if provider == "ollama":
-        return attribute_speakers_ollama(text, model, host=ollama_host, log_fn=log_fn)
+    if provider in ("ollama", "lmstudio"):
+        return attribute_speakers_ollama(text, model, host=ollama_host, log_fn=log_fn, backend=provider)
     return attribute_speakers_gemini(text, api_key, model, log_fn=log_fn)
 
 
@@ -1208,13 +1273,13 @@ def classify_paragraph_emotions_yandexgpt(paragraphs, api_key, model, allowed_em
 
 
 def classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions, host: str = "",
-                                        log_fn=None) -> "list[str]":
+                                        log_fn=None, backend: str = "ollama") -> "list[str]":
     """То же самое через локальный Ollama — см. attribute_speakers_ollama."""
     prompt = _emotion_prompt(paragraphs, allowed_emotions)
-    raw_text = _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn)
     results = _extract_json_array(raw_text)
     if results is None:
-        raise RuntimeError(f"Ollama не вернула распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
+        raise RuntimeError(f"Локальная модель не вернула распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
     return _normalize_emotion_results(results, len(paragraphs), allowed_emotions, log_fn)
 
 
@@ -1232,9 +1297,9 @@ def classify_paragraph_emotions_llm(paragraphs, allowed_emotions, api_key, model
                                                        folder_id=folder_id, log_fn=log_fn)
     if provider == "anthropic":
         return classify_paragraph_emotions_anthropic(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
-    if provider == "ollama":
+    if provider in ("ollama", "lmstudio"):
         return classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions,
-                                                    host=ollama_host, log_fn=log_fn)
+                                                    host=ollama_host, log_fn=log_fn, backend=provider)
     return classify_paragraph_emotions_gemini(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
 
 
@@ -1339,8 +1404,9 @@ def _llm_text_request(prompt: str, creds: dict, log_fn=None) -> str:
     provider = creds.get("provider", DEFAULT_ATTRIBUTION_PROVIDER)
     model = creds.get("model", DEFAULT_ATTRIBUTION_MODEL)
     api_key = creds.get("api_key", "")
-    if provider == "ollama":
-        return _ollama_chat_request(prompt, model, host=creds.get("ollama_host", ""), log_fn=log_fn)
+    if provider in ("ollama", "lmstudio"):
+        return _local_chat_request(prompt, model, host=creds.get("ollama_host", ""),
+                                    backend=provider, log_fn=log_fn)
     if provider == "anthropic":
         resp = requests.post(
             ANTHROPIC_MESSAGES_URL,
@@ -3664,7 +3730,7 @@ def _ollama_stress_prompt(items: "list[tuple[str, str, str]]") -> str:
 
 
 def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None,
-                              silero_stress_accentor=None) -> dict:
+                              silero_stress_accentor=None, backend: str = "ollama") -> dict:
     """Аналог _silero_stress_omograph_overrides (движок ударений 'ollama'):
     ударение слов-омографов из ambiguous_stress_words_ru.txt определяет
     локальная LLM через Ollama, по контексту конкретного употребления в
@@ -3720,13 +3786,13 @@ def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None,
             if log_fn:
                 log_fn(f"silero-stress (подсказка для Ollama) не сработала ({e}) — продолжаю без неё.")
 
-    cache_key_prefix = (model, host or OLLAMA_HOST_DEFAULT)
+    cache_key_prefix = (backend, model, host or "")
     items_with_hints = [(w, ctx, silero_hints.get(w, "")) for w, ctx in items]
     to_query = [t for t in items_with_hints if (cache_key_prefix, t[0], t[1]) not in _ollama_stress_cache]
     if to_query:
         prompt = _ollama_stress_prompt(to_query)
         try:
-            raw_text = _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+            raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn)
             results = _extract_json_array(raw_text)
         except Exception as e:
             if log_fn:
@@ -3974,8 +4040,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
     stress_engine = (stress_engine or "ruaccent").lower()
-    accentizer = _load_ruaccent() if stress_engine in ("ruaccent", "hybrid", "ollama") else None
-    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama") else None
+    accentizer = _load_ruaccent() if stress_engine in ("ruaccent", "hybrid", "ollama", "lmstudio") else None
+    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama", "lmstudio") else None
     if stress_dict:
         print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
               f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
@@ -4030,10 +4096,10 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         _case_overrides.update(resolve_lemma_homographs(part_text))
         if stress_engine == "hybrid" and silero_stress_accentor is not None:
             _case_overrides.update(_silero_stress_omograph_overrides(part_text, silero_stress_accentor))
-        if stress_engine == "ollama":
+        if stress_engine in ("ollama", "lmstudio"):
             _case_overrides.update(_ollama_stress_overrides(
                 part_text, stress_ollama_model, host=stress_ollama_host, log_fn=print,
-                silero_stress_accentor=silero_stress_accentor))
+                silero_stress_accentor=silero_stress_accentor, backend=stress_engine))
         _effective_stress_dict = stress_dict
         if _case_overrides:
             _effective_stress_dict = dict(stress_dict)
@@ -4388,7 +4454,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     # сервере; 'hybrid' и 'silero_stress' подмешивают/заменяют ударения
     # ДО отправки, а сервер лишь не трогает уже проставленные "+".
     stress_engine = (stress_engine or "ruaccent").lower()
-    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama") else None
+    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama", "lmstudio") else None
 
     if dialogue_speakers:
         allowed = speakers_for_model(model_id)
@@ -4474,11 +4540,11 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         if stress_engine == "hybrid" and silero_stress_accentor is not None:
             effective_dict = dict(effective_dict)
             effective_dict.update(_silero_stress_omograph_overrides(plain_text_chunk, silero_stress_accentor))
-        if stress_engine == "ollama":
+        if stress_engine in ("ollama", "lmstudio"):
             effective_dict = dict(effective_dict)
             effective_dict.update(_ollama_stress_overrides(
                 plain_text_chunk, stress_ollama_model, host=stress_ollama_host, log_fn=print,
-                silero_stress_accentor=silero_stress_accentor))
+                silero_stress_accentor=silero_stress_accentor, backend=stress_engine))
         if stress_engine == "silero_stress" and silero_stress_accentor is not None:
             protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, effective_dict)
             protected = apply_silero_stress(protected, silero_stress_accentor)
@@ -5295,7 +5361,7 @@ def main():
                           "put_accent в silero-режиме (по умолчанию используется, если "
                           "пакет ruaccent установлен) — то же самое, что --stress-engine none")
     ap.add_argument("--stress-engine", type=str, default="ruaccent",
-                     choices=["ruaccent", "silero_stress", "hybrid", "ollama", "none"],
+                     choices=["ruaccent", "silero_stress", "hybrid", "ollama", "lmstudio", "none"],
                      help="движок автоматической расстановки ударений (сверх словаря "
                           "stress_dict и put_accent) для silero/silero_rest-режимов: "
                           "'ruaccent' (по умолчанию, как раньше) / 'silero_stress' (новая "
@@ -5479,7 +5545,7 @@ def main():
         "api_key": attribution_api_key, "model": attribution_model,
         "provider": attribution_provider, "folder_id": attribution_folder_id,
         "ollama_host": args.ollama_host,
-    } if (attribution_api_key or attribution_provider == "ollama") else None
+    } if (attribution_api_key or attribution_provider in ("ollama", "lmstudio")) else None
 
     if args.mode == "online":
         run_online(chapters, args.outdir, args.play, args.start, voice_lang="ru",
