@@ -964,7 +964,8 @@ def attribute_speakers_yandexgpt(text: str, api_key: str, model: str, folder_id:
     return _normalize_attribution_results(results, dialogue_count, log_fn)
 
 
-def _ollama_chat_request(prompt: str, model: str, host: str = "", log_fn=None, timeout=180) -> str:
+def _ollama_chat_request(prompt: str, model: str, host: str = "", log_fn=None, timeout=180,
+                          max_tokens: "int | None" = None) -> str:
     """Отправляет один запрос в локальный Ollama (/api/chat, без стриминга)
     и возвращает текст ответа. Общий HTTP-транспорт для всех трёх
     LLM-фич проекта, которые умеют работать через Ollama (атрибуция
@@ -980,17 +981,23 @@ def _ollama_chat_request(prompt: str, model: str, host: str = "", log_fn=None, t
             "(например 'qwen2.5:7b-instruct', 'ollama pull qwen2.5:7b-instruct')."
         )
     host = (host or OLLAMA_HOST_DEFAULT).rstrip("/")
+    options = {"temperature": 0.1}
+    if max_tokens:
+        options["num_predict"] = int(max_tokens)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        # Отключаем "рассуждение" у thinking-моделей (Qwen3 и т.п.) — оно
+        # на порядок замедляет ответ, а нам нужен только короткий JSON.
+        "think": False,
+        "options": options,
+    }
     try:
-        resp = requests.post(
-            f"{host}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "options": {"temperature": 0.1},
-            },
-            timeout=timeout,
-        )
+        resp = requests.post(f"{host}/api/chat", json=payload, timeout=timeout)
+        if resp.status_code == 400 and "think" in resp.text.lower():
+            payload.pop("think")  # старая версия Ollama / модель без поддержки
+            resp = requests.post(f"{host}/api/chat", json=payload, timeout=timeout)
     except requests.exceptions.ConnectionError as e:
         raise RuntimeError(
             f"Не удалось подключиться к Ollama по адресу {host} ({e}). Проверьте, что Ollama "
@@ -1012,7 +1019,8 @@ def _ollama_chat_request(prompt: str, model: str, host: str = "", log_fn=None, t
     return content
 
 
-def _lmstudio_chat_request(prompt: str, model: str, host: str = "", log_fn=None, timeout=300) -> str:
+def _lmstudio_chat_request(prompt: str, model: str, host: str = "", log_fn=None, timeout=300,
+                            max_tokens: "int | None" = None) -> str:
     """Один запрос к локальному серверу LM Studio (OpenAI-совместимый
     /v1/chat/completions) -> текст ответа. Аналог _ollama_chat_request."""
     import requests
@@ -1023,9 +1031,12 @@ def _lmstudio_chat_request(prompt: str, model: str, host: str = "", log_fn=None,
             f"{host}/v1/chat/completions",
             json={
                 "model": model or "local-model",
-                "messages": [{"role": "user", "content": prompt}],
+                # "/no_think" — штатный выключатель рассуждения у Qwen3-семейства;
+                # остальные модели воспринимают как безобидную приписку.
+                "messages": [{"role": "user", "content": prompt + "\n/no_think"}],
                 "temperature": 0.1,
                 "stream": False,
+                **({"max_tokens": int(max_tokens)} if max_tokens else {}),
             },
             timeout=timeout,
         )
@@ -1057,11 +1068,11 @@ def _lmstudio_chat_request(prompt: str, model: str, host: str = "", log_fn=None,
 
 
 def _local_chat_request(prompt: str, model: str, host: str = "", backend: str = "ollama",
-                         log_fn=None) -> str:
+                         log_fn=None, max_tokens: "int | None" = None) -> str:
     """Единая точка для локальных LLM-серверов: 'ollama' или 'lmstudio'."""
     if backend == "lmstudio":
-        return _lmstudio_chat_request(prompt, model, host=host, log_fn=log_fn)
-    return _ollama_chat_request(prompt, model, host=host, log_fn=log_fn)
+        return _lmstudio_chat_request(prompt, model, host=host, log_fn=log_fn, max_tokens=max_tokens)
+    return _ollama_chat_request(prompt, model, host=host, log_fn=log_fn, max_tokens=max_tokens)
 
 
 def attribute_speakers_ollama(text: str, model: str, host: str = "", log_fn=None,
@@ -1084,7 +1095,8 @@ def attribute_speakers_ollama(text: str, model: str, host: str = "", log_fn=None
         log_fn(f"Атрибуция говорящих через {backend} ({model}): {dialogue_count} реплик, "
                f"{len(text)} симв. текста главы...")
 
-    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn)
+    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn,
+                                    max_tokens=120 + 16 * dialogue_count)
     results = _extract_json_array(raw_text)
     if results is None:
         raise RuntimeError(
@@ -1276,7 +1288,8 @@ def classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions, host
                                         log_fn=None, backend: str = "ollama") -> "list[str]":
     """То же самое через локальный Ollama — см. attribute_speakers_ollama."""
     prompt = _emotion_prompt(paragraphs, allowed_emotions)
-    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn)
+    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn,
+                                    max_tokens=80 + 8 * len(paragraphs))
     results = _extract_json_array(raw_text)
     if results is None:
         raise RuntimeError(f"Локальная модель не вернула распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
@@ -1406,7 +1419,7 @@ def _llm_text_request(prompt: str, creds: dict, log_fn=None) -> str:
     api_key = creds.get("api_key", "")
     if provider in ("ollama", "lmstudio"):
         return _local_chat_request(prompt, model, host=creds.get("ollama_host", ""),
-                                    backend=provider, log_fn=log_fn)
+                                    backend=provider, log_fn=log_fn, max_tokens=600)
     if provider == "anthropic":
         resp = requests.post(
             ANTHROPIC_MESSAGES_URL,
@@ -3729,98 +3742,164 @@ def _ollama_stress_prompt(items: "list[tuple[str, str, str]]") -> str:
     )
 
 
-def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None,
-                              silero_stress_accentor=None, backend: str = "ollama") -> dict:
-    """Аналог _silero_stress_omograph_overrides (движок ударений 'ollama'):
-    ударение слов-омографов из ambiguous_stress_words_ru.txt определяет
-    локальная LLM через Ollama, по контексту конкретного употребления в
-    этом куске текста — у LLM, в отличие от словаря/модели расстановки
-    ударений, есть доступ к смыслу всего предложения, а не только к форме
-    слова. RUAccent по-прежнему расставляет ударения во всём остальном
-    тексте, как и в режиме 'hybrid'.
+_ollama_stress_index: dict = {}
+_STRESS_MISS = object()
 
-    silero_stress_accentor — опционально (движок 'ollama' комбинируется с
-    silero-stress, если пакет установлен): её предположение по тому же
-    слову передаётся LLM как подсказка-мнение (не готовый ответ — см.
-    _ollama_stress_prompt) и используется как ОТКАТ, если сама Ollama
-    недоступна/вернула нераспознаваемый ответ — так комбинация надёжнее
-    любого из двух способов по отдельности, а не LLM "с нуля".
 
-    Результаты кэшируются в памяти процесса по (модель, адрес, слово,
-    контекст) — одинаковые фразы (например, повторяющиеся обращения) не
-    запрашиваются у Ollama повторно. При любой ошибке (Ollama не запущена,
-    модель не скачана, неожиданный ответ) — тихо откатывается на подсказку
-    silero-stress (если есть) или возвращает {}, не прерывая синтез."""
-    if not model:
-        return {}
+def _stress_cache_set(prefix, w, ck, value):
+    _ollama_stress_cache[(prefix, w, ck)] = value
+    _ollama_stress_index.setdefault((prefix, w), {})[ck] = value
+
+
+def _stress_cache_get(prefix, w, ck):
+    """Значение из кэша или _STRESS_MISS. Точное совпадение ключа
+    вхождения; если слово стоит у самого края куска (контекст слева/справа
+    короче 12 символов — его обрезала граница куска), ищем запись главы,
+    у которой контекст на этом краю ЗАКАНЧИВАЕТСЯ/НАЧИНАЕТСЯ так же."""
+    key = (prefix, w, ck)
+    if key in _ollama_stress_cache:
+        return _ollama_stress_cache[key]
+    left, _, right = ck.partition("|")
+    if len(left) >= 12 and len(right) >= 12:
+        return _STRESS_MISS
+    for cck, val in _ollama_stress_index.get((prefix, w), {}).items():
+        cl, _, cr = cck.partition("|")
+        if (len(left) >= 12 or cl.endswith(left)) and (len(right) >= 12 or cr.startswith(right)):
+            return val
+    return _STRESS_MISS
+
+
+def _stress_norm(fragment: str) -> str:
+    return re.sub(r"\s+", " ", fragment).strip().lower()
+
+
+def _stress_collect(text: str, all_occurrences: bool) -> "list[tuple[str, str, str]]":
+    """Слова-омографы из ambiguous_stress_words_ru.txt в text ->
+    [(слово, контекст ±60 симв., ключ_вхождения)]. Ключ вхождения — по 12
+    символов слева и справа от слова: один и тот же ключ получается и при
+    разборе ВСЕЙ главы целиком, и при разборе отдельного куска текста (кроме
+    слов в считанных символах от края куска), поэтому результат, посчитанный
+    на уровне главы (prewarm_ollama_stress), находится потом в кэше при
+    озвучке каждого куска. all_occurrences=False — только первое вхождение
+    каждого слова (режим одного куска)."""
     ambiguous = _load_ambiguous_stress_words()
     if not ambiguous:
-        return {}
-    src_words = _STRESS_WORD_RE.findall(text)
-    lower_text = text.lower()
-    items = []
-    seen_words = set()
-    for w in src_words:
-        low = w.lower()
-        if low not in ambiguous or low in seen_words:
+        return []
+    out = []
+    seen = set()
+    for m in _STRESS_WORD_RE.finditer(text):
+        low = m.group(0).lower()
+        if low not in ambiguous:
             continue
-        seen_words.add(low)
-        idx = lower_text.find(low)
-        if idx < 0:
+        i, j = m.span()
+        ck = _stress_norm(text[max(0, i - 12):i]) + "|" + _stress_norm(text[j:j + 12])
+        key = (low, ck) if all_occurrences else low
+        if key in seen:
             continue
-        start = max(0, idx - 60)
-        end = min(len(text), idx + len(low) + 60)
-        ctx = text[start:end].replace("\n", " ").strip()
-        items.append((low, ctx))
-    if not items:
-        return {}
+        seen.add(key)
+        ctx = text[max(0, i - 60):min(len(text), j + 60)].replace("\n", " ").strip()
+        out.append((low, ctx, ck))
+    return out
 
-    # Подсказки от silero-stress — та же логика, что и в hybrid
-    # (_silero_stress_omograph_overrides), только результат не применяется
-    # напрямую, а идёт в промпт LLM и служит запасным вариантом.
+
+def _stress_query_llm(todo, model, host, backend, silero_hints, cache_prefix, log_fn):
+    """todo: [(слово, контекст, ключ_вхождения)] -> заполняет
+    _ollama_stress_cache одним запросом к LLM (при ошибке — подсказкой
+    silero-stress или None, чтобы не долбить недоступный сервер заново на
+    каждом куске)."""
+    if not todo:
+        return
+    with_hints = [(w, ctx, silero_hints.get(w, "")) for w, ctx, _ck in todo]
+    try:
+        raw_text = _local_chat_request(_ollama_stress_prompt(with_hints), model, host=host,
+                                        backend=backend, log_fn=log_fn,
+                                        max_tokens=80 + 30 * len(todo))
+        results = _extract_json_array(raw_text)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"{backend} (расстановка ударений) недоступна ({e}) — "
+                   + ("использую подсказку silero-stress." if silero_hints else
+                      "пропускаю, остальной текст по-прежнему обрабатывает RUAccent."))
+        results = None
+    if results is not None and len(results) == len(todo):
+        for (w, _ctx, ck), (_w, _c, hint), out in zip(todo, with_hints, results):
+            out = str(out).strip().lower()
+            # Валидный ответ — "+" перед ударной гласной, либо случай "ё"
+            # (всегда ударная сама по себе, см. _ollama_stress_prompt).
+            valid = "+" in out or "ё" in out
+            _stress_cache_set(cache_prefix, w, ck, out if valid else (hint or None))
+    else:
+        if results is not None and log_fn:
+            log_fn(f"{backend} вернул {len(results)} ответов вместо {len(todo)} — "
+                   "использую подсказки silero-stress там, где они есть.")
+        for (w, _ctx, ck), (_w, _c, hint) in zip(todo, with_hints):
+            _stress_cache_set(cache_prefix, w, ck, hint or None)
+
+
+def prewarm_ollama_stress(chapter_text: str, model: str, host: str = "", log_fn=None,
+                           silero_stress_accentor=None, backend: str = "ollama",
+                           batch_size: int = 25) -> None:
+    """Разрешает ударения ВСЕХ омографов главы заранее — пачками по
+    batch_size слов за один запрос к LLM (а не по запросу на каждый кусок
+    текста): иначе на длинной главе это сотни медленных обращений к
+    локальной модели. Результат оседает в _ollama_stress_cache, откуда его
+    потом берёт _ollama_stress_overrides при озвучке каждого куска."""
+    if not model:
+        return
+    items = _stress_collect(chapter_text, all_occurrences=True)
+    prefix = (backend, model, host or "")
+    todo = [it for it in items if _stress_cache_get(prefix, it[0], it[2]) is _STRESS_MISS]
+    if not todo:
+        return
     silero_hints: dict = {}
     if silero_stress_accentor is not None:
         try:
-            silero_hints = _silero_stress_omograph_overrides(text, silero_stress_accentor)
-        except Exception as e:
-            if log_fn:
-                log_fn(f"silero-stress (подсказка для Ollama) не сработала ({e}) — продолжаю без неё.")
+            silero_hints = _silero_stress_omograph_overrides(chapter_text, silero_stress_accentor)
+        except Exception:
+            silero_hints = {}
+    if log_fn:
+        log_fn(f"Ударения-омографы через {backend}: {len(todo)} вхождений в главе, "
+               f"запросов к модели: {(len(todo) + batch_size - 1) // batch_size}...")
+    for i in range(0, len(todo), batch_size):
+        _stress_query_llm(todo[i:i + batch_size], model, host, backend, silero_hints, prefix, log_fn)
 
-    cache_key_prefix = (backend, model, host or "")
-    items_with_hints = [(w, ctx, silero_hints.get(w, "")) for w, ctx in items]
-    to_query = [t for t in items_with_hints if (cache_key_prefix, t[0], t[1]) not in _ollama_stress_cache]
-    if to_query:
-        prompt = _ollama_stress_prompt(to_query)
-        try:
-            raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn)
-            results = _extract_json_array(raw_text)
-        except Exception as e:
-            if log_fn:
-                log_fn(f"Ollama (расстановка ударений) недоступна ({e}) — "
-                       + ("использую подсказку silero-stress для этого фрагмента."
-                          if silero_hints else
-                          "пропускаю для этого фрагмента, остальной текст по-прежнему "
-                          "обрабатывает RUAccent."))
-            results = None
-        if results is not None and len(results) == len(to_query):
-            for (w, ctx, hint), out in zip(to_query, results):
-                out = str(out).strip().lower()
-                # Валидный ответ — это либо обычное "+" перед ударной гласной,
-                # либо случай "ё" (всегда ударная сама по себе, см.
-                # _ollama_stress_prompt — для неё LLM не обязана ставить "+").
-                valid = "+" in out or "ё" in out
-                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = out if valid else (hint or None)
-        else:
-            if results is not None and log_fn:
-                log_fn(f"Ollama вернула {len(results)} ответов вместо {len(to_query)} — "
-                       "использую подсказки silero-stress там, где они есть.")
-            for w, ctx, hint in to_query:
-                _ollama_stress_cache[(cache_key_prefix, w, ctx)] = hint or None
 
+def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None,
+                              silero_stress_accentor=None, backend: str = "ollama") -> dict:
+    """Аналог _silero_stress_omograph_overrides (движок ударений 'ollama' /
+    'lmstudio'): ударение слов-омографов из ambiguous_stress_words_ru.txt
+    определяет локальная LLM по контексту конкретного употребления — у LLM,
+    в отличие от словаря/модели расстановки ударений, есть доступ к смыслу
+    всего предложения. RUAccent по-прежнему расставляет ударения во всём
+    остальном тексте, как и в режиме 'hybrid'.
+
+    silero_stress_accentor — опционально: её предположение передаётся LLM как
+    подсказка-мнение (см. _ollama_stress_prompt) и служит ОТКАТОМ, если LLM
+    недоступна/ответила нераспознаваемо.
+
+    Обычно всё уже посчитано заранее на уровне главы (prewarm_ollama_stress),
+    и здесь — только чтение кэша; обращение к LLM остаётся для слов у самого
+    края куска текста, которых нет в кэше. При любой ошибке тихо возвращает
+    то, что есть, не прерывая синтез."""
+    if not model:
+        return {}
+    items = _stress_collect(text, all_occurrences=False)
+    if not items:
+        return {}
+    prefix = (backend, model, host or "")
+    todo = [it for it in items if _stress_cache_get(prefix, it[0], it[2]) is _STRESS_MISS]
+    if todo:
+        silero_hints: dict = {}
+        if silero_stress_accentor is not None:
+            try:
+                silero_hints = _silero_stress_omograph_overrides(text, silero_stress_accentor)
+            except Exception:
+                silero_hints = {}
+        _stress_query_llm(todo, model, host, backend, silero_hints, prefix, log_fn)
     overrides = {}
-    for w, ctx, hint in items_with_hints:
-        out = _ollama_stress_cache.get((cache_key_prefix, w, ctx)) or hint
-        if out:
+    for w, _ctx, ck in items:
+        out = _stress_cache_get(prefix, w, ck)
+        if out and out is not _STRESS_MISS:
             overrides[w] = out
     return overrides
 
@@ -4194,6 +4273,10 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             continue
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
+
+        if stress_engine in ("ollama", "lmstudio"):
+            prewarm_ollama_stress(text, stress_ollama_model, host=stress_ollama_host, log_fn=print,
+                                   silero_stress_accentor=silero_stress_accentor, backend=stress_engine)
 
         # Группируем по голосу (диалоги/повествование, см. dialogue_speakers,
         # и/или LLM-атрибуция по персонажам, см. attribution), затем каждую
@@ -4663,6 +4746,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             continue
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю (silero_rest): {title} -> {fname}")
+
+        if stress_engine in ("ollama", "lmstudio"):
+            prewarm_ollama_stress(text, stress_ollama_model, host=stress_ollama_host, log_fn=print,
+                                   silero_stress_accentor=silero_stress_accentor, backend=stress_engine)
 
         _chapter_para_prosody = {}
         if smart_emotion:
