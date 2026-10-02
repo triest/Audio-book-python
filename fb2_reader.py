@@ -1286,8 +1286,154 @@ def _save_character_voice_map(outdir: Path, mapping: dict):
         pass
 
 
+def _voice_gender(voice) -> "str | None":
+    """'m' / 'f' / None (неизвестно) для ключа голоса — по пометке "(муж.)"/
+    "(жен.)"/"(мужской)"/"(женский)" в подписях голосов Silero, Yandex,
+    Qwen (облако/локально) и Piper. Для остальных (CosyVoice-профили,
+    системные голоса offline) пол не известен -> None."""
+    if not voice:
+        return None
+    for table in (SILERO_SPEAKERS, YANDEX_VOICES, QWEN_TTS_VOICES, QWEN_TTS_LOCAL_VOICES, PIPER_VOICES):
+        label = table.get(voice)
+        if not label:
+            continue
+        low = label.lower()
+        if "жен" in low:
+            return "f"
+        if "муж" in low:
+            return "m"
+    return None
+
+
+def _guess_name_gender(name: str) -> "str | None":
+    """'m' / 'f' / None по имени персонажа — через pymorphy3 (необязательная
+    зависимость, см. _get_pymorphy_analyzer): берётся первое слово имени,
+    которое разбор признаёт именем/отчеством/фамилией с определённым
+    родом. Без pymorphy3 или для непонятных имён ("он", "старик", "unknown")
+    возвращает None — тогда голос выбирается как раньше, без учёта пола."""
+    analyzer = _get_pymorphy_analyzer()
+    if analyzer is None or not name:
+        return None
+    for token in re.findall(r"[А-Яа-яЁё]+", name):
+        try:
+            parses = analyzer.parse(token.lower())
+        except Exception:
+            continue
+        for p in parses[:3]:
+            tag = p.tag
+            if not any(g in str(tag) for g in ("Name", "Patr", "Surn")):
+                continue
+            if "femn" in str(tag):
+                return "f"
+            if "masc" in str(tag):
+                return "m"
+    return None
+
+
+def _llm_text_request(prompt: str, creds: dict, log_fn=None) -> str:
+    """Один текстовый запрос к LLM-провайдеру из creds (тот же словарь, что
+    attribution: api_key/model/provider/folder_id/ollama_host) -> сырой
+    текст ответа. Общий транспорт для разовых вспомогательных вопросов
+    (например, пол персонажа); те же HTTP-вызовы, что в classify_*."""
+    import requests
+    provider = creds.get("provider", DEFAULT_ATTRIBUTION_PROVIDER)
+    model = creds.get("model", DEFAULT_ATTRIBUTION_MODEL)
+    api_key = creds.get("api_key", "")
+    if provider == "ollama":
+        return _ollama_chat_request(prompt, model, host=creds.get("ollama_host", ""), log_fn=log_fn)
+    if provider == "anthropic":
+        resp = requests.post(
+            ANTHROPIC_MESSAGES_URL,
+            headers={"x-api-key": api_key, "anthropic-version": ANTHROPIC_API_VERSION,
+                     "content-type": "application/json"},
+            json={"model": model, "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]},
+            timeout=120)
+        resp.raise_for_status()
+        return "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text")
+    if provider == "yandexgpt":
+        resp = requests.post(
+            YANDEXGPT_COMPLETION_URL,
+            headers={"Authorization": f"Api-Key {api_key}", "content-type": "application/json"},
+            json={"modelUri": f"gpt://{creds.get('folder_id', '')}/{model}",
+                  "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": "1000"},
+                  "messages": [{"role": "user", "text": prompt}]},
+            timeout=120)
+        resp.raise_for_status()
+        return resp.json()["result"]["alternatives"][0]["message"]["text"]
+    resp = requests.post(
+        GEMINI_GENERATE_URL_TMPL.format(model=model), params={"key": api_key},
+        headers={"content-type": "application/json"},
+        json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]}, timeout=120)
+    resp.raise_for_status()
+    out = ""
+    for cand in resp.json().get("candidates", []):
+        for part in (cand.get("content") or {}).get("parts", []):
+            out += part.get("text", "")
+    return out
+
+
+def detect_character_genders(names: "list[str]", text: str, creds: dict, log_fn=None) -> dict:
+    """{имя_в_нижнем_регистре: 'm'|'f'} — LLM читает фрагменты главы, где
+    упоминается персонаж, и определяет его пол (учитывает прозвища, роли
+    вроде "старуха", "капитан", окончания глаголов прошедшего времени —
+    то, что одним разбором имени через pymorphy не поймать). Только для
+    имён, где LLM уверена; остальные не попадут в результат (тогда
+    сработает запасной вариант — _guess_name_gender). При любой ошибке
+    возвращает {}."""
+    if not names or not creds:
+        return {}
+    blocks = []
+    sentences = re.split(r"(?<=[.!?…])\s+|\n+", text)
+    for n in names:
+        token = n.split()[0].lower() if n.split() else n.lower()
+        snippets = [s.strip()[:220] for s in sentences if token[:5] in s.lower()][:3]
+        blocks.append(f"- {n}: " + (" | ".join(snippets) if snippets else "(фрагментов нет)"))
+    prompt = (
+        "Ниже — персонажи книги на русском и фрагменты, где они упоминаются. Для КАЖДОГО "
+        "определи пол: 'm' (мужской) или 'f' (женский), по имени, роли и согласованию "
+        "слов в тексте; если нельзя понять — 'unknown'.\n\n"
+        f"Верни ОТВЕТ СТРОГО в виде JSON-массива строк длиной ровно {len(names)}, в том же "
+        "порядке, без пояснений и markdown, например: [\"m\", \"f\", \"unknown\"]\n\n"
+        + "\n".join(blocks)
+    )
+    try:
+        results = _extract_json_array(_llm_text_request(prompt, creds, log_fn=log_fn))
+    except Exception as e:
+        if log_fn:
+            log_fn(f"Определение пола персонажей через LLM не удалось ({e}) — использую разбор имён.")
+        return {}
+    if not results or len(results) != len(names):
+        return {}
+    out = {}
+    for n, g in zip(names, results):
+        g = str(g).strip().lower()
+        if g in ("m", "f"):
+            out[n.strip().lower()] = g
+    return out
+
+
+def _pick_voice_for_new_character(name_key: str, dialogue_voices, character_voice_map: dict,
+                                   name_genders: "dict | None" = None):
+    """Выбор голоса для нового персонажа: сначала ещё НЕ занятые голоса
+    подходящего пола (пол — от LLM из name_genders, иначе по разбору имени),
+    затем любой голос этого пола, затем (если пол неизвестен или таких
+    голосов нет) старое поведение — следующий по кругу голос из списка."""
+    gender = (name_genders or {}).get(name_key) or _guess_name_gender(name_key)
+    if gender:
+        matching = [v for v in dialogue_voices if _voice_gender(v) == gender]
+        if matching:
+            used = set(character_voice_map.values())
+            free = [v for v in matching if v not in used]
+            if free:
+                return free[0]
+            n_same = sum(1 for v in character_voice_map.values() if v in matching)
+            return matching[n_same % len(matching)]
+    return dialogue_voices[len(character_voice_map) % len(dialogue_voices)]
+
+
 def _group_paragraphs_by_speaker_names(text: str, main_voice, dialogue_voices,
-                                        speaker_names: list, character_voice_map: dict):
+                                        speaker_names: list, character_voice_map: dict,
+                                        name_genders: "dict | None" = None):
     """Как _group_paragraphs_by_voice, но голос реплики выбирается не по
     круговому чередованию, а по имени говорящего (speaker_names[i] — имя
     для i-й по счёту реплики в тексте, см. attribute_speakers_llm):
@@ -1310,7 +1456,7 @@ def _group_paragraphs_by_speaker_names(text: str, main_voice, dialogue_voices,
             elif name_key in character_voice_map:
                 voice = character_voice_map[name_key]
             else:
-                voice = dialogue_voices[len(character_voice_map) % len(dialogue_voices)]
+                voice = _pick_voice_for_new_character(name_key, dialogue_voices, character_voice_map, name_genders)
                 character_voice_map[name_key] = voice
             grouped.append([voice, [para], True])
         else:
@@ -1352,8 +1498,16 @@ def resolve_voice_groups(text: str, main_voice, dialogue_voices, outdir: Path,
         return _group_paragraphs_by_voice(text, main_voice, dialogue_voices)
 
     character_voice_map = _load_character_voice_map(outdir)
+    # Пол НОВЫХ (ещё без закреплённого голоса) персонажей определяет та же
+    # LLM, что делала атрибуцию — один дополнительный запрос на главу.
+    new_names = []
+    for n in speaker_names:
+        k = n.strip().lower()
+        if k and k != "unknown" and k not in character_voice_map and n.strip() not in new_names:
+            new_names.append(n.strip())
+    name_genders = detect_character_genders(new_names, text, attribution, log_fn) if new_names else {}
     groups = _group_paragraphs_by_speaker_names(
-        text, main_voice, dialogue_voices, speaker_names, character_voice_map
+        text, main_voice, dialogue_voices, speaker_names, character_voice_map, name_genders
     )
     _save_character_voice_map(outdir, character_voice_map)
     if log_fn:

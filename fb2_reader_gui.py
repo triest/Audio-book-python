@@ -30,6 +30,8 @@ from fb2_reader import (
     QWEN_TTS_LOCAL_VOICES,
     QWEN_TTS_LOCAL_DEFAULT_VOICE,
     book_manual_stress_overrides_path,
+    _load_character_voice_map,
+    _save_character_voice_map,
     cosyvoice_list_voices,
     list_offline_voices,
     parse_fb2,
@@ -854,6 +856,96 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         ollama_host = self.ollama_host_var.get().strip()
         return {"api_key": api_key, "model": model, "provider": provider,
                 "folder_id": folder_id, "ollama_host": ollama_host}
+
+    def _open_character_voices_dialog(self):
+        """Окно ручной привязки голоса к персонажу: редактирует
+        dialogue_characters.json в папке вывода (тот же файл, который
+        автоматически заполняет атрибуция говорящих) — имя персонажа ->
+        голос текущего режима. Привязка действует на все главы, которые
+        озвучиваются после сохранения (уже готовые файлы не перезаписываются)."""
+        keys = self._dialogue_voice_keys()
+        if not keys:
+            messagebox.showinfo(
+                "Голоса персонажей",
+                "В текущем режиме нет нескольких голосов для диалогов — выберите режим "
+                "с набором голосов (Silero, Yandex, Qwen, Piper, CosyVoice).",
+            )
+            return
+        labels = [self.dialogue_list.get(i) for i in range(self.dialogue_list.size())]
+        if len(labels) != len(keys):
+            labels = list(keys)
+        label_by_key = dict(zip(keys, labels))
+        key_by_label = {v: k for k, v in label_by_key.items()}
+
+        outdir = Path(self.outdir_var.get().strip() or "audiobook_output")
+        mapping = _load_character_voice_map(outdir)
+
+        win = tk.Toplevel(self)
+        win.title("Голоса персонажей")
+        win.geometry("560x420")
+        win.transient(self)
+
+        ttk.Label(
+            win, wraplength=520, foreground="#555", justify="left",
+            text=f"Файл: {outdir / 'dialogue_characters.json'}\n"
+                 "Имя персонажа (как его определяет LLM, в нижнем регистре) -> голос. Новые "
+                 "персонажи получают голос автоматически (по полу имени, если он понятен); "
+                 "здесь можно закрепить конкретный голос вручную.",
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        tree = ttk.Treeview(win, columns=("name", "voice"), show="headings", height=10)
+        tree.heading("name", text="Персонаж")
+        tree.heading("voice", text="Голос")
+        tree.column("name", width=220)
+        tree.column("voice", width=300)
+        tree.pack(fill="both", expand=True, padx=10)
+
+        def refresh():
+            tree.delete(*tree.get_children())
+            for name in sorted(mapping):
+                tree.insert("", "end", iid=name, values=(name, label_by_key.get(mapping[name], mapping[name])))
+
+        form = ttk.Frame(win)
+        form.pack(fill="x", padx=10, pady=8)
+        name_var = tk.StringVar()
+        voice_var = tk.StringVar()
+        ttk.Entry(form, textvariable=name_var, width=22).pack(side="left")
+        voice_combo = ttk.Combobox(form, textvariable=voice_var, values=labels, state="readonly", width=32)
+        voice_combo.pack(side="left", padx=6)
+
+        def on_select(_e=None):
+            sel = tree.selection()
+            if sel:
+                name_var.set(sel[0])
+                voice_var.set(label_by_key.get(mapping[sel[0]], mapping[sel[0]]))
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def set_binding():
+            name = name_var.get().strip().lower()
+            voice = key_by_label.get(voice_var.get())
+            if not name or not voice:
+                return
+            mapping[name] = voice
+            refresh()
+
+        def delete_binding():
+            for iid in tree.selection():
+                mapping.pop(iid, None)
+            refresh()
+
+        def save_and_close():
+            outdir.mkdir(parents=True, exist_ok=True)
+            _save_character_voice_map(outdir, mapping)
+            win.destroy()
+
+        ttk.Button(form, text="Привязать", command=set_binding).pack(side="left")
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btns, text="Удалить выбранного", command=delete_binding).pack(side="left")
+        ttk.Button(btns, text="Сохранить и закрыть", command=save_and_close).pack(side="right")
+        ttk.Button(btns, text="Отмена", command=win.destroy).pack(side="right", padx=6)
+        refresh()
 
     def _selected_dialogue_voices(self):
         """Список ключей голосов для диалогов в текущем режиме, если
