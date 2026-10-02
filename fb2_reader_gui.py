@@ -1517,7 +1517,8 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
 
         dialogue_voices = self._selected_dialogue_voices()
 
-        if self.attribution_var.get() and not self.attribution_api_key_var.get().strip():
+        if (self.attribution_var.get() and not self.attribution_api_key_var.get().strip()
+                and self._current_attribution_provider_key() != "ollama"):
             messagebox.showwarning(
                 "Определение говорящих",
                 "Включена галочка «Определять, какой персонаж говорит», но не указан "
