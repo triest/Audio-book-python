@@ -91,10 +91,10 @@ rem not in stress_dictionary.json, well before it would fall back to
 rem looking the word up online (Wiktionary), which cuts down a lot on how
 rem often that online fallback is even needed - and how often it can hit
 rem the site's own rate limit (HTTP 429) on a long book. Best-effort only:
-rem download_stress_corpus.py never fails the install if this can't be
+rem tools\download_stress_corpus.py never fails the install if this can't be
 rem fetched (no internet right now, GitHub unreachable, etc.) - it just
 rem prints a warning and fb2_reader.py keeps working without it.
-"%VENV_PY%" download_stress_corpus.py
+"%VENV_PY%" tools\download_stress_corpus.py
 
 rem Local Silero synthesis (the main, recommended mode)
 rem CUDA build of torch in the MAIN venv (plain PyPI "torch" is CPU-only; Silero TTS can use the GPU).
@@ -112,7 +112,7 @@ rem Silero via a separate REST service (SSML pauses, optional)
 if errorlevel 1 goto :warn_partial
 
 rem silero-stress - the ONLY accentuation model (context-aware stress, ~0.5 s per chapter chunk on CPU).
-rem pinned to the verified version (stress_versions.lock.json); upgrade procedure: see check_stress_versions.py
+rem pinned to the verified version (stress_versions.lock.json); upgrade procedure: see tools\check_stress_versions.py
 "%VENV_PY%" -m pip install silero-stress==1.5
 if errorlevel 1 echo WARNING: silero-stress failed to install - there will be no automatic stress marks ^(only the dictionary^).
 

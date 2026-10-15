@@ -16,10 +16,10 @@ from ctypes import wintypes
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import fb2_reader as fr  # noqa: E402
 
-GOLD = json.loads((Path(__file__).resolve().parent / "data" / "stress_gold.json").read_text(encoding="utf-8"))
+GOLD = json.loads((Path(__file__).resolve().parent.parent / "data" / "stress_gold.json").read_text(encoding="utf-8"))
 ACC = fr._load_silero_stress()
 if ACC is None:
     sys.exit("silero-stress is required")
@@ -130,7 +130,7 @@ def verify_gold():
     homographs are expected there); a gold form that is absent from a single-reading entry is a gold ERROR."""
     import gzip
     corpus = defaultdict(set)
-    with gzip.open(Path(__file__).with_name("stress_corpus_ru.tsv.gz"), "rt", encoding="utf-8") as fh:
+    with gzip.open((Path(__file__).resolve().parent.parent / "stress_corpus_ru.tsv.gz"), "rt", encoding="utf-8") as fh:
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             if len(parts) == 2:

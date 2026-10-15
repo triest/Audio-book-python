@@ -16,7 +16,7 @@ import socket
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 LOCK = HERE / "stress_versions.lock.json"
 PACKAGES = ["silero-stress", "silero", "torch", "slovnet", "navec", "razdel", "pymorphy3", "numpy"]
 SMOKE = [("Дверной замок заклинило.", "зам+ок"), ("Он сказал себе, что замок пуст.", "з+амок"),

@@ -1,7 +1,7 @@
 """Stress test suite for the accentuation pipeline (silero-stress + slovnet grammar gate) and the
 stress dictionary editor logic.
 
-Run:  .venv\\Scripts\\python.exe test_accentuation.py      (exit code 0 = everything passed)
+Run:  .venv\\Scripts\\python.exe tools\\test_accentuation.py      (exit code 0 = everything passed)
 
 The network cases use an EMPTY user dictionary on purpose, so they check what the neural model
 itself produces; hierarchy cases use a temporary dictionary (the real forced_stress_words.json
@@ -13,7 +13,8 @@ import sys
 import contextlib
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+__import__("os").chdir(Path(__file__).resolve().parent.parent)   # the checks below use paths relative to the project root
 import fb2_reader as fr   # noqa: E402
 
 FAILS = []
@@ -500,7 +501,7 @@ src_py = Path("fb2_reader.py").read_text(encoding="utf-8")
 for legacy in ("def restore_yo", "global_sanity_overrides", "_PredictorClient", "def apply_ruaccent", "def _load_ruaccent",
                "_EmbeddedPredictor", "apply_predictor_stress", "_predictor_weights", "--no-ruaccent", "from ruaccent"):
     check(f"no {legacy}", legacy not in src_py)
-_all_py = {p.name: p.read_text(encoding="utf-8") for p in Path(".").glob("*.py") if p.name not in ("test_accentuation.py", "cosyvoice_rest_service.py", "stress_benchmark.py")}  # cosyvoice: own venv + ruaccent by design; stress_benchmark: optional env-gated candidate
+_all_py = {p.name: p.read_text(encoding="utf-8") for p in [*Path(".").glob("*.py"), *Path("tools").glob("*.py")] if p.name not in ("test_accentuation.py", "cosyvoice_rest_service.py", "stress_benchmark.py")}  # cosyvoice: own venv + ruaccent by design; stress_benchmark: optional env-gated candidate
 for name, body in _all_py.items():
     check(f"{name}: no classic RUAccent / predictor imports",
           not re.search(r"^\s*(?:from|import)\s+ruaccent|ruaccent_predictor_pkg|ruaccent-predictor", body, re.M))

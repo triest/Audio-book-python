@@ -28,7 +28,7 @@ import zipfile
 from pathlib import Path
 
 SOURCE_URL = "https://raw.githubusercontent.com/Koziev/NLP_Datasets/master/Stress/all_accents.zip"
-OUTPUT_PATH = Path(__file__).resolve().parent / "stress_corpus_ru.tsv.gz"
+OUTPUT_PATH = Path(__file__).resolve().parent.parent / "stress_corpus_ru.tsv.gz"
 TIMEOUT = 120
 
 

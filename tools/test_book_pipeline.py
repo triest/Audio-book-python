@@ -1,7 +1,7 @@
 r"""Book-sized integration test of the text side of the pipeline (real FB2 -> chapters -> chunks -> numbers ->
 stress chain), mirroring run_silero_rest._accented_text_for_rest. No TTS here (see audio_stress_review.py).
 
-Run:  .venv\Scripts\python.exe test_book_pipeline.py [book.fb2]
+Run:  .venv\Scripts\python.exe tools\test_book_pipeline.py [book.fb2]
 Checks: every chapter parsed and non-empty; chunking loses/duplicates/cuts nothing; stress output equals the
 (number-expanded) input modulo '+' and е/ё; two runs are identical; a second pass over finished output does not
 accumulate marks; dictionary entries persist through save/reload and win over the model."""
@@ -12,10 +12,10 @@ import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import fb2_reader as fr  # noqa: E402
 
-BOOK = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).with_name("pepel-pobedy.fb2")
+BOOK = Path(sys.argv[1]) if len(sys.argv) > 1 else (Path(__file__).resolve().parent.parent / "pepel-pobedy.fb2")
 FAILS = []
 
 
