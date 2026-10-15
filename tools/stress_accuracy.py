@@ -14,7 +14,7 @@ corpus = defaultdict(set)
 for l in gzip.open((Path(__file__).resolve().parent.parent / "stress_corpus_ru.tsv.gz"), "rt", encoding="utf-8"):
     p = l.rstrip("\n").split("\t")
     if len(p) == 2: corpus[p[0].lower().replace("ё", "е")].add(p[1].lower().replace("^", "+").replace("ё", "е"))
-adj_path = (Path(__file__).resolve().parent.parent / "stress_adjudication.json")
+adj_path = (Path(__file__).resolve().parent.parent / "data" / "stress_adjudication.json")
 adj = json.loads(adj_path.read_text(encoding="utf-8")) if adj_path.exists() else {}
 W = re.compile(r"[А-Яа-яЁё+]+")
 tot = ok = 0; bad = Counter(); skipped = 0; wrong = 0; right = 0; undecided = Counter()

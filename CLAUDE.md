@@ -600,7 +600,7 @@ There are NO separate workflow scripts or folders any more. `fb2_reader.py` is t
 ## Реальный прогон «Пепла победы», голос xenia (10 октября 2026) — что нашли
 Отчёт и артефакты: `audiobook_output2/_test_xenia_ch1_2/REPORT.md`. Кратко: (1) silero-stress сдвигает «+» влево после «/"/„/“/… перед словом (лечится пробелом, `_unglue_leading_punct`);
 (2) шлюз терял заглавную и удваивал «+» у слов на ударную гласную; (3) сноски FB2 «noteN» были в тексте (`strip_footnote_markers`) и роняли Silero («note шестнадцать» + «* * *») — фрагмент уходил в тишину;
-(4) метрики: `stress_gold.json`/`stress_benchmark.py`, `tools/stress_accuracy.py` (+`stress_adjudication.json`), `tools/audio_verify.py`, `check_stress_versions.py`. Ударение в аудио на слух НЕ проверено; ASR его не проверяет.
+(4) метрики: `data/stress_gold.json`/`stress_benchmark.py`, `tools/stress_accuracy.py` (+`data/stress_adjudication.json`), `tools/audio_verify.py`, `check_stress_versions.py`. Ударение в аудио на слух НЕ проверено; ASR его не проверяет.
 Сверка имён со старыми аудиокнигами серии (`E:\Документы2\книги\Хонор Харингтон`, чтец Князев): mp3 читаются через soundfile, m4b — нет (в системе только ffmpeg BlueStacks без AAC); акустическая оценка слога ненадёжна (см. REPORT).
 
 ## Подмены произношения (только для озвучки), 10 октября 2026
@@ -640,4 +640,5 @@ There are NO separate workflow scripts or folders any more. `fb2_reader.py` is t
 тесты и `stress_benchmark.py`/`check_stress_versions.py` (их зовёт `install.bat`). Модули плоские (импорты, `main.spec`, PyInstaller) — НЕ раскладывать по пакетам без переделки сборки.
 `tools/` — исследовательские скрипты, которые никто не импортирует (acoustic_*, asr_*, narrator_*, audio_verify, chapter_stress_audit, stress_accuracy); они сами добавляют корень в `sys.path`
 и берут данные из корня (`Path(__file__).resolve().parent.parent`). Запуск: `.venv\Scripts\python.exe toolsudio_verify.py ...` из корня.
+`data/` — данные оценки (`stress_gold.json`, `stress_adjudication.json`); словари, которые правит пользователь, и `stress_review_log.jsonl` лежат в корне (их ищет `app_paths`).
 `_archive/` (в `.gitignore`) — бэкапы `*.bak_*` и черновики; `*.exe`, `*.fb2`, `grammar_gate_models/`, `audiobook_output*/` тоже не в git.

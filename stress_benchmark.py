@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fb2_reader as fr  # noqa: E402
 
-GOLD = json.loads(Path(__file__).with_name("stress_gold.json").read_text(encoding="utf-8"))
+GOLD = json.loads((Path(__file__).resolve().parent / "data" / "stress_gold.json").read_text(encoding="utf-8"))
 ACC = fr._load_silero_stress()
 if ACC is None:
     sys.exit("silero-stress is required")
