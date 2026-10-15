@@ -492,7 +492,7 @@ pymorphy3 (`_guess_name_gender`), пол голоса — по пометке "(
 
 - SSML-`rate` ТОЛЬКО как «107%», НЕ «+7%» (Silero читает «+7%» как 7% скорости → предложение 27 с и ошибка «tensor a ... must match tensor b (5000)»).
 - Хвостовой кусок короче 150 символов присоединяется к предыдущему (`_split_paragraphs_for_ssml`) — меньше отдельных вызовов синтеза = меньше скачков тембра.
-- `test_accentuation.py` — запуск `python test_accentuation.py` (нужны silero-stress; шлюз-тесты пропускаются без slovnet); известные промахи моделей помечены KNOWN-LIMITATION.
+- `test_accentuation.py` — запуск `python tools\test_accentuation.py` (нужны silero-stress; шлюз-тесты пропускаются без slovnet); известные промахи моделей помечены KNOWN-LIMITATION.
 
 ## Фразы в словаре ударений (8 октября 2026)
 
@@ -636,9 +636,10 @@ There are NO separate workflow scripts or folders any more. `fb2_reader.py` is t
   прирост цепочки над сырым silero-stress на этом наборе статистически не доказан. Чтобы доказать, нужно золото ≥ 200 целей.
 
 ## Раскладка корня проекта (15 октября 2026)
-В корне — только то, что нужно приложению и сборке: `fb2_reader*.py`, `gui_*.py`, `silero_*`, REST-сервисы, `app_paths.py`, `grammar_gate.py`, `install.bat`, `run_*.bat`, словари/конфиги,
-тесты и `stress_benchmark.py`/`check_stress_versions.py` (их зовёт `install.bat`). Модули плоские (импорты, `main.spec`, PyInstaller) — НЕ раскладывать по пакетам без переделки сборки.
-`tools/` — исследовательские скрипты, которые никто не импортирует (acoustic_*, asr_*, narrator_*, audio_verify, chapter_stress_audit, stress_accuracy); они сами добавляют корень в `sys.path`
-и берут данные из корня (`Path(__file__).resolve().parent.parent`). Запуск: `.venv\Scripts\python.exe toolsudio_verify.py ...` из корня.
+В корне — только то, что нужно приложению и сборке: `fb2_reader*.py`, `gui_*.py`, `silero_*`, REST-сервисы, `app_paths.py`, `grammar_gate.py`, `stress_questions.py`, `install.bat`, `run_*.bat`, словари/конфиги.
+Модули плоские (импорты, `main.spec`, PyInstaller) — НЕ раскладывать по пакетам без переделки сборки.
+`tools/` — все вспомогательные скрипты: тесты (`test_accentuation.py`, `test_book_pipeline.py`), `stress_benchmark.py`, `check_stress_versions.py`, `download_stress_corpus.py` (его зовёт `install.bat`),
+`audio_cleanup.py`, `audio_stress_review.py`, `check_ambiguous_stress.py`, acoustic_*, asr_*, narrator_*, audio_verify, chapter_stress_audit, stress_accuracy. Каждый сам добавляет корень в `sys.path`
+и берёт данные из корня (`Path(__file__).resolve().parent.parent`). Запуск из корня: `.venv\Scripts\python.exe tools\test_accentuation.py` (тест сам делает chdir в корень).
 `data/` — данные оценки (`stress_gold.json`, `stress_adjudication.json`); словари, которые правит пользователь, и `stress_review_log.jsonl` лежат в корне (их ищет `app_paths`).
 `_archive/` (в `.gitignore`) — бэкапы `*.bak_*` и черновики; `*.exe`, `*.fb2`, `grammar_gate_models/`, `audiobook_output*/` тоже не в git.
