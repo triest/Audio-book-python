@@ -84,8 +84,8 @@ fb2_reader.py — озвучивание книг в формате FB2 на р�
   # Командная строка (как раньше):
   python3 fb2_reader.py book.fb2 --mode silero --speaker xenia --outdir audiobook
 
-Доступные модели Silero (--model): v5_5_ru (последняя, по умолчанию),
-v5_4_ru, v5_ru, v4_ru (устаревшая, поддерживает random).
+Доступные модели Silero (--model): v5_6_ru (последняя, по умолчанию),
+v5_5_ru, v5_4_ru, v5_ru, v4_ru (устаревшая, поддерживает random).
 Голоса (--speaker): aidar (муж.), baya (жен.),
 kseniya (жен.), xenia (жен.), eugene (муж.), random (только v4_ru).
 """
@@ -4038,6 +4038,25 @@ _silero_stress_instance = None
 _silero_stress_load_failed = False
 
 
+def _load_silero_stress_phrases(accentor) -> None:
+    """Контекстные правила омографов silero-stress 1.5 (silero_stress_phrases.json: слово -> {фраза: форма слова}).
+    Приоритет выше нейросети; ошибка в файле не мешает работе (ключи с "_" — комментарии)."""
+    try:
+        import tempfile
+        path = _app_paths.resolve_asset("silero_stress_phrases.json")
+        if not path.exists():
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        clean = {w: v for w, v in data.items() if not w.startswith("_") and isinstance(v, dict) and v}
+        if not clean:
+            return
+        tmp = Path(tempfile.gettempdir()) / "silero_stress_phrases_clean.json"
+        tmp.write_text(json.dumps(clean, ensure_ascii=False), encoding="utf-8")
+        accentor.homosolver.load_phrases_dict(str(tmp))
+    except Exception as e:
+        print(f"silero_stress_phrases.json пропущен ({type(e).__name__}: {e})")
+
+
 def _load_silero_stress():
     """Лениво загружает и кэширует silero-stress — единственный акцентор конвейера
     (https://github.com/snakers4/silero-stress; разрешает омографы по контексту).
@@ -4050,6 +4069,7 @@ def _load_silero_stress():
     try:
         from silero_stress import load_accentor
         _silero_stress_instance = load_accentor()
+        _load_silero_stress_phrases(_silero_stress_instance)
         print("silero-stress загружен.")
     except Exception as e:
         _silero_stress_load_failed = True
@@ -4896,7 +4916,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                strip_monosyllables: bool = True,
                stress_review: "bool | None" = None):
     """Озвучка через Silero TTS — нейросетевой русский голос, локально.
-    По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
+    По умолчанию v5_6_ru (последняя модель: эмфазы, восклицания, вопросы; прежняя — v5_5_ru).
 
     Текст делится на короткие куски по знакам препинания (см.
     _segments_with_pauses), между кусками вставляется пауза нужной длины —

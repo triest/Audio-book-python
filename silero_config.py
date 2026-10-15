@@ -7,8 +7,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-# Последняя русская модель Silero (август 2026): v5_5_ru
-DEFAULT_SILERO_MODEL = "v5_5_ru"
+# Последняя русская модель Silero (15 октября 2026): v5_6_ru (эмфазы, восклицания, вопросы). Прежняя: v5_5_ru
+DEFAULT_SILERO_MODEL = "v5_6_ru"
 
 SILERO_MODELS: dict[str, dict] = {
     "v3_1_ru": {
@@ -17,8 +17,14 @@ SILERO_MODELS: dict[str, dict] = {
         "local_file": 'silero_model_v3_1_ru.pt',
         "speakers": ('aidar', 'baya', 'kseniya', 'xenia', 'eugene'),
     },
+    "v5_6_ru": {
+        "title": "Silero v5.6 — последняя (эмфазы, восклицания, вопросы)",
+        "package_url": "https://models.silero.ai/models/tts/ru/v5_6_ru.pt",
+        "local_file": "silero_model_v5_6_ru.pt",
+        "speakers": ("aidar", "baya", "kseniya", "xenia", "eugene"),
+    },
     "v5_5_ru": {
-        "title": "Silero v5.5 — последняя (ударения, омографы, вопросы)",
+        "title": "Silero v5.5 — прежняя (ударения, омографы, вопросы)",
         "package_url": "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
         "local_file": "silero_model_v5_5_ru.pt",
         "speakers": ("aidar", "baya", "kseniya", "xenia", "eugene"),

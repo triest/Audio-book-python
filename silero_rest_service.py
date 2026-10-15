@@ -55,7 +55,7 @@ async def _log_unhandled_exceptions(request: Request, exc: Exception):
  
 from silero_config import DEFAULT_SILERO_MODEL, load_silero_package
 
-# Модель по умолчанию — v5_5_ru (последняя). Переопределить: set SILERO_MODEL=v5_4_ru
+# Модель по умолчанию — v5_6_ru (последняя; прежняя v5_5_ru). Переопределить: set SILERO_MODEL=v5_4_ru
 MODEL_ID = os.environ.get("SILERO_MODEL", DEFAULT_SILERO_MODEL)
  
  
