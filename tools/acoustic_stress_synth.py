@@ -12,7 +12,7 @@ WORDS = ["замок", "мука", "хонор", "харрингтон", "ним
          "адмирал", "эскадра", "трумэн", "кромарти", "лафолле", "василиск", "республика", "протектор", "миледи", "милорд", "леонард", "елизавета",
          "александер", "мюллер", "оскар", "парнелл"]
 VOW = "аеёиоуыэюя"
-imp = torch.package.PackageImporter(str(Path(__file__).with_name("silero_model_v5_5_ru.pt")))
+imp = torch.package.PackageImporter(str((Path(__file__).resolve().parent.parent / "silero_model_v5_5_ru.pt")))
 m = imp.load_pickle("tts_models", "model"); m.to("cpu")
 meta = []
 for w in WORDS:

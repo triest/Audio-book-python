@@ -48,7 +48,7 @@ def best_template(seg_contour, templates):
 
 def validate(testdir, tmpldir, out):
     import librosa, whisper
-    sys.path.insert(0, str(Path(__file__).parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from acoustic_stress import locate_word
     meta = json.load(open(Path(testdir) / "meta.json", encoding="utf-8"))
     tmeta = json.load(open(Path(tmpldir) / "meta.json", encoding="utf-8"))

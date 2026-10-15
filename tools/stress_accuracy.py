@@ -11,10 +11,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 T = Path(sys.argv[1]); a, b = int(sys.argv[2]), int(sys.argv[3]); LIST = int(sys.argv[sys.argv.index("--list") + 1]) if "--list" in sys.argv else 0
 corpus = defaultdict(set)
-for l in gzip.open(Path(__file__).with_name("stress_corpus_ru.tsv.gz"), "rt", encoding="utf-8"):
+for l in gzip.open((Path(__file__).resolve().parent.parent / "stress_corpus_ru.tsv.gz"), "rt", encoding="utf-8"):
     p = l.rstrip("\n").split("\t")
     if len(p) == 2: corpus[p[0].lower().replace("ё", "е")].add(p[1].lower().replace("^", "+").replace("ё", "е"))
-adj_path = Path(__file__).with_name("stress_adjudication.json")
+adj_path = (Path(__file__).resolve().parent.parent / "stress_adjudication.json")
 adj = json.loads(adj_path.read_text(encoding="utf-8")) if adj_path.exists() else {}
 W = re.compile(r"[А-Яа-яЁё+]+")
 tot = ok = 0; bad = Counter(); skipped = 0; wrong = 0; right = 0; undecided = Counter()

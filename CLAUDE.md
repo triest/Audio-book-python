@@ -600,7 +600,7 @@ There are NO separate workflow scripts or folders any more. `fb2_reader.py` is t
 ## Реальный прогон «Пепла победы», голос xenia (10 октября 2026) — что нашли
 Отчёт и артефакты: `audiobook_output2/_test_xenia_ch1_2/REPORT.md`. Кратко: (1) silero-stress сдвигает «+» влево после «/"/„/“/… перед словом (лечится пробелом, `_unglue_leading_punct`);
 (2) шлюз терял заглавную и удваивал «+» у слов на ударную гласную; (3) сноски FB2 «noteN» были в тексте (`strip_footnote_markers`) и роняли Silero («note шестнадцать» + «* * *») — фрагмент уходил в тишину;
-(4) метрики: `stress_gold.json`/`stress_benchmark.py`, `stress_accuracy.py` (+`stress_adjudication.json`), `audio_verify.py`, `check_stress_versions.py`. Ударение в аудио на слух НЕ проверено; ASR его не проверяет.
+(4) метрики: `stress_gold.json`/`stress_benchmark.py`, `tools/stress_accuracy.py` (+`stress_adjudication.json`), `tools/audio_verify.py`, `check_stress_versions.py`. Ударение в аудио на слух НЕ проверено; ASR его не проверяет.
 Сверка имён со старыми аудиокнигами серии (`E:\Документы2\книги\Хонор Харингтон`, чтец Князев): mp3 читаются через soundfile, m4b — нет (в системе только ffmpeg BlueStacks без AAC); акустическая оценка слога ненадёжна (см. REPORT).
 
 ## Подмены произношения (только для озвучки), 10 октября 2026
@@ -629,8 +629,15 @@ There are NO separate workflow scripts or folders any more. `fb2_reader.py` is t
 - **`_text_guard`** (`fb2_reader.py`, вокруг каждого слоя `apply_stress_layers`): слой не может менять буквы (допустимы только «+» и е/ё). Нарушил — для этого куска слой пропускается
   (теряются только метки, не слова), счётчик `_fallback_stats["text_guard"]`, первые 20 случаев в консоль. Отключить нельзя и не нужно. Тест — «text guard» в `test_accentuation.py`.
   Сервис Silero не менялся, `SERVICE_VERSION` не бампали. Реальный прогон цепочки на Windows после правки НЕ запускался: после первого прогона смотреть, не растёт ли `text_guard` (должно быть 0).
-- **`audio_verify.py`**: к покрытию добавлены WER, CER (по выравниванию слов + точное расстояние Левенштейна в расходящихся группах), `loop_ratio` (zlib по окнам из 60 слов ASR) и флаг `resynth`
+- **`tools/audio_verify.py`**: к покрытию добавлены WER, CER (по выравниванию слов + точное расстояние Левенштейна в расходящихся группах), `loop_ratio` (zlib по окнам из 60 слов ASR) и флаг `resynth`
   (CER > 0,05, или пропущенный кусок ≥ 6 слов, или loop_ratio > 3,0). Порог петли: обычный текст книги даёт до ~2,4, зацикленная фраза ~10 (замерено на `pepel-pobedy.fb2`, а не на реальном ASR — откалибровать на первом прогоне).
   Различия CER меньше ~0,01 — шум самой ASR. ASR НЕ проверяет ударение, только то, что текст произнесён.
 - **`stress_benchmark.py`**: к итогу добавлен 95% интервал Уилсона и вывод «различимы / не различимы». На золоте из 68 целей 64/68 (94,1%) и 67/68 (98,5%) имеют ПЕРЕКРЫВАЮЩИЕСЯ интервалы (85,8–97,7 и 92,1–99,7):
   прирост цепочки над сырым silero-stress на этом наборе статистически не доказан. Чтобы доказать, нужно золото ≥ 200 целей.
+
+## Раскладка корня проекта (15 октября 2026)
+В корне — только то, что нужно приложению и сборке: `fb2_reader*.py`, `gui_*.py`, `silero_*`, REST-сервисы, `app_paths.py`, `grammar_gate.py`, `install.bat`, `run_*.bat`, словари/конфиги,
+тесты и `stress_benchmark.py`/`check_stress_versions.py` (их зовёт `install.bat`). Модули плоские (импорты, `main.spec`, PyInstaller) — НЕ раскладывать по пакетам без переделки сборки.
+`tools/` — исследовательские скрипты, которые никто не импортирует (acoustic_*, asr_*, narrator_*, audio_verify, chapter_stress_audit, stress_accuracy); они сами добавляют корень в `sys.path`
+и берут данные из корня (`Path(__file__).resolve().parent.parent`). Запуск: `.venv\Scripts\python.exe toolsudio_verify.py ...` из корня.
+`_archive/` (в `.gitignore`) — бэкапы `*.bak_*` и черновики; `*.exe`, `*.fb2`, `grammar_gate_models/`, `audiobook_output*/` тоже не в git.

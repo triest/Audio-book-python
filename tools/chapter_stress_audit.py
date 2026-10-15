@@ -4,17 +4,17 @@ Writes OUTDIR/text/chN_plain.txt, chN_B_annotated.txt and OUTDIR/audit_chN.json.
 import gzip, json, re, sys
 from collections import defaultdict
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import fb2_reader as fr
 
 out = Path(sys.argv[1]); (out / "text").mkdir(parents=True, exist_ok=True)
 acc = fr._load_silero_stress()
 corpus = defaultdict(set)
-for l in gzip.open(Path(__file__).with_name("stress_corpus_ru.tsv.gz"), "rt", encoding="utf-8"):
+for l in gzip.open((Path(__file__).resolve().parent.parent / "stress_corpus_ru.tsv.gz"), "rt", encoding="utf-8"):
     p = l.rstrip("\n").split("\t")
     if len(p) == 2: corpus[p[0].lower().replace("ё", "е")].add(p[1].lower().replace("^", "+"))
 stress_dict = fr.load_stress_dictionary(fr.DEFAULT_FORCED_STRESS_PATH) if hasattr(fr, "load_stress_dictionary") else {}
-title, chapters = fr.parse_fb2(Path(__file__).with_name("pepel-pobedy.fb2"))
+title, chapters = fr.parse_fb2((Path(__file__).resolve().parent.parent / "pepel-pobedy.fb2"))
 W = re.compile(r"[А-Яа-яЁё+]+(?:-[А-Яа-яЁё+]+)*")
 for ch in map(int, sys.argv[2:]):
     name, text = chapters[ch - 1]
