@@ -3657,6 +3657,36 @@ def restore_pronunciation_substitutions(text: str, held: dict) -> str:
     return _PRON_PH_RE.sub(lambda m: held.get("PRONSUB" + m.group(1), ""), text)
 
 
+_LATIN_DIGRAPHS = (("sch", "ш"), ("tch", "ч"), ("th", "з"), ("sh", "ш"), ("ch", "ч"), ("ph", "ф"), ("ck", "к"), ("oo", "у"),
+                   ("ee", "и"), ("kh", "х"), ("zh", "ж"), ("qu", "кв"))
+_LATIN_LETTERS = dict(zip("abcdefghijklmnopqrstuvwxyz",
+                          ["а", "б", "к", "д", "е", "ф", "г", "х", "и", "дж", "к", "л", "м", "н", "о", "п", "к", "р",
+                           "с", "т", "а", "в", "в", "кс", "и", "з"]))
+
+
+def latin_to_cyrillic_ru(text: str) -> str:
+    """Safety net: Silero's alphabet is Cyrillic - ONE Latin letter in an SSML request makes the whole request fail
+    ('NoneType' object has no attribute 'keys') and the chunk falls back to a flat plain-text synthesis. Whatever Latin
+    is left after the pronunciation substitutions is transliterated roughly, so the chunk keeps pauses and prosody."""
+    if not text or not re.search(r"[A-Za-z]", text):
+        return text
+
+    def conv(m: "re.Match") -> str:
+        w, low, out, i = m.group(0), m.group(0).lower(), [], 0
+        while i < len(low):
+            for dg, ru in _LATIN_DIGRAPHS:
+                if low.startswith(dg, i):
+                    out.append(ru)
+                    i += len(dg)
+                    break
+            else:
+                out.append(_LATIN_LETTERS.get(low[i], ""))
+                i += 1
+        res = "".join(out)
+        return res[:1].upper() + res[1:] if w[:1].isupper() else res
+    return re.sub(r"[A-Za-z]+", conv, text)
+
+
 def pronunciation_digest(subs: dict, text: str) -> str:
     """Hash of the substitutions that occur in `text` ("" when none) - part of the chapter fingerprint, so editing ONE
     substitution re-synthesizes exactly the chapters that use it."""
@@ -5456,9 +5486,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         if _client_layers:
             protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, stress_dict)
             protected = apply_stress_layers(protected, stress_engine, silero_stress_accentor)
-            return restore_pronunciation_substitutions(restore_stress_placeholders(protected, placeholders), _pron_held)
-        return restore_pronunciation_substitutions(
-            strip_monosyllable_stress(apply_stress_dictionary(plain_text_chunk, stress_dict)), _pron_held)
+            return latin_to_cyrillic_ru(restore_pronunciation_substitutions(restore_stress_placeholders(protected, placeholders), _pron_held))
+        return latin_to_cyrillic_ru(restore_pronunciation_substitutions(
+            strip_monosyllable_stress(apply_stress_dictionary(plain_text_chunk, stress_dict)), _pron_held))
 
     # Заполняется заново для каждой главы (см. основной цикл ниже) —
     # {абзац_исходного_текста: {"rate":..,"pitch":..}} по классификации LLM.
