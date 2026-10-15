@@ -97,12 +97,38 @@ rem prints a warning and fb2_reader.py keeps working without it.
 "%VENV_PY%" download_stress_corpus.py
 
 rem Local Silero synthesis (the main, recommended mode)
+rem CUDA build of torch in the MAIN venv (plain PyPI "torch" is CPU-only; Silero TTS can use the GPU).
+rem Skipped when the venv already has a CUDA build; otherwise the CPU build is replaced (cu126, then cu130 - cu121/cu124 have no wheels for Python 3.14).
+"%VENV_PY%" -c "import sys,torch; sys.exit(0 if torch.version.cuda else 1)" 2>nul
+if errorlevel 1 (
+    "%VENV_PY%" -m pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+    if errorlevel 1 "%VENV_PY%" -m pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+)
 "%VENV_PY%" -m pip install silero torch torchaudio omegaconf
 if errorlevel 1 goto :warn_partial
 
 rem Silero via a separate REST service (SSML pauses, optional)
-"%VENV_PY%" -m pip install fastapi uvicorn ruaccent silero-stress num2words
+"%VENV_PY%" -m pip install fastapi uvicorn num2words
 if errorlevel 1 goto :warn_partial
+
+rem silero-stress - the ONLY accentuation model (context-aware stress, ~0.5 s per chapter chunk on CPU).
+rem pinned to the verified version (stress_versions.lock.json); upgrade procedure: see check_stress_versions.py
+"%VENV_PY%" -m pip install silero-stress==1.5
+if errorlevel 1 echo WARNING: silero-stress failed to install - there will be no automatic stress marks ^(only the dictionary^).
+
+rem Leftovers of the removed RUAccent / ruaccent-predictor engines: drop them so they cannot bloat the .exe.
+"%VENV_PY%" -m pip uninstall -y ruaccent ruaccent-predictor >nul 2>nul
+if exist "%~dp0ruaccent_predictor_pkg" rmdir /s /q "%~dp0ruaccent_predictor_pkg"
+
+rem Grammar gate (case/number stress homographs): slovnet morphology tagger + 29 MB of models. Optional:
+rem if anything here fails the gate stays off and the rest of the pipeline is unaffected.
+"%VENV_PY%" -m pip install slovnet navec razdel
+"%VENV_PY%" fb2_reader.py fetch-models
+if errorlevel 1 echo WARNING: grammar models were not downloaded - the grammar gate stays off ^(and the .exe will not contain them^) until you run install.bat again.
+
+rem PyInstaller - builds the single-file .exe at the end of this script.
+"%VENV_PY%" -m pip install --upgrade pyinstaller
+if errorlevel 1 echo WARNING: pyinstaller failed to install - the .exe build step below will be skipped.
 
 rem pymorphy3 - Russian morphology analyzer, used to pick the correct
 rem stress for a handful of common words whose stress depends on
@@ -190,6 +216,7 @@ echo .venv folder, and run install.bat again so it rebuilds the
 echo environment on that Python instead.
 
 :pygame_ok
+call :build_exe
 echo.
 echo Main dependencies installed successfully.
 echo (If you saw a warning above like "dependency resolver does not
@@ -706,6 +733,7 @@ echo.
 goto :done
 
 :warn_partial
+call :build_exe
 echo.
 echo WARNING: some packages failed to install (see the error messages above).
 echo The program will still start - whatever failed to install will just
@@ -717,7 +745,54 @@ goto :done
 :done
 echo.
 echo ===============================================
-echo   All done. You can now run run_gui.bat.
+echo   All done.
+if exist "%~dp0fb2_reader.exe" echo   Run fb2_reader.exe ^(the single-file build^), or run_gui.bat ^(from sources^).
+if not exist "%~dp0fb2_reader.exe" echo   Run run_gui.bat ^(the .exe was not built - see the messages above^).
 echo ===============================================
 echo.
 pause
+exit /b 0
+
+rem ===============================================
+rem   Single-file .exe build (PyInstaller, main.spec).
+rem   Called after all Python dependencies and the grammar models are in
+rem   place, because main.spec packs them (silero-stress, slovnet, tkinter).
+rem   Result: dist\fb2_reader.exe, copied next to this file as
+rem   fb2_reader.exe - there it finds (and seeds) the editable files
+rem   (stress_dictionary.json, forced_stress_words.json, ...) and the
+rem   models it must NOT carry inside (silero_model_v5_5_ru.pt,
+rem   pretrained_models\). Failures here are not fatal.
+rem ===============================================
+:build_exe
+if defined BUILD_DONE exit /b 0
+set "BUILD_DONE=1"
+echo.
+echo ===============================================
+echo   Building the single-file fb2_reader.exe ^(PyInstaller^)
+echo ===============================================
+"%VENV_PY%" -c "import PyInstaller" >nul 2>nul
+if errorlevel 1 (
+    echo WARNING: PyInstaller is not installed - skipping the .exe build.
+    exit /b 0
+)
+if not exist "%~dp0grammar_gate_models\slovnet_morph_news_v1.tar" echo WARNING: grammar models are missing - the .exe will be built WITHOUT the grammar gate.
+"%VENV_PY%" -c "import silero_stress" >nul 2>nul
+if errorlevel 1 echo WARNING: silero-stress is not installed - the .exe would have no automatic stress marks.
+rem a running fb2_reader.exe locks the file and makes the build fail
+taskkill /F /IM fb2_reader.exe >nul 2>nul
+rem forced CLEAN build: no stale build\ / dist\ output from an earlier (e.g. folder-mode) build
+if exist "%~dp0build" rmdir /s /q "%~dp0build"
+if exist "%~dp0dist" rmdir /s /q "%~dp0dist"
+rem strictly ONE monolithic file (main.spec reads this variable; it is also its default)
+set "AUDIOBOOK_ONEFILE=1"
+"%VENV_PY%" -m PyInstaller main.spec --noconfirm --clean --distpath "%~dp0dist" --workpath "%~dp0build"
+if errorlevel 1 (
+    echo WARNING: the .exe build failed - see the messages above. The program still runs from sources ^(run_gui.bat^).
+    exit /b 0
+)
+if exist "%~dp0dist\fb2_reader.exe" (
+    copy /Y "%~dp0dist\fb2_reader.exe" "%~dp0fb2_reader.exe" >nul
+    echo Built: %~dp0fb2_reader.exe
+    echo Check it with:  fb2_reader.exe selftest
+)
+exit /b 0

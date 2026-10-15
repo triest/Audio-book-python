@@ -99,6 +99,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+import app_paths as _app_paths   # one place for source/PyInstaller (sys._MEIPASS) path logic
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -313,6 +315,22 @@ def iter_text(element) -> str:
     return text.strip()
 
 
+# Footnote anchors in this FB2 (and in many epub->fb2 conversions) are literal text glued to the word: "РУФnote 2 ,", "Честь.note 1 Хонор".
+# They were read aloud / crashed Silero on a "note шестнадцать" + "* * *" chunk (found in the real-book run, 10 Oct 2026).
+_FOOTNOTE_RE = re.compile(r"[ ]*" + r"note" + r"[ ]*" + r"[0-9]+" + r"(?![0-9A-Za-z])" + r"[ ]*")
+
+
+def strip_footnote_markers(text: str) -> str:
+    """Removes "noteN" footnote anchors from chapter text, keeping a single space between the neighbours and no space before
+    punctuation ("РУФnote 2 , а" -> "РУФ, а"; "Честь.note 1 Хонор" -> "Честь. Хонор")."""
+    if not text or "note" not in text:
+        return text
+    out = _FOOTNOTE_RE.sub(" ", text)
+    out = re.sub(r"[ ]+([,.;:!?»)])", r"\1", out)
+    out = re.sub(r"(?m)[ ]+$", "", out)
+    return re.sub(r"[ ]{2,}", " ", out)
+
+
 def parse_fb2(path: Path):
     """Возвращает (заголовок_книги, [(заголовок_главы, текст_главы), ...])."""
     data = load_fb2_bytes(path)
@@ -365,13 +383,13 @@ def parse_fb2(path: Path):
         if not top_sections:
             top_sections = collect_sections(body)
         if not top_sections:
-            text = iter_text(body)
+            text = strip_footnote_markers(iter_text(body))
             if text:
                 chapters.append(("Текст", text))
             continue
         for i, sec in enumerate(top_sections, 1):
             title = section_title(sec) or f"Глава {i}"
-            text = iter_text(sec)
+            text = strip_footnote_markers(iter_text(sec))
             if text:
                 chapters.append((title, text))
 
@@ -395,7 +413,9 @@ try:
 except ImportError:
     num2words = None
 
-_NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+# A leading "-" is a minus sign only when it is not glued to a word/number ("5-6" is a range);
+# a hyphen between a number and letters ("20-летие") becomes a space.
+_NUMBER_RE = re.compile(r"(?P<neg>(?<![\w-])-)?(?P<num>\d+(?:[.,]\d+)?)(?P<hy>-(?=[^\W\d_]))?")
 
 
 def numbers_to_words_ru(text: str) -> str:
@@ -410,13 +430,22 @@ def numbers_to_words_ru(text: str) -> str:
         return text
 
     def _repl(m: "re.Match") -> str:
-        raw = m.group(0)
+        raw = m.group("num")
         try:
             if "," in raw or "." in raw:
-                return num2words(float(raw.replace(",", ".")), lang="ru")
-            return num2words(int(raw), lang="ru")
+                words = num2words(float(raw.replace(",", ".")), lang="ru")
+            else:
+                words = num2words(int(raw), lang="ru")
         except Exception:
-            return raw
+            return m.group(0)
+        if m.group("neg"):
+            words = "минус " + words
+        # The words are always separated from neighbouring letters/digits ("10лет" -> "десять лет"):
+        # glued to a neighbour, Silero swallows the number word.
+        s, a, b = m.string, m.start(), m.end()
+        left = " " if a > 0 and re.match(r"\w", s[a - 1]) else ""
+        right = " " if m.group("hy") or (b < len(s) and re.match(r"\w", s[b])) else ""
+        return left + words + right
 
     return _NUMBER_RE.sub(_repl, text)
 
@@ -453,6 +482,24 @@ def _params_fingerprint(text: str, **params) -> dict:
     fingerprint = dict(params)
     fingerprint["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return fingerprint
+
+
+def stress_dict_digest(stress_dict, text: "str | None" = None) -> str:
+    """Short content hash of the stress dictionary entries that can affect `text` (all entries when
+    text is None; phrase keys are always included). Part of the chapter fingerprint, so changing
+    ONE stress mark (same number of entries) re-synthesizes exactly the chapters that use that
+    word - and leaves the others alone."""
+    items = dict(stress_dict or {})
+    if text is not None:
+        words = {w.lower() for w in _STRESS_WORD_RE.findall(text)}
+        words |= {w.replace("ё", "е") for w in words}
+        items = {k: v for k, v in items.items()
+                 if " " in k or k in words or k.replace("ё", "е") in words}
+    try:
+        blob = json.dumps(sorted(items.items()), ensure_ascii=False)
+    except Exception:
+        blob = repr(items)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def _is_already_done(out_path: Path, fingerprint: dict) -> bool:
@@ -606,12 +653,16 @@ ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 GEMINI_GENERATE_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 YANDEXGPT_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+# The app is 100% local/free: speaker attribution and smart emotions need an LLM (local or paid
+# cloud), so they are OFF in the active pipeline. Dialogue voices simply alternate per quote.
+# (The LLM code stays in this file but is unreachable unless AUDIOBOOK_LLM_FEATURES=1.)
+LLM_FEATURES_ENABLED = os.environ.get("AUDIOBOOK_LLM_FEATURES", "0") == "1"
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 LMSTUDIO_HOST_DEFAULT = "http://localhost:1234"
 
 ATTRIBUTION_PROVIDERS = {
     "yandexgpt": {
-        "title": "YandexGPT (бесплатный лимит, тот же ключ/каталог, что и SpeechKit)",
+        "title": "Yandex SpeechKit / AI Studio (YandexGPT, тот же ключ и каталог)",
         "default_model": "yandexgpt-lite",
         "key_hint": "Работает из России без VPN, доступен грант на бесплатные запросы в "
                      "Yandex Cloud. Можно использовать тот же API-ключ и Folder ID, что и "
@@ -631,27 +682,6 @@ ATTRIBUTION_PROVIDERS = {
         "default_model": "claude-haiku-4-5",
         "key_hint": "Платный ключ: console.anthropic.com/settings/keys (нужна привязанная "
                      "иностранная карта — из России оплатить напрямую обычно нельзя).",
-    },
-    "ollama": {
-        "title": "Ollama (локально на вашей машине, бесплатно, без ключа)",
-        "default_model": "qwen2.5:7b-instruct",
-        "key_hint": "Ключ не нужен — используется уже запущенный локально Ollama "
-                     "(ollama.com, команда 'ollama serve') и заранее скачанная модель "
-                     "(например 'ollama pull qwen2.5:7b-instruct'). Поле 'API-ключ' можно "
-                     "оставить пустым или вписать туда что угодно — не используется. Укажите "
-                     "имя установленной модели в поле ниже и, если Ollama слушает не на "
-                     "localhost:11434, адрес сервера (поле 'Адрес Ollama').",
-    },
-    "lmstudio": {
-        "title": "LM Studio (локально на вашей машине, бесплатно, без ключа)",
-        "default_model": "local-model",
-        "key_hint": "Ключ не нужен — используется локальный сервер LM Studio (вкладка "
-                     "Developer -> Start Server, по умолчанию http://localhost:1234, "
-                     "OpenAI-совместимый API). В поле 'Модель' впишите идентификатор "
-                     "загруженной модели ровно как он показан в LM Studio (например "
-                     "'qwen3.8-14b-instruct-turbo'); адрес сервера — в поле 'Адрес "
-                     "локального сервера', если он не стандартный. Поле 'API-ключ' не "
-                     "используется.",
     },
 }
 DEFAULT_ATTRIBUTION_PROVIDER = "yandexgpt"
@@ -748,6 +778,7 @@ def attribute_speakers_anthropic(text: str, api_key: str, model: str, log_fn=Non
         json={
             "model": model,
             "max_tokens": 4096,
+            "temperature": 0.0,
             "tools": [_ATTRIBUTION_TOOL_SCHEMA],
             "tool_choice": {"type": "tool", "name": "report_speakers"},
             "messages": [{"role": "user", "content": prompt}],
@@ -828,6 +859,7 @@ def attribute_speakers_gemini(text: str, api_key: str, model: str, log_fn=None) 
         json={
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "tools": [{"function_declarations": [gemini_schema]}],
+            "generationConfig": {"temperature": 0.0},
             "tool_config": {"function_calling_config": {"mode": "ANY",
                                                           "allowed_function_names": ["report_speakers"]}},
         },
@@ -929,7 +961,7 @@ def attribute_speakers_yandexgpt(text: str, api_key: str, model: str, folder_id:
         },
         json={
             "modelUri": model_uri,
-            "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": "4000"},
+            "completionOptions": {"stream": False, "temperature": 0.0, "maxTokens": "4000"},
             "messages": [{"role": "user", "text": prompt}],
         },
         timeout=120,
@@ -981,7 +1013,7 @@ def _ollama_chat_request(prompt: str, model: str, host: str = "", log_fn=None, t
             "(например 'qwen2.5:7b-instruct', 'ollama pull qwen2.5:7b-instruct')."
         )
     host = (host or OLLAMA_HOST_DEFAULT).rstrip("/")
-    options = {"temperature": 0.1}
+    options = {"temperature": 0.0}
     if max_tokens:
         options["num_predict"] = int(max_tokens)
     payload = {
@@ -1026,26 +1058,42 @@ def _lmstudio_chat_request(prompt: str, model: str, host: str = "", log_fn=None,
     import requests
 
     host = (host or LMSTUDIO_HOST_DEFAULT).rstrip("/")
-    try:
-        resp = requests.post(
-            f"{host}/v1/chat/completions",
-            json={
-                "model": model or "local-model",
-                # "/no_think" — штатный выключатель рассуждения у Qwen3-семейства;
-                # остальные модели воспринимают как безобидную приписку.
-                "messages": [{"role": "user", "content": prompt + "\n/no_think"}],
-                "temperature": 0.1,
-                "stream": False,
-                **({"max_tokens": int(max_tokens)} if max_tokens else {}),
-            },
-            timeout=timeout,
-        )
-    except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(
-            f"Не удалось подключиться к LM Studio по адресу {host} ({e}). Запустите локальный "
-            "сервер в LM Studio (вкладка Developer -> Start Server) и проверьте адрес "
-            "(по умолчанию http://localhost:1234)."
-        )
+
+    def _post(mt, extra):
+        try:
+            return requests.post(
+                f"{host}/v1/chat/completions",
+                json={
+                    "model": model or "local-model",
+                    # "/no_think" — штатный выключатель рассуждения у Qwen3-семейства.
+                    "messages": [{"role": "user", "content": prompt + "\n/no_think"}],
+                    "temperature": 0.0,
+                    "stream": False,
+                    **({"max_tokens": int(mt)} if mt else {}),
+                    **extra,
+                },
+                timeout=timeout,
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(
+                f"Не удалось подключиться к LM Studio по адресу {host} ({e}). Запустите локальный "
+                "сервер в LM Studio (вкладка Developer -> Start Server) и проверьте адрес "
+                "(по умолчанию http://localhost:1234)."
+            )
+
+    def _parse(resp):
+        ch = resp.json()["choices"][0]
+        msg = ch.get("message") or {}
+        c = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.DOTALL).strip()
+        return c, (msg.get("reasoning_content") or ""), ch.get("finish_reason")
+
+    # Просим выключить рассуждение (неизвестные поля LM Studio игнорирует; если
+    # сервер всё же вернёт 400 — повторяем без них).
+    extra = {"chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"}
+    resp = _post(max_tokens, extra)
+    if resp.status_code == 400:
+        extra = {}
+        resp = _post(max_tokens, extra)
     if resp.status_code >= 400:
         body = resp.text[:1000]
         if log_fn:
@@ -1056,54 +1104,224 @@ def _lmstudio_chat_request(prompt: str, model: str, host: str = "", log_fn=None,
             "совпадает с показанным в LM Studio."
         )
     try:
-        content = resp.json()["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, TypeError, ValueError):
+        content, reasoning, finish = _parse(resp)
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
         raise RuntimeError(f"LM Studio не вернул ожидаемый ответ (ответ: {resp.text[:500]})")
-    # Модели с "рассуждением" (Qwen3 thinking и т.п.) могут вернуть <think>...</think>
-    # прямо в тексте — для разбора JSON это только мешает.
-    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    if not content and reasoning:
+        # Модель «думала» и исчерпала max_tokens: повторяем с большим бюджетом.
+        if log_fn:
+            log_fn("LM Studio: модель тратит токены на рассуждение (reasoning), пустой ответ; "
+                   "повтор с увеличенным лимитом. Отключите 'Thinking' у модели в LM Studio "
+                   "или возьмите non-thinking Instruct-сборку — так будет намного быстрее.")
+        big = max((int(max_tokens) if max_tokens else 0) * 6, 4096)
+        resp = _post(big, extra)
+        if resp.status_code < 400:
+            try:
+                content, reasoning, finish = _parse(resp)
+            except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+                pass
+        if not content and reasoning:
+            # Последняя попытка: JSON иногда оказывается внутри рассуждения.
+            m = re.findall(r"\[[^\[\]]*\]|\{[^{}]*\}", reasoning, flags=re.DOTALL)
+            if m:
+                content = m[-1]
     if not content:
-        raise RuntimeError("LM Studio вернул пустой ответ")
+        raise RuntimeError(
+            "LM Studio вернул пустой ответ (модель в режиме рассуждения не уложилась в лимит). "
+            "Выключите Thinking у модели в LM Studio или выберите non-thinking Instruct-модель."
+        )
     return content
 
 
+LOCAL_LLM_AUTOSTART = os.environ.get("AUDIOBOOK_LLM_AUTOSTART", "1") != "0"
+LOCAL_LLM_CONTEXT = 8192      # атрибуции говорящих нужно 8192+
+LOCAL_LLM_TTL_SECONDS = 900   # LM Studio сам выгрузит модель после простоя -> VRAM свободна для TTS
+_local_llm_last_check: dict = {}
+
+
+def _cli_path(name: str, extra: "list[str]") -> "str | None":
+    import shutil
+    found = shutil.which(name)
+    if found:
+        return found
+    for c in extra:
+        c = os.path.expandvars(os.path.expanduser(c))
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _run_cli(args: "list[str]", timeout: int = 60) -> "tuple[int, str]":
+    import subprocess
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, creationflags=flags)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        return -1, str(e)
+
+
+def _http_alive(url: str, timeout: float = 2.0) -> "tuple[bool, str]":
+    import requests
+    try:
+        r = requests.get(url, timeout=timeout)
+        return r.status_code < 500, r.text
+    except Exception:
+        return False, ""
+
+
+def _wait_alive(url: str, seconds: float) -> bool:
+    import time
+    end = time.time() + seconds
+    while time.time() < end:
+        if _http_alive(url)[0]:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def ensure_local_llm(backend: str, model: str, host: str = "", log_fn=None, force: bool = False) -> bool:
+    if not LLM_FEATURES_ENABLED:   # local/free mode: never probe :1234 / :11434, never run `lms`
+        return False
+    """Автоматически поднимает локальную LLM: запускает сервер LM Studio
+    ('lms server start') / Ollama ('ollama serve') и загружает модель с
+    контекстом LOCAL_LLM_CONTEXT и авто-выгрузкой через LOCAL_LLM_TTL_SECONDS.
+    Не падает: при любой неудаче пишет подсказку и возвращает False
+    (дальше всё работает как раньше). Проверка не чаще раза в 2 минуты."""
+    import time
+    log = log_fn or print
+    host = (host or (LMSTUDIO_HOST_DEFAULT if backend == "lmstudio" else OLLAMA_HOST_DEFAULT)).rstrip("/")
+    key = (backend, host, model)
+    if not force and time.time() - _local_llm_last_check.get(key, 0) < 120:
+        return True
+    _local_llm_last_check[key] = time.time()
+    try:
+        if backend == "lmstudio":
+            probe = f"{host}/v1/models"
+            lms = _cli_path("lms", ["~/.lmstudio/bin/lms.exe", "~/.lmstudio/bin/lms",
+                                    "%USERPROFILE%/.lmstudio/bin/lms.exe"])
+            if not _http_alive(probe)[0]:
+                if not lms:
+                    log("LM Studio: сервер не отвечает, а утилита 'lms' не найдена — запустите "
+                        "сервер вручную (Developer -> Start Server).")
+                    return False
+                log("LM Studio: запускаю локальный сервер (lms server start)...")
+                _run_cli([lms, "server", "start"], timeout=90)
+                if not _wait_alive(probe, 45):
+                    log("LM Studio: сервер не поднялся за 45 сек — запустите его вручную.")
+                    return False
+            if lms and model:
+                rc, out = _run_cli([lms, "ps"], timeout=30)
+                if model.lower() not in out.lower():
+                    log(f"LM Studio: загружаю модель {model} (контекст {LOCAL_LLM_CONTEXT})...")
+                    rc, out = _run_cli([lms, "load", model, "--context-length", str(LOCAL_LLM_CONTEXT),
+                                        "--ttl", str(LOCAL_LLM_TTL_SECONDS), "-y"], timeout=300)
+                    if rc != 0:
+                        rc, out = _run_cli([lms, "load", model, "-y"], timeout=300)
+                    if rc != 0:
+                        log(f"LM Studio: не удалось загрузить модель автоматически ({out.strip()[:300]}).")
+                        return False
+            return True
+        # ollama
+        probe = f"{host}/api/tags"
+        if not _http_alive(probe)[0]:
+            exe = _cli_path("ollama", ["%LOCALAPPDATA%/Programs/Ollama/ollama.exe"])
+            if not exe:
+                log("Ollama: сервер не отвечает и 'ollama' не найден — запустите приложение Ollama.")
+                return False
+            import subprocess
+            log("Ollama: запускаю сервер (ollama serve)...")
+            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)) if os.name == "nt" else 0
+            subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, creationflags=flags)
+            if not _wait_alive(probe, 45):
+                log("Ollama: сервер не поднялся за 45 сек.")
+                return False
+        return True
+    except Exception as e:
+        log(f"Автозапуск локальной LLM не удался: {e}")
+        return False
+
+
 def _local_chat_request(prompt: str, model: str, host: str = "", backend: str = "ollama",
-                         log_fn=None, max_tokens: "int | None" = None) -> str:
-    """Единая точка для локальных LLM-серверов: 'ollama' или 'lmstudio'."""
-    if backend == "lmstudio":
-        return _lmstudio_chat_request(prompt, model, host=host, log_fn=log_fn, max_tokens=max_tokens)
-    return _ollama_chat_request(prompt, model, host=host, log_fn=log_fn, max_tokens=max_tokens)
+                         log_fn=None, max_tokens: "int | None" = None, api_key: str = "") -> str:
+    """Единая точка для локальных LLM-серверов: 'ollama' или 'lmstudio'.
+    Перед запросом автоматически поднимает сервер/модель (ensure_local_llm);
+    при отказе соединения или 'модель не найдена' — один повтор после
+    принудительного перезапуска."""
+    def _once():
+        if backend == "lmstudio":
+            return _lmstudio_chat_request(prompt, model, host=host, log_fn=log_fn, max_tokens=max_tokens)
+        return _ollama_chat_request(prompt, model, host=host, log_fn=log_fn, max_tokens=max_tokens)
+
+    if not LLM_FEATURES_ENABLED:
+        raise RuntimeError("Локальные LLM (LM Studio/Ollama) отключены: приложение работает полностью "
+                           "локально без LLM (AUDIOBOOK_LLM_FEATURES=1 включает обратно).")
+    if not LOCAL_LLM_AUTOSTART:
+        return _once()
+    ensure_local_llm(backend, model, host, log_fn)
+    try:
+        return _once()
+    except RuntimeError as e:
+        msg = str(e)
+        if "подключиться" in msg or "model_not_found" in msg or "HTTP 400" in msg or "HTTP 404" in msg:
+            if ensure_local_llm(backend, model, host, log_fn, force=True):
+                return _once()
+        raise
 
 
 def attribute_speakers_ollama(text: str, model: str, host: str = "", log_fn=None,
-                               backend: str = "ollama") -> list:
+                               backend: str = "ollama", api_key: str = "") -> list:
     """То же самое через локальный Ollama (ollama.com) — работает полностью
     офлайн/бесплатно на машине пользователя, но без строгого function
     calling у большинства моделей просим вернуть JSON текстом и парсим его
     сами, как и для YandexGPT (см. _extract_json_array)."""
-    dialogue_count = _attribution_dialogue_count(text)
-    if dialogue_count == 0:
+    if _attribution_dialogue_count(text) == 0:
         return []
 
-    prompt = (
-        _attribution_prompt(text, dialogue_count) +
-        "\n\nВерни ОТВЕТ СТРОГО в виде JSON-массива строк, без каких-либо пояснений, "
-        "markdown-разметки или текста до/после — только сам массив, например: "
-        '["Иван Петров", "unknown", "Мария"]'
-    )
-    if log_fn:
-        log_fn(f"Атрибуция говорящих через {backend} ({model}): {dialogue_count} реплик, "
-               f"{len(text)} симв. текста главы...")
+    # Локальные модели имеют небольшое окно контекста (часто 4–8К токенов), а глава
+    # может быть длиннее — режем по абзацам на куски ~5000 символов.
+    chunks, cur, cur_len = [], [], 0
+    for para in text.split("\n"):
+        if cur and cur_len + len(para) > 5000:
+            chunks.append("\n".join(cur))
+            cur, cur_len = [], 0
+        cur.append(para)
+        cur_len += len(para) + 1
+    if cur:
+        chunks.append("\n".join(cur))
 
-    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn,
-                                    max_tokens=120 + 16 * dialogue_count)
-    results = _extract_json_array(raw_text)
-    if results is None:
-        raise RuntimeError(
-            f"Локальная модель вернула ответ, из которого не удалось извлечь список говорящих "
-            f"(ответ модели: {raw_text[:500]})"
+    all_results, failed = [], 0
+    for idx, chunk in enumerate(chunks, 1):
+        n = _attribution_dialogue_count(chunk)
+        if n == 0:
+            continue
+        prompt = (
+            _attribution_prompt(chunk, n) +
+            "\n\nВерни ОТВЕТ СТРОГО в виде JSON-массива строк, без каких-либо пояснений, "
+            "markdown-разметки или текста до/после — только сам массив, например: "
+            '["Иван Петров", "unknown", "Мария"]'
         )
-    return _normalize_attribution_results(results, dialogue_count, log_fn)
+        if log_fn:
+            log_fn(f"Атрибуция говорящих через {backend} ({model}): часть {idx}/{len(chunks)}, "
+                   f"{n} реплик, {len(chunk)} симв....")
+        try:
+            raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn,
+                                            max_tokens=120 + 16 * n, api_key=api_key)
+            res = _extract_json_array(raw_text)
+            if res is None:
+                raise RuntimeError(f"не удалось извлечь список из ответа: {raw_text[:200]}")
+            all_results.extend(_normalize_attribution_results(res, n, log_fn))
+        except Exception as e:
+            failed += 1
+            if log_fn:
+                log_fn(f"Часть {idx}/{len(chunks)}: ошибка ({str(e)[:300]}) — реплики помечены 'unknown'.")
+            all_results.extend(["unknown"] * n)
+    if failed == len([c for c in chunks if _attribution_dialogue_count(c)]):
+        raise RuntimeError("Модель не смогла разобрать ни одной части главы "
+                           "(проверьте ключ/Folder ID Yandex и доступ к Yandex Cloud).")
+    return all_results
 
 
 def attribute_speakers_llm(text: str, api_key: str, model: str = DEFAULT_ATTRIBUTION_MODEL,
@@ -1119,7 +1337,8 @@ def attribute_speakers_llm(text: str, api_key: str, model: str = DEFAULT_ATTRIBU
     if provider == "anthropic":
         return attribute_speakers_anthropic(text, api_key, model, log_fn=log_fn)
     if provider in ("ollama", "lmstudio"):
-        return attribute_speakers_ollama(text, model, host=ollama_host, log_fn=log_fn, backend=provider)
+        return attribute_speakers_ollama(text, model, host=ollama_host, log_fn=log_fn, backend=provider,
+                                          api_key=api_key)
     return attribute_speakers_gemini(text, api_key, model, log_fn=log_fn)
 
 
@@ -1161,6 +1380,33 @@ SILERO_EMOTION_PROSODY = {
 }
 
 
+SILERO_EMOTION_INTENSITY = 0.6   # доля от табличного сдвига rate/pitch (мягче -> меньше «карикатуры»)
+SILERO_EMOTION_SMOOTHING = 0.5   # вес текущего абзаца в скользящем среднем (меньше = плавнее)
+
+
+def smooth_emotion_prosody(labels: "list[str]") -> "list[dict]":
+    """Метки эмоций по абзацам -> список {"rate","pitch"} со сглаживанием:
+    1) одиночный «выброс» между двумя одинаковыми соседями убирается;
+    2) сдвиги rate/pitch ослабляются (SILERO_EMOTION_INTENSITY);
+    3) скользящее среднее по абзацам — тон меняется плавно, а не скачком
+    на границе абзаца."""
+    lab = list(labels)
+    for i in range(1, len(lab) - 1):
+        if lab[i - 1] == lab[i + 1] and lab[i] != lab[i - 1]:
+            lab[i] = lab[i - 1]
+    out = []
+    prev_r = prev_p = 0.0
+    for l in lab:
+        base = SILERO_EMOTION_PROSODY.get(l) or SILERO_EMOTION_PROSODY["neutral"]
+        r = (float(base["rate"].rstrip("%")) - 100.0) * SILERO_EMOTION_INTENSITY
+        pt = float(base["pitch"].rstrip("%")) * SILERO_EMOTION_INTENSITY
+        a = SILERO_EMOTION_SMOOTHING
+        prev_r = a * r + (1 - a) * prev_r
+        prev_p = a * pt + (1 - a) * prev_p
+        out.append({"rate": f"{100 + round(prev_r)}%", "pitch": f"{round(prev_p):+d}%"})
+    return out
+
+
 _EMOTION_LABEL_HINTS = {
     "good": "тёплая/бодрая/доброжелательная интонация",
     "neutral": "обычное повествование без выраженной окраски",
@@ -1173,7 +1419,7 @@ _EMOTION_LABEL_HINTS = {
 }
 
 
-def _emotion_prompt(paragraphs: "list[str]", allowed_emotions: "list[str]") -> str:
+def _emotion_prompt(paragraphs: "list[str]", allowed_emotions: "list[str]", keyed: bool = False) -> str:
     labels = "/".join(allowed_emotions)
     hints = "; ".join(f"'{e}' — {_EMOTION_LABEL_HINTS[e]}" for e in allowed_emotions if e in _EMOTION_LABEL_HINTS)
     numbered = "\n".join(f"{i + 1}. {p[:400]}" for i, p in enumerate(paragraphs))
@@ -1181,12 +1427,22 @@ def _emotion_prompt(paragraphs: "list[str]", allowed_emotions: "list[str]") -> s
         "Ниже — пронумерованные абзацы одной главы книги на русском языке. Для КАЖДОГО "
         f"абзаца определи наиболее подходящую эмоциональную окраску речи из набора: {labels}.\n"
         f"Значения: {hints}. Опирайся на смысл и контекст абзаца (что происходит, "
-        "какие эмоции у персонажей/рассказчика), а не на отдельные слова.\n\n"
-        f"Верни ОТВЕТ СТРОГО в виде JSON-массива строк длиной ровно {len(paragraphs)} — "
-        "по одной метке на каждый абзац, в том же порядке, без каких-либо пояснений, "
-        f"markdown-разметки или текста до/после массива, например: "
-        + str(["neutral"] * min(3, len(paragraphs))) + "\n\n"
-        "--- АБЗАЦЫ ---\n" + numbered
+        "какие эмоции у персонажей/рассказчика), а не на отдельные слова. Озвучка — "
+        "аудиокнига: интонация НЕ должна скакать. Если окраска не выражена явно — ставь "
+        "'neutral'; соседние абзацы одной сцены обычно имеют одну и ту же метку, меняй её "
+        "только при явной смене настроения сцены.\n\n"
+        + (
+            f"Верни ОТВЕТ СТРОГО в виде JSON-объекта: ключ — номер абзаца (строкой), значение — "
+            f"метка, ровно {len(paragraphs)} ключей, например "
+            + str({str(i + 1): "neutral" for i in range(min(3, len(paragraphs)))}).replace("'", '"')
+            + ", без пояснений, markdown-разметки или текста до/после объекта.\n\n"
+            if keyed else
+            f"Верни ОТВЕТ СТРОГО в виде JSON-массива строк длиной ровно {len(paragraphs)} — "
+            "по одной метке на каждый абзац, в том же порядке, без каких-либо пояснений, "
+            f"markdown-разметки или текста до/после массива, например: "
+            + str(["neutral"] * min(3, len(paragraphs))) + "\n\n"
+        )
+        + "--- АБЗАЦЫ ---\n" + numbered
     )
 
 
@@ -1216,7 +1472,7 @@ def classify_paragraph_emotions_anthropic(paragraphs, api_key, model, allowed_em
         ANTHROPIC_MESSAGES_URL,
         headers={"x-api-key": api_key, "anthropic-version": ANTHROPIC_API_VERSION,
                  "content-type": "application/json"},
-        json={"model": model, "max_tokens": 2048,
+        json={"model": model, "max_tokens": 2048, "temperature": 0.0,
               "messages": [{"role": "user", "content": prompt}]},
         timeout=120,
     )
@@ -1238,7 +1494,8 @@ def classify_paragraph_emotions_gemini(paragraphs, api_key, model, allowed_emoti
     resp = requests.post(
         GEMINI_GENERATE_URL_TMPL.format(model=model),
         params={"key": api_key}, headers={"content-type": "application/json"},
-        json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
+        json={"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+              "generationConfig": {"temperature": 0.0}},
         timeout=120,
     )
     if resp.status_code >= 400:
@@ -1267,7 +1524,7 @@ def classify_paragraph_emotions_yandexgpt(paragraphs, api_key, model, allowed_em
         YANDEXGPT_COMPLETION_URL,
         headers={"Authorization": f"Api-Key {api_key}", "content-type": "application/json"},
         json={"modelUri": model_uri,
-              "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": "2000"},
+              "completionOptions": {"stream": False, "temperature": 0.0, "maxTokens": "2000"},
               "messages": [{"role": "user", "text": prompt}]},
         timeout=120,
     )
@@ -1285,15 +1542,42 @@ def classify_paragraph_emotions_yandexgpt(paragraphs, api_key, model, allowed_em
 
 
 def classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions, host: str = "",
-                                        log_fn=None, backend: str = "ollama") -> "list[str]":
-    """То же самое через локальный Ollama — см. attribute_speakers_ollama."""
-    prompt = _emotion_prompt(paragraphs, allowed_emotions)
-    raw_text = _local_chat_request(prompt, model, host=host, backend=backend, log_fn=log_fn,
-                                    max_tokens=80 + 8 * len(paragraphs))
-    results = _extract_json_array(raw_text)
-    if results is None:
-        raise RuntimeError(f"Локальная модель не вернула распознаваемый JSON-массив эмоций (ответ: {raw_text[:500]})")
-    return _normalize_emotion_results(results, len(paragraphs), allowed_emotions, log_fn)
+                                        log_fn=None, backend: str = "ollama", api_key: str = "") -> "list[str]":
+    """То же самое через локальную LLM. Метки приходят ПО НОМЕРАМ абзацев
+    ({"1": "joy", ...}), поэтому пропуск одного пункта не сдвигает все
+    остальные метки на соседние абзацы (раньше: '14 вместо 15' -> эмоции
+    уезжали и интонация «скакала»). Не пришедшие пункты перезапрашиваются
+    (до 2 раз), остаток — 'neutral'."""
+    default = "neutral" if "neutral" in allowed_emotions else allowed_emotions[0]
+    labels = [None] * len(paragraphs)
+    step = 15  # маленькие модели путают счёт на длинных списках — режем на пачки
+    for start in range(0, len(paragraphs), step):
+        idxs = list(range(start, min(start + step, len(paragraphs))))
+        for attempt in range(3):
+            if not idxs:
+                break
+            part = [paragraphs[i] for i in idxs]
+            try:
+                raw_text = _local_chat_request(_emotion_prompt(part, allowed_emotions, keyed=True),
+                                                model, host=host, backend=backend, log_fn=log_fn,
+                                                max_tokens=80 + 12 * len(part), api_key=api_key)
+            except Exception as e:
+                if log_fn:
+                    log_fn(f"Эмоции, пачка {start // step + 1}: ошибка ({str(e)[:200]}) — по умолчанию.")
+                break
+            parsed = _parse_stress_reply(raw_text, len(part))
+            for j, i in enumerate(idxs):
+                v = (parsed.get(j) or "").strip().lower()
+                if v in allowed_emotions:
+                    labels[i] = v
+            left = [i for i in idxs if labels[i] is None]
+            if len(left) == len(idxs):
+                break  # прогресса нет
+            idxs = left
+    missing = sum(1 for x in labels if x is None)
+    if missing and log_fn:
+        log_fn(f"Эмоции: для {missing} абзац(ев) метка не получена — 'neutral'.")
+    return [x or default for x in labels]
 
 
 def classify_paragraph_emotions_llm(paragraphs, allowed_emotions, api_key, model=DEFAULT_ATTRIBUTION_MODEL,
@@ -1312,7 +1596,8 @@ def classify_paragraph_emotions_llm(paragraphs, allowed_emotions, api_key, model
         return classify_paragraph_emotions_anthropic(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
     if provider in ("ollama", "lmstudio"):
         return classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions,
-                                                    host=ollama_host, log_fn=log_fn, backend=provider)
+                                                    host=ollama_host, log_fn=log_fn, backend=provider,
+                                                    api_key=api_key)
     return classify_paragraph_emotions_gemini(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
 
 
@@ -1419,13 +1704,13 @@ def _llm_text_request(prompt: str, creds: dict, log_fn=None) -> str:
     api_key = creds.get("api_key", "")
     if provider in ("ollama", "lmstudio"):
         return _local_chat_request(prompt, model, host=creds.get("ollama_host", ""),
-                                    backend=provider, log_fn=log_fn, max_tokens=600)
+                                    backend=provider, log_fn=log_fn, max_tokens=600, api_key=api_key)
     if provider == "anthropic":
         resp = requests.post(
             ANTHROPIC_MESSAGES_URL,
             headers={"x-api-key": api_key, "anthropic-version": ANTHROPIC_API_VERSION,
                      "content-type": "application/json"},
-            json={"model": model, "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": model, "max_tokens": 1024, "temperature": 0.0, "messages": [{"role": "user", "content": prompt}]},
             timeout=120)
         resp.raise_for_status()
         return "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text")
@@ -1434,7 +1719,7 @@ def _llm_text_request(prompt: str, creds: dict, log_fn=None) -> str:
             YANDEXGPT_COMPLETION_URL,
             headers={"Authorization": f"Api-Key {api_key}", "content-type": "application/json"},
             json={"modelUri": f"gpt://{creds.get('folder_id', '')}/{model}",
-                  "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": "1000"},
+                  "completionOptions": {"stream": False, "temperature": 0.0, "maxTokens": "1000"},
                   "messages": [{"role": "user", "text": prompt}]},
             timeout=120)
         resp.raise_for_status()
@@ -1442,7 +1727,8 @@ def _llm_text_request(prompt: str, creds: dict, log_fn=None) -> str:
     resp = requests.post(
         GEMINI_GENERATE_URL_TMPL.format(model=model), params={"key": api_key},
         headers={"content-type": "application/json"},
-        json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]}, timeout=120)
+        json={"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+              "generationConfig": {"temperature": 0.0}}, timeout=120)
     resp.raise_for_status()
     out = ""
     for cand in resp.json().get("candidates", []):
@@ -1524,14 +1810,20 @@ def _group_paragraphs_by_speaker_names(text: str, main_voice, dialogue_voices,
     grouped = []  # [[voice, [paragraphs], is_dialogue], ...]
     di = 0
     unknown_i = 0
+    hist = []  # голоса последних реплик
     for para, is_dialogue in paras:
         if is_dialogue:
             name = speaker_names[di] if di < len(speaker_names) else "unknown"
             di += 1
             name_key = name.strip().lower()
             if not name_key or name_key == "unknown":
-                voice = dialogue_voices[unknown_i % len(dialogue_voices)]
-                unknown_i += 1
+                if len(hist) >= 2:
+                    # диалог обычно идёт «пинг-понгом»: неопознанная реплика —
+                    # скорее всего от собеседника предыдущего говорящего
+                    voice = hist[-2]
+                else:
+                    voice = dialogue_voices[unknown_i % len(dialogue_voices)]
+                    unknown_i += 1
             elif name_key in character_voice_map:
                 voice = character_voice_map[name_key]
             else:
@@ -1560,7 +1852,7 @@ def resolve_voice_groups(text: str, main_voice, dialogue_voices, outdir: Path,
     на простое чередование, чтобы не срывать всю озвучку из-за LLM."""
     if not dialogue_voices:
         return [(main_voice, text)]
-    if not attribution:
+    if not attribution or not LLM_FEATURES_ENABLED:
         return _group_paragraphs_by_voice(text, main_voice, dialogue_voices)
 
     try:
@@ -1579,12 +1871,22 @@ def resolve_voice_groups(text: str, main_voice, dialogue_voices, outdir: Path,
     character_voice_map = _load_character_voice_map(outdir)
     # Пол НОВЫХ (ещё без закреплённого голоса) персонажей определяет та же
     # LLM, что делала атрибуцию — один дополнительный запрос на главу.
-    new_names = []
+    # Пол определяем для ВСЕХ персонажей главы (а не только новых): закреплённые
+    # раньше голоса могли быть выбраны без учёта пола (мужчина -> женский голос).
+    all_names = []
     for n in speaker_names:
         k = n.strip().lower()
-        if k and k != "unknown" and k not in character_voice_map and n.strip() not in new_names:
-            new_names.append(n.strip())
-    name_genders = detect_character_genders(new_names, text, attribution, log_fn) if new_names else {}
+        if k and k != "unknown" and n.strip() not in all_names:
+            all_names.append(n.strip())
+    name_genders = detect_character_genders(all_names, text, attribution, log_fn) if all_names else {}
+    for k in list(character_voice_map.keys()):
+        g = name_genders.get(k) or _guess_name_gender(k)
+        vg = _voice_gender(character_voice_map[k])
+        if g and vg and g != vg and any(_voice_gender(v) == g for v in dialogue_voices):
+            if log_fn:
+                log_fn(f"Персонаж «{k}»: голос {character_voice_map[k]} не подходит по полу "
+                       f"({'жен.' if g == 'f' else 'муж.'}) — подбираю другой.")
+            del character_voice_map[k]
     groups = _group_paragraphs_by_speaker_names(
         text, main_voice, dialogue_voices, speaker_names, character_voice_map, name_genders
     )
@@ -1933,7 +2235,7 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
         # либо диалоговые голоса без ermil/jane) ведём себя как раньше.
         emotion_voices_in_use = {g_voice for g_voice, _ in voice_groups} & set(YANDEX_EMOTION_VOICES)
         para_emotion_map: "dict[str, str] | None" = None
-        if smart_emotion and emotion_voices_in_use:
+        if smart_emotion and LLM_FEATURES_ENABLED and emotion_voices_in_use:
             all_paras = [p for g_text in (t for _v, t in voice_groups) for p in g_text.split("\n") if p.strip()]
             # Один общий набор допустимых эмоций на главу — пересечение
             # поддерживаемых наборов используемых голосов (чтобы не
@@ -2527,15 +2829,15 @@ def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms:
 
 # --------------------------------------------------------------------------
 # Ударения для локального режима silero: словарь книжных имён/терминов +
-# RUAccent как общая подстраховка. silero_rest_service.py (отдельный REST-
-# сервис) уже делает то же самое через RUAccent на сервере — здесь то же
+# silero-stress как общая подстраховка. silero_rest_service.py (отдельный REST-
+# сервис) уже делает то же самое через silero-stress на сервере — здесь то же
 # самое добавляется для ЛОКАЛЬНОГО режима (--mode silero, апелляция к
 # model.apply_tts напрямую), у которого раньше не было ничего, кроме
 # встроенного в саму модель Silero угадывания ударений (put_accent=True),
 # которое на редких/составных словах и омографах иногда ошибается.
 # --------------------------------------------------------------------------
 
-DEFAULT_STRESS_DICT_PATH = Path(__file__).resolve().parent / "stress_dictionary.json"
+DEFAULT_STRESS_DICT_PATH = _app_paths.user_file("stress_dictionary.json")
 
 # Захватывает и дефисные составные слова целиком ("во-первых", "кто-то") —
 # иначе они виделись бы словарю как два отдельных слова ("во" + "первых"),
@@ -2549,7 +2851,7 @@ _STRESS_WORD_RE = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*")
 # "замо́к", а также словоформы вроде "ка́зни"/"казни́", "ка́тера"/"катера́"):
 # для НИХ словарь в принципе не может дать один правильный ответ на все
 # случаи — единственный, кто в состоянии выбрать вариант по контексту
-# предложения, это RUAccent. Список — почти 1200 слов из открытого списка
+# предложения, это silero-stress. Список — почти 1200 слов из открытого списка
 # омографов проекта Silero (https://github.com/snakers4/silero-stress,
 # wiki Homograph-List) — хранится рядом со скриптом в
 # ambiguous_stress_words_ru.txt, по одному слову в нижнем регистре на
@@ -2559,9 +2861,7 @@ _STRESS_WORD_RE = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*")
 # (enrich_stress_dictionary_online такие слова даже не пытается искать).
 # --------------------------------------------------------------------------
 
-DEFAULT_AMBIGUOUS_STRESS_WORDS_PATH = (
-    Path(__file__).resolve().parent / "ambiguous_stress_words_ru.txt"
-)
+DEFAULT_AMBIGUOUS_STRESS_WORDS_PATH = _app_paths.resolve_asset("ambiguous_stress_words_ru.txt")
 
 _ambiguous_stress_words: "set | None" = None
 _ambiguous_stress_words_load_failed = False
@@ -2631,9 +2931,7 @@ def _load_ambiguous_stress_words(path: "Path | str | None" = None) -> set:
         return set()
 
 
-DEFAULT_NOT_AMBIGUOUS_STRESS_WORDS_PATH = (
-    Path(__file__).resolve().parent / "not_ambiguous_stress_words_ru.txt"
-)
+DEFAULT_NOT_AMBIGUOUS_STRESS_WORDS_PATH = _app_paths.resolve_asset("not_ambiguous_stress_words_ru.txt")
 
 _not_ambiguous_stress_words: "set | None" = None
 
@@ -2673,70 +2971,51 @@ def mark_word_not_ambiguous(word: str, path: "Path | str | None" = None) -> None
 
 def load_stress_dictionary(path: "Path | str | None" = None,
                             book_overrides_path: "Path | str | None" = None) -> dict:
-    """Загружает пользовательский словарь ударений — JSON вида
-    {"слово": "сл+ово"} (значение — слово с "+" перед ударной гласной,
-    в том виде, который понимает Silero). Ключи ищутся без учёта регистра.
-    Файл необязателен: если его нет — просто используется только RUAccent.
-    Ошибки чтения не прерывают синтез, а только выводятся в консоль,
-    чтобы опечатка в словаре не ломала всю озвучку.
+    """The USER's manual stress dictionaries only: forced_stress_words.json (top priority),
+    manual_stress_overrides.json and the per-book overrides. These words bypass the neural
+    network completely. The old auto-built stress_dictionary.json is no longer used (it was
+    built from a corpus with systemic errors, e.g. "с+ебе"); `path` is kept for compatibility."""
+    return load_manual_stress_entries(book_overrides_path)
 
-    Слова, у которых ударение зависит от контекста (см.
-    _load_ambiguous_stress_words выше), из словаря отфильтровываются — для
-    них решение всегда должен принимать RUAccent по контексту предложения,
-    а не единственный жёстко заданный вариант.
 
-    ИСКЛЮЧЕНИЕ: слова из manual_stress_overrides.json (см.
-    save_manual_stress_overrides/DEFAULT_MANUAL_STRESS_OVERRIDES_PATH) и из
-    book_overrides_path (см. book_manual_stress_overrides_path) НЕ
-    фильтруются, даже если входят в список омографов — это осознанный выбор
-    пользователя (сделанный в GUI кнопкой «Проверить ударения» после
-    просмотра примеров из текста), а не автоматическая догадка, поэтому
-    здесь ему разрешено переопределить решение RUAccent.
+DEFAULT_FORCED_STRESS_PATH = _app_paths.user_file("forced_stress_words.json")
 
-    book_overrides_path — ударения, назначенные вручную ДЛЯ КОНКРЕТНОЙ
-    КНИГИ (файл рядом с книгой, см. book_manual_stress_overrides_path).
-    Они применяются ПОВЕРХ общих manual_stress_overrides.json — то есть
-    если одно и то же слово по-разному размечено глобально и для этой
-    книги, побеждает книжная запись. Так разные книги могут расходиться в
-    том, как читать одно и то же неоднозначное слово."""
-    p = Path(path) if path else DEFAULT_STRESS_DICT_PATH
-    result = {}
-    if p.exists():
-        try:
+
+def _load_forced_stress(path: "Path | str | None" = None) -> dict:
+    """forced_stress_words.json — слова, которые ВСЕГДА читаются так, как
+    записано (выше LLM, словаря и silero-stress), например {"душу": "душ+у"}.
+    Для случаев, где пользователь точно знает нужное ударение."""
+    p = Path(path) if path else DEFAULT_FORCED_STRESS_PATH
+    try:
+        if p.exists():
             raw = json.loads(p.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                raise ValueError("ожидался JSON-объект {слово: слово_с_ударением}")
-            result = {str(k).lower(): str(v) for k, v in raw.items()}
-            ambiguous = _load_ambiguous_stress_words()
-            skipped = [k for k in result if k in ambiguous]
-            if skipped:
-                for k in skipped:
-                    del result[k]
-                print(f"В словаре ударений {p} пропущено {len(skipped)} слов(о) с "
-                      f"ударением, зависящим от контекста (омографы/словоформы вроде "
-                      f"«за́мок/замо́к», «ка́зни/казни́») — для них решает RUAccent по "
-                      f"контексту предложения, а не фиксированная запись в словаре.")
-        except Exception as e:
-            print(f"Не удалось прочитать словарь ударений {p}: {e} — продолжаю без него.")
-            result = {}
+            return {str(k).lower(): str(v) for k, v in raw.items() if not str(k).startswith("_")}
+    except Exception as e:
+        print(f"Не удалось прочитать {p}: {e}")
+    return {}
 
-    overrides = _load_manual_stress_overrides()
-    if overrides:
-        result.update(overrides)
 
+def load_manual_stress_entries(book_overrides_path: "Path | str | None" = None) -> dict:
+    """Everything the USER wrote by hand, merged with the same precedence as
+    load_stress_dictionary (global manual overrides < book overrides < forced_stress_words.json).
+    These words have ABSOLUTE authority: no context resolver, ё-pass, silero-stress or
+    silero-stress may change them."""
+    d = dict(_load_manual_stress_overrides())
     if book_overrides_path:
-        book_overrides = _load_manual_stress_overrides(book_overrides_path)
-        if book_overrides:
-            result.update(book_overrides)
-            print(f"Применено {len(book_overrides)} вручную заданных ударений для этой "
-                  f"книги ({Path(book_overrides_path)}).")
-
-    return result
+        d.update(_load_manual_stress_overrides(book_overrides_path))
+    d.update(_load_forced_stress())
+    return d
 
 
-DEFAULT_MANUAL_STRESS_OVERRIDES_PATH = (
-    Path(__file__).resolve().parent / "manual_stress_overrides.json"
-)
+DEFAULT_MANUAL_STRESS_OVERRIDES_PATH = _app_paths.user_file("manual_stress_overrides.json")
+
+
+def ensure_forced_stress_file(path: "Path | str | None" = None) -> Path:
+    """Creates forced_stress_words.json ({}) when missing; returns its path (GUI 'open dictionary')."""
+    p = Path(path) if path else DEFAULT_FORCED_STRESS_PATH
+    if not p.exists():
+        p.write_text("{\n}\n", encoding="utf-8")
+    return p
 
 
 def book_manual_stress_overrides_path(book_path: "Path | str") -> Path:
@@ -2796,7 +3075,7 @@ def add_preferred_stress(word: str, replacement: str) -> Path:
 
     - если слово НЕ входит в список омографов (_load_ambiguous_stress_words)
       — прямо в общий stress_dictionary.json, как обычная словарная запись;
-    - если слово омограф (не всегда однозначно, RUAccent сам решает по
+    - если слово омограф (не всегда однозначно, silero-stress сам решает по
       контексту) — в manual_stress_overrides.json, потому что
       load_stress_dictionary отфильтровывает омографы из stress_dictionary.json
       и запись туда молча пропадала бы при следующей загрузке.
@@ -2866,6 +3145,18 @@ def delete_stress_entry(word: str, source: "Path | str") -> bool:
     return True
 
 
+_KEEP_HYPHENS = False
+
+
+def set_keep_hyphens(enabled: bool) -> None:
+    """True when Silero's own put_accent is OFF for the run (the client chain marks every word itself):
+    the hyphen of a dictionary replacement ("сан-март+ин", "вс+ё-таки") is then kept as in the book text.
+    False (put_accent may run inside Silero, which would stress the first half of a hyphenated word on its
+    own): the hyphen is dropped from the replacement."""
+    global _KEEP_HYPHENS
+    _KEEP_HYPHENS = bool(enabled)
+
+
 def _prepare_stress_replacement(word: str, replacement: str) -> str:
     """Готовит значение из словаря ударений к вставке в текст, отдельно от
     самого поиска в словаре — общая часть для apply_stress_dictionary и
@@ -2880,15 +3171,24 @@ def _prepare_stress_replacement(word: str, replacement: str) -> str:
        из неё, не из остального текста книги). Причина: Silero сам
        разбивает текст на слова по дефису для своего ВСТРОЕННОГО put_accent
        (это отдельный механизм, до которого apply_stress_dictionary_protected
-       не дотягивается — тот защищает только от RUAccent) — увидев "во"
+       не дотягивается — тот защищает только от silero-stress) — увидев "во"
        отдельным "словом" без явного "+", он присваивает ему собственное
        ударение, и получается заметное, лишнее ударение на "во" вдобавок к
        правильному на "первых". Дефис в исходном тексте книги (обычные
        тире/составные слова, которых нет в словаре) при этом никак не
        затрагивается — это только для конкретных слов из словаря."""
-    if word[0].isupper() and replacement:
-        replacement = replacement[0].upper() + replacement[1:]
-    if "-" in word:
+    def _cap(part: str) -> str:
+        if part.startswith("+") and len(part) > 1:               # "+он" -> "+Он" (was lowercased)
+            return "+" + part[1].upper() + part[2:]
+        return part[:1].upper() + part[1:]
+
+    w_parts, r_parts = word.split("-"), replacement.split("-")
+    if "-" in word and _KEEP_HYPHENS and len(w_parts) == len(r_parts):
+        # "Сан-Мартин" -> "Сан-Март+ин": the capitalisation of EVERY part is copied
+        replacement = "-".join(_cap(r) if w[:1].isupper() and r else r for w, r in zip(w_parts, r_parts))
+    elif word[0].isupper() and replacement:
+        replacement = _cap(replacement)
+    if "-" in word and not _KEEP_HYPHENS:
         replacement = replacement.replace("-", "")
     return replacement
 
@@ -2901,13 +3201,13 @@ def _prepare_stress_replacement(word: str, replacement: str) -> str:
 # "командным пунктом звезды́") vs "зв+ёзды" (им./вин.п. мн.ч., "на небе
 # зажглись звёзды"). Такие слова были исключены из словаря целиком (см.
 # ambiguous_stress_words_ru.txt), и по умолчанию решение отдаётся на откуп
-# RUAccent — но RUAccent тоже иногда ошибается на таких примерах. Ниже —
+# silero-stress — но silero-stress тоже иногда ошибается на таких примерах. Ниже —
 # небольшой, вручную проверенный список самых частых слов с чередованием
 # ударения по типу "род.п. ед.ч. (на окончании) / им.п. мн.ч. (на основе)"
 # (это регулярный для русского языка тип склонения — т.н. "тип b" по
 # Зализняку) и простая эвристика на pymorphy3 + локальный контекст, чтобы
 # выбрать нужную форму. Если pymorphy3 не установлен или ничего не удаётся
-# определить — слово просто не трогаем (оставляем RUAccent как раньше),
+# определить — слово просто не трогаем (оставляем silero-stress как раньше),
 # никогда не гадаем вслепую.
 _CASE_AMBIGUOUS_NOUNS = {
     "звезды":  {"gen_sg": "звезд+ы",  "nom_pl": "зв+ёзды"},
@@ -3136,17 +3436,20 @@ def resolve_lemma_homographs(text: str) -> dict:
 
 def apply_stress_dictionary(text: str, stress_dict: dict) -> str:
     """Заменяет слова из пользовательского словаря на их вариант с "+" перед
-    ударной гласной — раньше, чем текст попадёт в RUAccent/put_accent, чтобы
+    ударной гласной — раньше, чем текст попадёт в silero-stress/put_accent, чтобы
     словарь имел приоритет над автоматическим угадыванием (для имён
     персонажей и специфических терминов книги, которые модель не знает)."""
-    if not stress_dict:
+    if not stress_dict and "ё" not in text.lower():
         return text
 
     def repl(m: "re.Match") -> str:
         word = m.group(0)
-        replacement = stress_dict.get(word.lower())
+        replacement = (stress_dict or {}).get(word.lower())
         if replacement is None:
-            return word
+            # "ё" is always stressed: mark it ("подошёл" -> "подош+ёл") so the
+            # engines/_sane_yo do not roll it back to "е".
+            marked = _mark_yo_stress(text, m.start(), word)
+            return marked if marked is not None else word
         return _prepare_stress_replacement(word, replacement)
 
     return _STRESS_WORD_RE.sub(repl, text)
@@ -3155,33 +3458,104 @@ def apply_stress_dictionary(text: str, stress_dict: dict) -> str:
 # Маркер-обёртка для apply_stress_dictionary_protected/restore_stress_placeholders
 # ниже — заведомо не встречается в обычном тексте книги (не кириллица, не
 # цифры, так что numbers_to_words_ru его не тронет) и не похожа на слово,
-# которое RUAccent попытался бы акцентировать.
+# которое silero-stress попытался бы акцентировать.
 _STRESS_PLACEHOLDER_RE = re.compile(r"STRESSDICT(\d+)")
 
 
-def apply_stress_dictionary_protected(text: str, stress_dict: dict) -> "tuple[str, dict]":
+# --- Multi-word entries in the user dictionaries ("мы все": "мы вс+е") --------------------------------
+# A key with spaces is a PHRASE. It must have the same number of words as its value and the same letters
+# (marks aside, е/ё equal). Every word of a matched phrase gets its own placeholder, so the neural net
+# still sees the whole sentence around them. Phrase marks win over single-word entries.
+_PHRASE_CACHE: dict = {}
+_phrase_warned: set = set()
+
+
+def _stress_plain(w: str) -> str:
+    return w.replace("+", "").replace("ё", "е").replace("Ё", "Е").lower()
+
+
+def _phrase_word_pattern(word: str) -> str:
+    out = []
+    for ch in _stress_plain(word):
+        out.append("[её]" if ch == "е" else re.escape(ch))
+    return r"\+?".join(out) + r"\+?"
+
+
+def _compiled_phrases(stress_dict: dict) -> list:
+    items = tuple(sorted((k, v) for k, v in stress_dict.items() if re.search(r"\s", str(k).strip())))
+    if not items:
+        return []
+    hit = _PHRASE_CACHE.get(items)
+    if hit is not None:
+        return hit
+    pats = []
+    for k, v in items:
+        kw, vw = str(k).split(), str(v).split()
+        if len(kw) != len(vw) or any(_stress_plain(a) != _stress_plain(b) for a, b in zip(kw, vw)):
+            if k not in _phrase_warned:
+                _phrase_warned.add(k)
+                print(f"Stress dictionary: phrase {k!r} -> {v!r} skipped (the value must be the same words "
+                      "with a '+' before the stressed vowel).")
+            continue
+        rx = (r"(?<![А-Яа-яЁё+-])"
+              + r"\s+".join("(" + _phrase_word_pattern(w) + ")" for w in kw)
+              + r"(?![А-Яа-яЁё+]|-[А-Яа-яЁё])")
+        pats.append((len(kw), re.compile(rx, re.I), vw))
+    pats.sort(key=lambda t: -t[0])          # longest phrase first
+    if len(_PHRASE_CACHE) > 8:
+        _PHRASE_CACHE.clear()
+    _PHRASE_CACHE[items] = pats
+    return pats
+
+
+def _phrase_forms(text: str, stress_dict: dict) -> dict:
+    """{start offset of a word: replacement} for every word of every phrase found in `text`."""
+    forms: dict = {}
+    for _n, rx, vw in _compiled_phrases(stress_dict or {}):
+        for m in rx.finditer(text):
+            starts = [m.start(i + 1) for i in range(len(vw))]
+            if any(st in forms for st in starts):
+                continue                      # overlaps a longer phrase already applied
+            for st, w in zip(starts, vw):
+                forms[st] = w
+    return forms
+
+
+def apply_stress_dictionary_protected(text: str, stress_dict: dict,
+                                       occurrence_forms: "dict | None" = None) -> "tuple[str, dict]":
     """То же самое, что apply_stress_dictionary, но вместо того чтобы сразу
     подставить в текст готовое "сл+ово" из словаря, подставляет временный
     непечатаемый маркер-плейсхолдер и возвращает (текст_с_плейсхолдерами,
     {плейсхолдер: готовая_замена}). Используется, когда после словаря текст
-    ещё пройдёт через RUAccent (apply_ruaccent) — RUAccent разбирает текст
+    ещё пройдёт через silero-stress — silero-stress разбирает текст
     на токены сам и на составных словах через дефис ("во-первых",
     "по-русски" и т.п.) может не распознать уже стоящее "+"-ударение и
     добавить своё собственное ЕЩЁ РАЗ, поверх — из-за двух ударений в одном
     слове получается характерное "странное растягивание" при синтезе.
-    Плейсхолдер (не кириллица, не похож на слово) RUAccent не трогает
+    Плейсхолдер (не кириллица, не похож на слово) silero-stress не трогает
     вообще, а после него исходная словарная форма возвращается на место
     через restore_stress_placeholders — так словарь остаётся полностью
     защищён от повторной обработки, а не просто "обычно не переписывается"."""
-    if not stress_dict:
+    if not stress_dict and not occurrence_forms and "ё" not in text.lower():
         return text, {}
+
+    phrase_forms = _phrase_forms(text, stress_dict)
+    if phrase_forms:
+        occurrence_forms = {**phrase_forms, **(occurrence_forms or {})}
 
     placeholders: dict = {}
     counter = [0]
 
     def repl(m: "re.Match") -> str:
         word = m.group(0)
-        replacement = stress_dict.get(word.lower())
+        # occurrence_forms — решение по КОНКРЕТНОМУ месту текста (омограф,
+        # разобранный LLM по контексту), приоритетнее словаря.
+        replacement = (occurrence_forms or {}).get(m.start())
+        if replacement is None:
+            replacement = (stress_dict or {}).get(word.lower())
+        if replacement is None:
+            # restored/original "ё" -> "+ё", protected from silero-stress/_sane_yo
+            replacement = _mark_yo_stress(text, m.start(), word)
         if replacement is None:
             return word
         replacement = _prepare_stress_replacement(word, replacement)
@@ -3195,10 +3569,109 @@ def apply_stress_dictionary_protected(text: str, stress_dict: dict) -> "tuple[st
     return protected, placeholders
 
 
+# Односложные слова, которым метка нужна: без неё Silero читает «лет» как «лёт».
+_MONO_KEEP_STRESS = frozenset({"лет"})
+_MONO_STRESS_RE = re.compile(r"[А-Яа-яЁё+]*\+[А-Яа-яЁё+]*")
+
+
+def strip_monosyllable_stress(text: str) -> str:
+    """Убирает "+" в словах с одной гласной ("+и", "+он", "н+е"): ударение там
+    однозначно, а лишняя метка в SSML/Silero даёт неестественное растягивание."""
+    if not _STRIP_MONO_ENABLED:
+        return text
+
+    def repl(m: "re.Match") -> str:
+        w = m.group(0)
+        plain = w.replace("+", "")
+        if "ё" in plain.lower():
+            return w          # "ё" is always stressed — keep "вс+ё", "ч+ём", "+ёж"
+        if plain.lower() in _MONO_KEEP_STRESS:
+            return w
+        if len(re.findall(r"[аеёиоуыэюяАЕЁИОУЫЭЮЯ]", plain)) <= 1:
+            return plain
+        return w
+    return _MONO_STRESS_RE.sub(repl, text)
+
+
+
+# ---------------------------------------------------------------------------
+# Pronunciation substitutions: TTS-ONLY rephrasing ("БГБ" -> "б+э г+э б+э"). The book text is never changed; the file
+# pronunciation_substitutions.json ({"БГБ": "б+э г+э б+э"}) lives next to the scripts/.exe. Keys are whole words, case-SENSITIVE,
+# each inflected form is its own key; the value is spoken as written (put "+" before stressed vowels yourself).
+# ---------------------------------------------------------------------------
+DEFAULT_PRONUNCIATION_PATH = _app_paths.user_file("pronunciation_substitutions.json")
+_PRON_CH = "А-Яа-яЁёA-Za-z0-9"
+_PRON_PH_RE = re.compile(r"PRONSUB([A-Z]+)")
+_pron_regex_cache: dict = {}
+
+
+def load_pronunciation_substitutions(path=None, book_path=None) -> dict:
+    out = {}
+    for p in (path or DEFAULT_PRONUNCIATION_PATH, book_path):
+        if not p:
+            continue
+        try:
+            pp = Path(p)
+            if pp.exists():
+                raw = json.loads(pp.read_text(encoding="utf-8"))
+                out.update({str(k): str(v) for k, v in raw.items() if not str(k).startswith("_") and str(v).strip()})
+        except Exception as e:
+            print(f"Не удалось прочитать {p}: {e}")
+    return out
+
+
+def _pron_regex(subs: dict):
+    keys = tuple(sorted(subs, key=len, reverse=True))
+    rx = _pron_regex_cache.get(keys)
+    if rx is None:
+        rx = re.compile(r"(?<![" + _PRON_CH + r"])(?:" + "|".join(re.escape(k) for k in keys) + r")(?![" + _PRON_CH + r"])")
+        _pron_regex_cache[keys] = rx
+    return rx
+
+
+def _pron_ph_name(i: int) -> str:
+    i += 1
+    s = ""
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return "PRONSUB" + s
+
+
+def protect_pronunciation_substitutions(text: str, subs: dict):
+    """Hides every substituted word behind a letters-only placeholder (survives numbers_to_words_ru, silero-stress, the gate)."""
+    if not subs or not text:
+        return text, {}
+    held: dict = {}
+
+    def _sub(m):
+        name = _pron_ph_name(len(held))
+        held[name] = subs[m.group(0)]
+        return name
+    return _pron_regex(subs).sub(_sub, text), held
+
+
+def restore_pronunciation_substitutions(text: str, held: dict) -> str:
+    if not held:
+        return text
+    return _PRON_PH_RE.sub(lambda m: held.get("PRONSUB" + m.group(1), ""), text)
+
+
+def pronunciation_digest(subs: dict, text: str) -> str:
+    """Hash of the substitutions that occur in `text` ("" when none) - part of the chapter fingerprint, so editing ONE
+    substitution re-synthesizes exactly the chapters that use it."""
+    if not subs or not text:
+        return ""
+    used = sorted({m.group(0) for m in _pron_regex(subs).finditer(text)})
+    if not used:
+        return ""
+    return hashlib.sha256(json.dumps([(k, subs[k]) for k in used], ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
 def restore_stress_placeholders(text: str, placeholders: dict) -> str:
     """Возвращает на место словарные ударения, спрятанные
     apply_stress_dictionary_protected под плейсхолдерами — после того, как
-    RUAccent (или что угодно ещё) обработал остальной текст. Заменяет все
+    silero-stress (или что угодно ещё) обработал остальной текст. Заменяет все
     плейсхолдеры ЗА ОДИН проход регулярным выражением, а не по очереди
     через text.replace() для каждого — иначе, например, "STRESSDICT1"
     случайно совпал бы с началом "STRESSDICT10" (это реальная подстрока)
@@ -3208,13 +3681,13 @@ def restore_stress_placeholders(text: str, placeholders: dict) -> str:
     (не должно происходить, но на всякий случай) — на этом этапе он просто
     вырезается, а не остаётся в тексте нечитаемым мусором."""
     if not placeholders:
-        return text
+        return strip_monosyllable_stress(text)
 
     def repl(m: "re.Match") -> str:
         return placeholders.get(m.group(0), "")
 
     text = _STRESS_PLACEHOLDER_RE.sub(repl, text)
-    return text
+    return strip_monosyllable_stress(text)
 
 
 # --------------------------------------------------------------------------
@@ -3226,7 +3699,7 @@ def restore_stress_placeholders(text: str, placeholders: dict) -> str:
 # запусках сеть больше не требовалась. Любая ошибка — нет интернета, сайт
 # недоступен, слова там нет, файл словаря нельзя записать — НЕ прерывает
 # синтез, а только пишется в консоль: в худшем случае слово просто
-# останется без словарного ударения и ударение расставит RUAccent/
+# останется без словарного ударения и ударение расставит silero-stress/
 # put_accent, как и раньше.
 # --------------------------------------------------------------------------
 
@@ -3258,9 +3731,7 @@ class _StressSourceRateLimited(Exception):
 # при прогоне книги целиком через один онлайн-источник.
 # --------------------------------------------------------------------------
 
-DEFAULT_OFFLINE_STRESS_CORPUS_PATH = (
-    Path(__file__).resolve().parent / "stress_corpus_ru.tsv.gz"
-)
+DEFAULT_OFFLINE_STRESS_CORPUS_PATH = _app_paths.resolve_asset("stress_corpus_ru.tsv.gz")
 
 # None = ещё не пробовали загрузить; {} = пробовали, но не получилось
 # (файла нет / битый / кончилась память и т.п.) — в обоих случаях больше
@@ -3275,7 +3746,7 @@ def _load_offline_stress_corpus(path: "Path | str | None" = None) -> dict:
     один раз за весь запуск (несколько секунд на ~1.7 млн строк). Файл
     необязателен: если его нет рядом со скриптом (например, кто-то не
     скачал/не скопировал stress_corpus_ru.tsv.gz) — молча используется
-    пустой словарь, синтез продолжается через RUAccent/онлайн-источники,
+    пустой словарь, синтез продолжается через silero-stress/онлайн-источники,
     как и раньше. Любая ошибка чтения (битый gzip, нехватка памяти и
     т.п.) тоже не прерывает синтез — только один раз печатается
     предупреждение."""
@@ -3307,7 +3778,7 @@ def _load_offline_stress_corpus(path: "Path | str | None" = None) -> dict:
     except Exception as e:
         _offline_stress_corpus_load_failed = True
         print(f"Не удалось загрузить офлайн-корпус ударений {p}: {e} — "
-              "продолжаю без него (останутся RUAccent/онлайн-источники).")
+              "продолжаю без него (останутся silero-stress/онлайн-источники).")
         return {}
 
 
@@ -3548,69 +4019,11 @@ def enrich_stress_dictionary_online(text: str, stress_dict: dict,
               "продолжаю без него.")
 
 
-_ruaccent_instance = None
-_ruaccent_load_failed = False
-
-
-def _load_ruaccent():
-    """Лениво загружает и кэширует RUAccent (тот же пакет и тот же патч
-    token_type_ids, что и в silero_rest_service.py — см. его
-    _patch_ruaccent_token_type_ids для подробного объяснения, зачем патч
-    нужен). При любой ошибке (пакет не установлен, модель не грузится)
-    возвращает None один раз печатает предупреждение и больше не
-    пытается — остальная озвучка продолжается без RUAccent, полагаясь на
-    встроенный в Silero put_accent."""
-    global _ruaccent_instance, _ruaccent_load_failed
-    if _ruaccent_instance is not None or _ruaccent_load_failed:
-        return _ruaccent_instance
-    try:
-        from ruaccent import RUAccent
-        accentizer = RUAccent()
-        accentizer.load(omograph_model_size='turbo3.1', use_dictionary=True)
-
-        # Патч token_type_ids — см. подробный комментарий в
-        # silero_rest_service.py._patch_ruaccent_token_type_ids. Без него
-        # некоторые версии onnxruntime/ruaccent падают на КАЖДОМ вызове.
-        try:
-            import numpy as np
-            inner = getattr(accentizer, "accent_model", None)
-            session = getattr(inner, "session", None) if inner is not None else None
-            if session is not None:
-                required_inputs = {i.name for i in session.get_inputs()}
-                if "token_type_ids" in required_inputs:
-                    original_run = session.run
-
-                    def patched_run(output_names, input_feed, run_options=None):
-                        if "token_type_ids" not in input_feed and "input_ids" in input_feed:
-                            input_feed = dict(input_feed)
-                            input_feed["token_type_ids"] = np.zeros_like(input_feed["input_ids"])
-                        return original_run(output_names, input_feed, run_options)
-
-                    session.run = patched_run
-        except Exception:
-            pass  # патч — best-effort, без него RUAccent просто может упасть при вызове ниже
-
-        _ruaccent_instance = accentizer
-        print("RUAccent загружен — ударения для локального Silero будут дополнительно "
-              "проверяться этой моделью (в дополнение к встроенному put_accent).")
-    except Exception as e:
-        _ruaccent_load_failed = True
-        print(f"RUAccent недоступен ({e}) — использую только встроенный в Silero put_accent. "
-              "Чтобы включить RUAccent: pip install ruaccent")
-        _ruaccent_instance = None
-    return _ruaccent_instance
-
-
 def _sane_yo(text: str) -> str:
-    """"ё" в русском языке всегда ударная. RUAccent расставляет "+" и меняет
-    "е" на "ё" одной и той же моделью за один проход — если он поставил
-    "ё", но САМ же не пометил её "+" (ударение по его же мнению оказалось
-    на другой гласной того же слова или не отмечено вовсе), это внутренне
-    противоречиво — на практике так и проявляется жалоба "часто вместо е
-    ставит ё" (например "самое" -> "самоё"). Такую неподтверждённую "ё"
-    возвращаем обратно в "е": "е" вместо "ё" на письме — обычное дело
-    (так печатают почти всегда), а вот лишняя услышанная "ё" очень
-    заметна на слух, так что при сомнении лучше промолчать про "ё"."""
+    """"ё" в русском языке всегда ударная. Если в ответе акцентора стоит "ё", но САМ он
+    её "+" не пометил (внутреннее противоречие), такую неподтверждённую "ё" возвращаем
+    обратно в "е": "е" вместо "ё" на письме — обычное дело, а лишняя услышанная "ё"
+    очень заметна на слух, так что при сомнении лучше промолчать про "ё"."""
     chars = list(text)
     for i, ch in enumerate(chars):
         if ch not in ("ё", "Ё"):
@@ -3621,34 +4034,16 @@ def _sane_yo(text: str) -> str:
     return "".join(chars)
 
 
-def apply_ruaccent(text: str, accentizer) -> str:
-    """Прогоняет текст через RUAccent (расставляет "+" перед ударными
-    гласными и, где нужно, "ё"). Слова, которые словарь (apply_stress_dictionary)
-    уже пометил "+", RUAccent при повторном проходе не трогает — так
-    словарь остаётся приоритетнее автоматической модели. "ё", которую сам
-    RUAccent не считает ударной (см. _sane_yo), откатывается обратно в "е"."""
-    if accentizer is None:
-        return text
-    try:
-        return _sane_yo(accentizer.process_all(text))
-    except Exception as e:
-        print(f"RUAccent не смог обработать фрагмент ({e}) — использую текст без его правок.")
-        return text
-
-
 _silero_stress_instance = None
 _silero_stress_load_failed = False
 
 
 def _load_silero_stress():
-    """Лениво загружает и кэширует silero-stress — отдельную модель-акцентор
-    от Silero (https://github.com/snakers4/silero-stress, релиз сентября
-    2026, см. заметку в CLAUDE.md), в отличие от RUAccent специально
-    заточенную на разрешение омографов по контексту (2208 омографов,
-    F1 0.86). Формат вывода совпадает с RUAccent — "+" перед ударной
-    гласной, поэтому apply_stress_dictionary_protected/_sane_yo и т.д.
-    работают с ней без изменений. При любой ошибке (пакет не установлен)
-    возвращает None один раз, печатает предупреждение и больше не пытается."""
+    """Лениво загружает и кэширует silero-stress — единственный акцентор конвейера
+    (https://github.com/snakers4/silero-stress; разрешает омографы по контексту).
+    Вывод — "+" перед ударной гласной, поэтому словарь, _sane_yo и грамматический
+    шлюз работают с ним напрямую. При ошибке (пакет не установлен) возвращает None,
+    один раз печатает предупреждение и больше не пытается."""
     global _silero_stress_instance, _silero_stress_load_failed
     if _silero_stress_instance is not None or _silero_stress_load_failed:
         return _silero_stress_instance
@@ -3658,250 +4053,687 @@ def _load_silero_stress():
         print("silero-stress загружен.")
     except Exception as e:
         _silero_stress_load_failed = True
-        print(f"silero-stress недоступен ({e}) — движок ударений 'silero_stress'/'hybrid' "
-              "недоступен, продолжаю без него. Чтобы включить: pip install silero-stress")
+        print(f"silero-stress недоступен ({e}) — автоматических ударений не будет, "
+              "остаются только словарь и встроенный put_accent Silero. "
+              "Чтобы включить: pip install silero-stress")
         _silero_stress_instance = None
     return _silero_stress_instance
 
 
-def apply_silero_stress(text: str, accentor) -> str:
-    """Прогоняет text через silero-stress целиком (движок ударений
-    'silero_stress' — полная замена RUAccent). Как и apply_ruaccent,
-    подчищает внутренне противоречивую "ё" через _sane_yo."""
-    if accentor is None:
-        return text
+def reload_stress_models() -> None:
+    """Drops every cached stress state (context tail, OOV tally, fallback counters) so the next
+    text is processed from scratch with the CURRENT dictionaries. Models stay loaded."""
+    reset_stress_context()
+    _oov_words.clear()
+    for k in list(_fallback_stats):
+        _fallback_stats[k] = 0
     try:
-        return _sane_yo(accentor(text))
+        import grammar_gate
+        if hasattr(grammar_gate, "clear_caches"):
+            grammar_gate.clear_caches()
+    except Exception:
+        pass
+
+
+def set_stress_review(enabled: bool) -> None:
+    """GUI/run_* switch for the review list (review_list.json)."""
+    global STRESS_REVIEW_ENABLED
+    STRESS_REVIEW_ENABLED = bool(enabled)
+
+
+def _mark_yo_stress(text: str, start: int, word: str) -> "str | None":
+    """"ё" is always stressed: returns the word with "+" in front of it
+    ("подошёл" -> "подош+ёл"), or None when nothing should be changed. The mark
+    also makes _sane_yo leave the word alone (an "ё" without "+" in front of it is
+    rolled back to "е" by _sane_yo)."""
+    low = word.lower()
+    if low.count("ё") != 1 or (start > 0 and text[start - 1] == "+"):
+        return None
+    i = low.index("ё")
+    return word[:i] + "+" + word[i:]
+
+
+# --------------------------------------------------------------------------
+# Review list -> review_list.json
+# --------------------------------------------------------------------------
+# silero-stress accentuates the whole chapter once more; every word that carries no mark
+# afterwards ("unmarked": names, neologisms) or that no dictionary knows ("oov") is counted
+# over the whole book and dumped, most frequent first, into review_list.json. Words that the
+# user's dictionaries already decide are not reported. Fix a reported word once in the
+# "Словарь ударений" tab (or by adding {"слово": "сл+ово"} to forced_stress_words.json).
+# Known context-dependent homographs are listed separately ("homographs").
+# Disable: --no-stress-review or AUDIOBOOK_STRESS_REVIEW=0;
+# other location: AUDIOBOOK_REVIEW_LIST=<path>.
+
+STRESS_REVIEW_ENABLED = os.environ.get("AUDIOBOOK_STRESS_REVIEW", "1") != "0"
+STRESS_REVIEW_PATH = Path(os.environ.get("AUDIOBOOK_REVIEW_LIST", "")
+                          or _app_paths.user_file("review_list.json"))
+_OUT_WORD_RE = re.compile(r"[А-Яа-яЁё+]+(?:-[А-Яа-яЁё+]+)*")
+_stress_review_state: "dict | None" = None
+
+
+def reset_stress_review(label: str = "") -> None:
+    """Starts a fresh tally (call once at the start of a book run)."""
+    global _stress_review_state
+    _stress_review_state = {"label": label, "chapters": [], "words": {}, "totals": {}}
+
+
+def _align_plain(src_plain: "list[str]", out_tokens: "list[str]") -> dict:
+    """{source token index: output token index} for tokens that line up.
+    Robust to silero-stress dropping/merging a token (difflib on the plain words)."""
+    import difflib
+    out_plain = [t.replace("+", "").lower().replace("ё", "е") for t in out_tokens]
+    sm = difflib.SequenceMatcher(a=src_plain, b=out_plain, autojunk=False)
+    mapping = {}
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                mapping[i1 + k] = j1 + k
+    return mapping
+
+
+def collect_stress_review(text: str, resolved_words=None, chapter_label: str = "", log_fn=None) -> int:
+    """Adds one chapter to the running tally. Returns the number of flagged occurrences.
+    Never raises."""
+    log = log_fn or (lambda m: None)
+    if not STRESS_REVIEW_ENABLED or not text or not text.strip():
+        return 0
+    try:
+        if _stress_review_state is None:
+            reset_stress_review()
+        st = _stress_review_state
+        if chapter_label and chapter_label in st["chapters"]:
+            return 0
+        ss = _load_silero_stress()
+        if ss is None:
+            return 0
+        import time
+        t0 = time.time()
+        resolved = resolved_words or ()
+        known_sources = []
+        corpus = _load_offline_stress_corpus()
+        if corpus:
+            known_sources.append(corpus)
+
+        chunks, cur, n = [], [], 0
+        for p in text.split("\n"):
+            cur.append(p)
+            n += len(p) + 1
+            if n >= 3000:
+                chunks.append("\n".join(cur))
+                cur, n = [], 0
+        if cur:
+            chunks.append("\n".join(cur))
+
+        flagged = 0
+        vowels_re = re.compile(r"[аеёиоуыэюя]")
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            try:
+                ss_toks = _OUT_WORD_RE.findall(ss(chunk))
+            except Exception:
+                ss_toks = None
+            src = [(m.group(0), m.start()) for m in _STRESS_WORD_RE.finditer(chunk)]
+            src_plain = [t.lower().replace("ё", "е") for t, _ in src]
+            ss_map = _align_plain(src_plain, ss_toks) if ss_toks else {}
+            for i, (tok, pos) in enumerate(src):
+                low = tok.lower()
+                if len(vowels_re.findall(low)) <= 1 or "ё" in low:
+                    continue
+                st["totals"][low] = st["totals"].get(low, 0) + 1
+                if low in resolved:
+                    continue
+                ss_form = ss_toks[ss_map[i]].lower() if i in ss_map else None
+                reasons = []
+                if ss_form is not None and "+" not in ss_form:
+                    reasons.append("unmarked")
+                if known_sources and "-" not in low and not any(low in d for d in known_sources):
+                    reasons.append("oov")
+                if not reasons:
+                    continue
+                flagged += 1
+                e = st["words"].setdefault(low, {"flagged": 0, "reasons": set(),
+                                                  "silero_stress": {}, "examples": []})
+                e["flagged"] += 1
+                e["reasons"].update(reasons)
+                if ss_form is not None:
+                    e["silero_stress"][ss_form] = e["silero_stress"].get(ss_form, 0) + 1
+                if len(e["examples"]) < 3:
+                    ctx = chunk[max(0, pos - 40):pos + len(tok) + 40].replace("\n", " ").strip()
+                    e["examples"].append({"chapter": chapter_label, "context": ctx})
+        if chapter_label:
+            st["chapters"].append(chapter_label)
+        log(f"stress review: {flagged} flagged occurrence(s), {len(st['words'])} distinct word(s) so far "
+            f"[{time.time() - t0:.0f}s]")
+        return flagged
     except Exception as e:
-        print(f"silero-stress не смог обработать фрагмент ({e}) — использую текст без его правок.")
+        log(f"stress review failed ({type(e).__name__}: {e}) — skipped, synthesis is not affected.")
+        return 0
+
+
+def dump_stress_review(path: "Path | str | None" = None) -> "Path | None":
+    """Writes the running tally to review_list.json (atomically, most frequent
+    words first). Never raises; returns the path or None."""
+    st = _stress_review_state
+    if st is None:
+        return None
+    p = Path(path) if path else STRESS_REVIEW_PATH
+    try:
+        homographs = _load_ambiguous_stress_words()
+        entries = []
+        for low, e in st["words"].items():
+            entries.append({
+                "word": low,
+                "occurrences": st["totals"].get(low, e["flagged"]),
+                "flagged_occurrences": e["flagged"],
+                "reasons": sorted(e["reasons"]),
+                "silero_stress": dict(sorted(e["silero_stress"].items(), key=lambda kv: -kv[1])),
+                "known_homograph": low in homographs,
+                "examples": e["examples"],
+            })
+        entries.sort(key=lambda x: (-x["occurrences"], x["word"]))
+        words = [x for x in entries if not x["known_homograph"]]
+        homos = [x for x in entries if x["known_homograph"]]
+
+        paste_ready = {}
+        for x in words:
+            sug = next((f for f in x.get("silero_stress", {}) if f.count("+") == 1), None)
+            if sug:
+                x["suggested"] = sug
+                paste_ready[x["word"]] = sug
+        payload = {
+            "generated_at": __import__("time").strftime("%Y-%m-%d %H:%M:%S"),
+            "book": st.get("label", ""),
+            "chapters_processed": st["chapters"],
+            "summary": {"distinct_words": len(words), "distinct_homographs": len(homos),
+                        "flagged_occurrences": sum(x["flagged_occurrences"] for x in entries),
+                        "silero_applied": dict(_fallback_stats)},
+            "how_to_use": ("1) Open review_list_paste.txt (same folder): one ready line per word, most "
+                           "frequent first. 2) Delete the lines whose stress is wrong, fix them by hand "
+                           "(the '+' goes BEFORE the stressed vowel). 3) Paste the lines right after the "
+                           "opening { of forced_stress_words.json - or fix the words in the 'Словарь "
+                           "ударений' tab of the app. Words in that file are never touched by silero-stress. "
+                           "Reasons: 'unmarked' = silero-stress put no mark; 'oov' = in no dictionary. "
+                           "'homographs' depend on context -> informational."),
+            "paste_ready": paste_ready,
+            "unresolved_oov": dict(sorted(_oov_words.items(), key=lambda kv: -kv[1])[:500]),
+            "words": words,
+            "homographs": homos,
+        }
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
+        try:   # copy-paste friendly twin: every line ends with a comma -> paste right after "{"
+            txt = "\n".join(f'  {json.dumps(w, ensure_ascii=False)}: {json.dumps(f, ensure_ascii=False)},'
+                            for w, f in paste_ready.items())
+            tp = p.with_name(p.stem + "_paste.txt")
+            tp.write_text(txt + ("\n" if txt else ""), encoding="utf-8")
+        except Exception as e:
+            print(f"Could not write the paste list: {e}")
+        return p
+    except Exception as e:
+        print(f"Could not write {p}: {e}")
+        return None
+
+
+def _stall_guard_start(label: str, seconds: float = 180.0):
+    """Hang diagnostics: if the code between start and stop takes longer than `seconds`, prints where every thread
+    is stuck (repeating every `seconds`, at most 5 times) so a "frozen" run leaves a stack trace in the log
+    instead of silence."""
+    import threading
+    import traceback
+    stop = threading.Event()
+
+    def watch():
+        for n in range(1, 6):
+            if stop.wait(seconds):
+                return
+            lines = [f"!! STALL: '{label}' has been running for {n * seconds:.0f}s - thread stacks follow"]
+            for tid, frame in sys._current_frames().items():
+                lines.append(f"--- thread {tid} ---\n" + "".join(traceback.format_stack(frame)))
+            print("\n".join(lines))
+
+    threading.Thread(target=watch, name="stall-guard", daemon=True).start()
+    return stop
+
+
+def _stall_guard_stop(guard) -> None:
+    if guard is not None:
+        guard.set()
+
+
+def run_stress_review_for_chapter(text: str, stress_dict: dict, title: str, log_fn=print) -> None:
+    """Chapter hook used by run_silero / run_silero_rest: tally, then dump."""
+    if not STRESS_REVIEW_ENABLED:
+        return
+    collect_stress_review(text, resolved_words=set(stress_dict or ()), chapter_label=title, log_fn=log_fn)
+    out = dump_stress_review()
+    if out is not None:
+        log_fn(f"stress review list updated: {out}")
+
+
+# ==========================================================================
+# Accentuation chain (single engine)
+#   1. forced_stress_words.json / manual overrides - the user's words, absolute priority,
+#                 hidden behind placeholders so nothing downstream can change them
+#   2. numbers -> words
+#   3. silero-stress over the chunk (with the previous chunk's tail as left context)
+#   4. grammar gate (slovnet morphology) for case/number homographs
+#   5. global_prose_sanitizer (context-free forced forms, particles) -> mono-syllable strip
+# ==========================================================================
+
+_STRIP_MONO_ENABLED = True
+
+
+def set_strip_monosyllables(enabled: bool) -> None:
+    """Switches strip_monosyllable_stress() on/off for this run (GUI option)."""
+    global _STRIP_MONO_ENABLED
+    _STRIP_MONO_ENABLED = bool(enabled)
+
+
+_CYR_VOWEL_RE = re.compile(r"[аеёиоуыэюяАЕЁИОУЫЭЮЯ]")
+_PLACEHOLDER_SPLIT_RE = re.compile(r"STRESSDICT\d+")
+
+# --- context priming (October 2026) ---------------------------------------------------------------------
+# silero-stress resolves homographs from a ~300-character window, but the pipeline hands it one chunk at a
+# time, so the first words of a chunk have no left context ("Они все побежали" alone -> "всё"; after a
+# sentence about people running for the exits -> "все"). The tail of the PREVIOUS chunk is therefore
+# prepended to what silero-stress reads, and only the current chunk's words are kept from its answer.
+# Off: AUDIOBOOK_STRESS_CONTEXT=0. Reset per chapter by reset_stress_context().
+_STRESS_CTX_ON = os.environ.get("AUDIOBOOK_STRESS_CONTEXT", "1") != "0"
+_STRESS_CTX_CHARS = 220
+_stress_ctx_tail = ""
+
+
+def reset_stress_context() -> None:
+    global _stress_ctx_tail
+    _stress_ctx_tail = ""
+
+
+def _stress_ctx_update(src_text: str) -> None:
+    """Remember the plain tail (no marks, no dictionary placeholders) of the chunk just processed."""
+    global _stress_ctx_tail
+    if not _STRESS_CTX_ON or not src_text:
+        return
+    plain = re.sub(r"\s+", " ", _PLACEHOLDER_SPLIT_RE.sub(" ", src_text.replace("+", ""))).strip()
+    if not re.search(r"[А-Яа-яЁё]", plain):
+        return
+    tail = plain[-_STRESS_CTX_CHARS:]
+    if len(plain) > _STRESS_CTX_CHARS:
+        cut = tail.find(" ")
+        tail = tail[cut + 1:] if cut >= 0 else tail
+    _stress_ctx_tail = tail
+
+
+# silero-stress 1.5 shifts the "+" LEFT by one position per punctuation char glued to the front of a word
+# («Пора -> «По+ра, «—Пора -> «—П+ора; a space after the mark removes the shift; "-" and "(" are not affected).
+# Found in the real-book audio test (10 Oct 2026): "с+мирно", "+Пола", "По+ра" and marks lost on vowel-initial words.
+_GLUED_PUNCT_RE = re.compile(r"([^\w\s+\-(])(?=[А-Яа-яЁё])")
+
+
+def _unglue_leading_punct(text: str) -> str:
+    return _GLUED_PUNCT_RE.sub(r"\1 ", text)
+
+
+def _silero_stress_primed(accentor, src_text: str) -> str:
+    """accentor(src_text), but with the previous chunk's tail as left context. The returned text starts at
+    the first word of src_text. Any mismatch -> the plain unprimed call."""
+    ctx = _stress_ctx_tail if _STRESS_CTX_ON else ""
+    if not ctx:
+        return accentor(_unglue_leading_punct(src_text))
+    try:
+        out = accentor(_unglue_leading_punct(ctx + " " + src_text))
+        ctx_words = [w.lower().replace("ё", "е") for w in _STRESS_WORD_RE.findall(ctx)]
+        ms = list(_OUT_WORD_RE.finditer(out))
+        k = len(ctx_words)
+        if len(ms) > k and [m.group(0).replace("+", "").lower().replace("ё", "е") for m in ms[:k]] == ctx_words:
+            _fallback_stats["ctx_primed"] = _fallback_stats.get("ctx_primed", 0) + 1
+            return out[ms[k].start():]
+    except Exception:
+        pass
+    return accentor(_unglue_leading_punct(src_text))
+
+
+_fallback_stats = {"blank": 0, "applied": 0, "yo_swapped": 0}
+_oov_words: dict = {}   # >=2-syllable words left clean by every layer (logged to review_list.json)
+
+_VOWELS_LOW_RE = re.compile(r"[аеёиоуыэюя]")
+
+
+def _copy_case(src: str, marked: str) -> str:
+    """The marked form with the capitalisation of the source word ("+" is skipped when looking for the
+    first letter). silero-stress already keeps the case; this makes the layer independent of that."""
+    if marked.replace("+", "") == src.replace("ё", "е").replace("Ё", "Е") or marked.replace("+", "") == src:
+        return marked
+    if len(src) > 1 and src.isupper():
+        return marked.upper()
+    if src[:1].isupper():
+        chars = list(marked)
+        for i, ch in enumerate(chars):
+            if ch != "+":
+                chars[i] = ch.upper()
+                break
+        return "".join(chars)
+    return marked
+
+
+# silero-stress ошибочно отдаёт «ё» в основах, где её нет ("королевой" -> "корол+ёвой"): метка остаётся на «е».
+_YO_FALSE_STEM_RE = re.compile(r"корол\+?ёв", re.I)
+
+
+def apply_silero_layer(src_text: str, silero_accentor) -> str:
+    """The accentor layer: silero-stress marks every word of src_text it knows. Only the plain letters
+    of src_text are ever kept (a word is replaced by silero's form only when both spell the same word
+    modulo "+" and е/ё), so a misaligned or rewritten answer cannot damage the text. "ё" returned by
+    silero-stress ("все" -> "вс+ё") is taken; the numeric "лет"->"лёт" case is refused. Words that are
+    still unmarked afterwards (>= 2 vowels) are counted as OOV for review_list.json."""
+    if silero_accentor is None or not src_text or not re.search(r"[А-Яа-яЁё]", src_text):
+        return src_text
+    src = list(_STRESS_WORD_RE.finditer(src_text))
+    if not src:
+        return src_text
+    try:
+        ss_out = _silero_stress_primed(silero_accentor, src_text)
+    except Exception as e:
+        print(f"silero-stress failed on a fragment ({e}) — fragment left unaccented.")
+        return src_text
+    ssm = list(_OUT_WORD_RE.finditer(ss_out))
+    src_plain = [m.group(0).lower().replace("ё", "е") for m in src]
+    ss_map = _align_plain(src_plain, [m.group(0) for m in ssm]) if ssm else {}
+    pieces, last = [], 0
+    for i, m in enumerate(src):
+        word = m.group(0)
+        low = word.lower()
+        if "ё" in low or (m.start() > 0 and src_text[m.start() - 1] == "+"):
+            continue
+        sf = _sane_yo(ssm[ss_map[i]].group(0)) if i in ss_map else None
+        if sf and _YO_FALSE_STEM_RE.match(sf):
+            sf = sf.replace("ё", "е").replace("Ё", "Е")
+        if (sf and "+" in sf
+                and sf.replace("+", "").replace("ё", "е").lower() == low
+                and not (low == "лет" and "ё" in sf)):
+            sf = _copy_case(word, sf)
+            pieces.append(src_text[last:m.start()])
+            pieces.append(sf)
+            last = m.end()
+            _fallback_stats["applied"] += 1
+            if "ё" in sf.lower() and "е" in low:
+                _fallback_stats["yo_swapped"] = _fallback_stats.get("yo_swapped", 0) + 1
+        elif len(_VOWELS_LOW_RE.findall(low)) >= 2:
+            _oov_words[low] = _oov_words.get(low, 0) + 1
+    pieces.append(src_text[last:])
+    return "".join(pieces)
+
+
+_warned_legacy_engines: set = set()
+
+
+def normalize_stress_engine(name) -> str:
+    """The stress flow has two modes: "silero" (silero-stress + grammar gate, the default) and
+    "none". Old settings / CLI values ('ruaccent', 'silero_stress', 'hybrid', 'ollama',
+    'lmstudio') map to "silero"."""
+    n = (name or "silero").strip().lower()
+    if n in ("silero", "none"):
+        return n
+    if n not in ("ruaccent", "silero_stress") and n not in _warned_legacy_engines:
+        _warned_legacy_engines.add(n)
+        print(f"Stress engine {n!r} is no longer supported — using silero-stress + grammar gate.")
+    return "silero"
+
+
+def stress_engine_needs_silero(stress_engine: str) -> bool:
+    return stress_engine != "none"
+
+
+def stress_layers_are_client_side(stress_engine: str, silero_accentor) -> bool:
+    """True when the accent marks are produced in the client before the text is sent
+    (REST path): the service then only synthesizes the marked text."""
+    return stress_engine != "none" and silero_accentor is not None
+
+
+# ---------------------------------------------------------------------------
+# global_prose_sanitizer: the last stress step before the text goes to Silero. Fixed forms for
+# words that the accentor keeps getting wrong in fiction (found in live chapter tests), plus the
+# hyphenated-particle rule. A plain table, no LLM. The user's own dictionary
+# (forced_stress_words.json) still wins: those words are hidden behind placeholders while this runs.
+# ---------------------------------------------------------------------------
+_PROSE_WORDS = {
+    "могущий": "мог+ущий", "могущая": "мог+ущая", "могущие": "мог+ущие", "могущее": "мог+ущее",
+    "губы": "г+убы",
+    "глубоко": "глубок+о",
+    "самому": "самом+у",
+    "поняла": "понял+а",
+    "такая": "так+ая",
+    "также": "т+акже",
+    # words with ONE reading where silero-stress is wrong. Every entry must agree with the independent
+    # offline corpus (stress_corpus_ru.tsv.gz): test_accentuation.py enforces it, except _PROSE_CORPUS_EXCEPTIONS.
+    # (Removed Oct 10 2026: импульсный -> и́мпульсный, жизнеобеспечение -> жизнеобесп+ечение, уровнях -> +уровнях:
+    # the old rules contradicted the corpus AND the raw model, i.e. they CREATED errors.)
+    "молча": "молч+а",
+}
+# context-dependent readings pinned by the user after listening; the corpus lists only one reading, so they differ on purpose
+_PROSE_CORPUS_EXCEPTIONS = {"могущий", "могущая", "могущие", "могущее", "самому"}
+_PROSE_CH = "А-Яа-яЁё"
+
+
+def _prose_pattern(phrase: str):
+    words = [r"\+?".join(re.escape(ch) for ch in w) + r"\+?" for w in phrase.split()]
+    return re.compile(r"(?<![" + _PROSE_CH + r"])" + r"\+?" + r"\s+".join(words) + r"(?![" + _PROSE_CH + r"])", re.I)
+
+
+_PROSE_RULES = [(_prose_pattern(k), v) for k, v in _PROSE_WORDS.items()]
+
+# Hyphenated particles: "когда-нибудь", "кто-то", "всё-таки", "дай-ка" carry ONE stress (in the
+# host word). A second "+" inside the particle is always wrong.
+_HYPHEN_PARTICLES = ("нибудь", "либо", "то", "таки", "ка")
+_PARTICLE_TOKEN_RE = re.compile(r"[А-Яа-яЁё+]+(?:-[А-Яа-яЁё+]+)+")
+
+
+def strip_particle_stress(text: str) -> str:
+    """Removes a "+" that landed inside a trailing hyphenated particle."""
+    if not text or "-" not in text or "+" not in text:
         return text
 
+    def _fix(m):
+        parts = m.group(0).split("-")
+        if len(parts) >= 2 and parts[-1].replace("+", "").lower() in _HYPHEN_PARTICLES and "+" in parts[-1]:
+            parts[-1] = parts[-1].replace("+", "")
+        return "-".join(parts)
 
-def _silero_stress_omograph_overrides(text: str, accentor) -> dict:
-    """Для движка ударений 'hybrid': прогоняет text целиком через
-    silero-stress и достаёт ударение ТОЛЬКО для слов из списка омографов
-    (_load_ambiguous_stress_words) — именно там, где RUAccent слабее всего.
-    Возвращает {слово_в_нижнем_регистре: "сл+ово"}, пригодный для подмешивания
-    в stress_dict (как resolve_case_ambiguous_nouns/resolve_lemma_homographs)
-    перед apply_stress_dictionary_protected — остальной текст по-прежнему
-    достаётся RUAccent, как и в обычном режиме 'ruaccent'.
-    Полагается на то, что silero-stress не меняет число слов в тексте
-    (только вставляет "+" и иногда меняет "е"->"ё") — сопоставляет слова
-    входного и акцентированного текста по порядку встречи; при малейшем
-    расхождении просто теряет часть совпадений (не ошибка, best-effort)."""
-    if accentor is None:
-        return {}
-    ambiguous = _load_ambiguous_stress_words()
-    if not ambiguous:
-        return {}
+    return _PARTICLE_TOKEN_RE.sub(_fix, text)
+
+
+_NUM_LET_RE = re.compile(r"(\d\s*)л\+?ёт(?![" + _PROSE_CH + r"])")
+
+
+def global_prose_sanitizer(text: str) -> str:
+    """Forces the known-good stress for words the accentor misplaces ("самому" -> "самом+у",
+    "поняла" -> "понял+а", "губы" -> "г+убы"...), strips stray marks from hyphenated particles and
+    undoes a bad "ё" after a number ("10 лёт" -> "10 лет")."""
+    if not text:
+        return text
+    for pat, form in _PROSE_RULES:
+        def _sub(m, form=form):
+            return (form[0].upper() + form[1:]) if m.group(0).lstrip("+")[:1].isupper() else form
+        text = pat.sub(_sub, text)
+    text = strip_particle_stress(text)
+    return _NUM_LET_RE.sub(r"\1лет", text)
+
+
+def _grammar_gate_pass(text: str) -> str:
+    """Grammar gate (grammar_gate.py): the slovnet morphology tagger decides case/number stress
+    homographs (земли, сети, трети, голоса, корпуса...). Off when AUDIOBOOK_GRAMMAR_GATE=0 or when
+    slovnet/navec/razdel or the model files are missing (it then does nothing and never raises)."""
     try:
-        accented = accentor(text)
+        import grammar_gate
+        return grammar_gate.grammar_gate(text)
     except Exception as e:
-        print(f"silero-stress (hybrid, омографы) не смог обработать фрагмент ({e}).")
-        return {}
-    src_words = _STRESS_WORD_RE.findall(text)
-    out_words = re.findall(r"[А-Яа-яЁё+]+(?:-[А-Яа-яЁё+]+)*", accented)
-    overrides = {}
-    for src, out in zip(src_words, out_words):
-        low = src.lower()
-        if low in ambiguous and "+" in out:
-            overrides[low] = out.lower()
-    return overrides
+        if not getattr(_grammar_gate_pass, "_warned", False):
+            _grammar_gate_pass._warned = True
+            print(f"grammar gate skipped ({type(e).__name__}: {e})")
+        return text
+
+_GUARD_FOLD_RE = re.compile(r"[^0-9a-zа-я]")
 
 
-_ollama_stress_cache: dict = {}
+def _guard_fold(t: str) -> str:
+    """Letters and digits only, lower case, ё == е, no '+': what must survive every stress layer."""
+    return _GUARD_FOLD_RE.sub("", t.lower().replace("ё", "е"))
 
 
-def _ollama_stress_prompt(items: "list[tuple[str, str, str]]") -> str:
-    """items: (слово, контекст, подсказка_от_silero_stress_или_""). Подсказка
-    передаётся LLM как мнение другой модели, а не как готовый ответ — чтобы
-    LLM могла с ней согласиться (обычный случай — она совпадает с контекстом)
-    либо поправить, если контекст говорит об обратном."""
-    lines = []
-    for i, (w, ctx, hint) in enumerate(items):
-        hint_part = f" (другая модель предполагает: «{hint}»)" if hint else ""
-        lines.append(f"{i + 1}. слово «{w}», контекст: «...{ctx}...»{hint_part}")
-    numbered = "\n".join(lines)
-    return (
-        "Ниже — пронумерованный список русских слов-омографов (слов с неоднозначным "
-        "ударением в зависимости от смысла/падежа) вместе с контекстом их употребления в "
-        "книге, и, где есть, предположение отдельной специализированной модели ударений — "
-        "она иногда ошибается, особенно если смысл неочевиден из одной словоформы, поэтому "
-        "решай по КОНТЕКСТУ, а не просто повторяй её предположение. Для КАЖДОГО слова "
-        "определи правильное ударение по смыслу контекста и верни ТО ЖЕ САМОЕ слово (та же "
-        "словоформа и регистр букв, падеж/число не менять) с символом '+' перед ударной "
-        "гласной буквой, например: 'за+мок' (сооружение) или 'замо+к' (на двери). В тексте "
-        "книги буква 'ё' почти всегда напечатана как 'е' (так принято в русских текстах) — "
-        "если по смыслу ударение падает именно на неё, ЗАМЕНИ эту букву на 'ё' в ответе "
-        "(например 'все' в значении 'всё' -> 'всё' без '+', так как 'ё' всегда ударная сама "
-        "по себе и отдельный '+' перед ней не нужен); для остальных букв замена 'е'->'ё' не "
-        "нужна, если ударение падает не на них.\n\n"
-        f"Верни ОТВЕТ СТРОГО в виде JSON-массива строк длиной ровно {len(items)} — по одному "
-        "слову на каждый пункт списка, в том же порядке, без каких-либо пояснений, "
-        "markdown-разметки или текста до/после массива.\n\n" + numbered
-    )
+def _text_guard(before: str, after: str, layer: str) -> str:
+    """Runtime form of the book test «output = input modulo '+' and е/ё»: if a stress layer changed,
+    dropped or added a letter, keep that layer's INPUT (the chunk loses only its marks, never words;
+    a lost word is a silent hole in the audio). Counted in _fallback_stats["text_guard"]."""
+    if after is before or os.environ.get("AUDIOBOOK_TEXT_GUARD") == "0" or _guard_fold(before) == _guard_fold(after):
+        return after
+    _fallback_stats["text_guard"] = _fallback_stats.get("text_guard", 0) + 1
+    if _fallback_stats["text_guard"] <= 20:
+        print(f"stress text guard: layer {layer} changed the letters, layer skipped for this chunk: {before[:70]!r}")
+    return before
 
 
-_ollama_stress_index: dict = {}
-_STRESS_MISS = object()
+def apply_stress_layers(text: str, stress_engine: str, silero_accentor) -> str:
+    """silero-stress (with the previous chunk as left context) -> grammar gate -> sanitizer.
+    Dictionary words are already hidden behind STRESSDICT placeholders."""
+    if stress_engine == "none":
+        return text
+    out = _text_guard(text, apply_silero_layer(text, silero_accentor), "silero") if silero_accentor is not None else text
+    _stress_ctx_update(text)
+    out = _text_guard(out, _grammar_gate_pass(out), "gate")
+    return _text_guard(out, global_prose_sanitizer(out), "sanitizer")
 
 
-def _stress_cache_set(prefix, w, ck, value):
-    _ollama_stress_cache[(prefix, w, ck)] = value
-    _ollama_stress_index.setdefault((prefix, w), {})[ck] = value
+def stress_dry_run(text: str, strip_monosyllables: bool = True, book_overrides_path=None,
+                   progress_cb=None) -> "tuple[str, dict]":
+    """GUI «Проверить ударения»: runs the SAME chain the audio gets, without synthesis:
+    digits -> words, user dictionary (placeholders) -> silero-stress -> grammar gate ->
+    global_prose_sanitizer -> mono-syllable strip. Returns (text with "+" marks, info)."""
+    reset_stress_context()
+    import time as _time
+    t0 = _time.time()
+    silero = _load_silero_stress()
+    set_keep_hyphens(silero is not None)
+    stress_dict = load_stress_dictionary(book_overrides_path=book_overrides_path)
+    set_strip_monosyllables(strip_monosyllables)
+    swaps0 = _fallback_stats.get("yo_swapped", 0)
+    blanks0 = _fallback_stats.get("applied", 0)
+    paragraphs = numbers_to_words_ru(text).split("\n")
+    todo = sum(1 for p in paragraphs if p.strip())
+    out, done = [], 0
+    for para in paragraphs:
+        if not para.strip():
+            out.append(para)
+            continue
+        protected, ph = apply_stress_dictionary_protected(para, stress_dict)
+        marked = apply_stress_layers(protected, "silero", silero)
+        out.append(strip_monosyllable_stress(restore_stress_placeholders(marked, ph)))
+        done += 1
+        if progress_cb and done % 10 == 0:
+            progress_cb(f"  …{done}/{todo} абзацев")
+    result = "\n".join(out)
+    info = {
+        "silero_stress": silero is not None,
+        "dictionary_words": len(stress_dict),
+        "yo_swapped": _fallback_stats.get("yo_swapped", 0) - swaps0,
+        "silero_filled": _fallback_stats.get("applied", 0) - blanks0,
+        "marks": result.count("+"),
+        "seconds": _time.time() - t0,
+    }
+    return result, info
 
 
-def _stress_cache_get(prefix, w, ck):
-    """Значение из кэша или _STRESS_MISS. Точное совпадение ключа
-    вхождения; если слово стоит у самого края куска (контекст слева/справа
-    короче 12 символов — его обрезала граница куска), ищем запись главы,
-    у которой контекст на этом краю ЗАКАНЧИВАЕТСЯ/НАЧИНАЕТСЯ так же."""
-    key = (prefix, w, ck)
-    if key in _ollama_stress_cache:
-        return _ollama_stress_cache[key]
-    left, _, right = ck.partition("|")
-    if len(left) >= 12 and len(right) >= 12:
-        return _STRESS_MISS
-    for cck, val in _ollama_stress_index.get((prefix, w), {}).items():
-        cl, _, cr = cck.partition("|")
-        if (len(left) >= 12 or cl.endswith(left)) and (len(right) >= 12 or cr.startswith(right)):
-            return val
-    return _STRESS_MISS
 
 
-def _stress_norm(fragment: str) -> str:
-    return re.sub(r"\s+", " ", fragment).strip().lower()
-
-
-def _stress_collect(text: str, all_occurrences: bool) -> "list[tuple[str, str, str]]":
-    """Слова-омографы из ambiguous_stress_words_ru.txt в text ->
-    [(слово, контекст ±60 симв., ключ_вхождения)]. Ключ вхождения — по 12
-    символов слева и справа от слова: один и тот же ключ получается и при
-    разборе ВСЕЙ главы целиком, и при разборе отдельного куска текста (кроме
-    слов в считанных символах от края куска), поэтому результат, посчитанный
-    на уровне главы (prewarm_ollama_stress), находится потом в кэше при
-    озвучке каждого куска. all_occurrences=False — только первое вхождение
-    каждого слова (режим одного куска)."""
-    ambiguous = _load_ambiguous_stress_words()
-    if not ambiguous:
+def find_word_occurrences(text: str, query: str, whole_word: bool = True) -> "list[tuple[int, int]]":
+    """[(start, end)] of every occurrence of `query` in `text` - case-insensitive, "ё" == "е", any "+"
+    in the query ignored. whole_word=True matches only complete words (a hyphenated word is one
+    word). Indices refer to the ORIGINAL text (the folding keeps the length)."""
+    q = (query or "").replace("+", "").strip().lower().replace("ё", "е")
+    if not q or not text:
         return []
-    out = []
-    seen = set()
-    for m in _STRESS_WORD_RE.finditer(text):
-        low = m.group(0).lower()
-        if low not in ambiguous:
-            continue
-        i, j = m.span()
-        ck = _stress_norm(text[max(0, i - 12):i]) + "|" + _stress_norm(text[j:j + 12])
-        key = (low, ck) if all_occurrences else low
-        if key in seen:
-            continue
-        seen.add(key)
-        ctx = text[max(0, i - 60):min(len(text), j + 60)].replace("\n", " ").strip()
-        out.append((low, ctx, ck))
+    hay = text.lower().replace("ё", "е")
+    out, i = [], 0
+    while True:
+        i = hay.find(q, i)
+        if i < 0:
+            break
+        j = i + len(q)
+        if whole_word:
+            before = hay[i - 1] if i > 0 else ""
+            after = hay[j] if j < len(hay) else ""
+            glued_l = before.isalpha() or (before == "-" and i > 1 and hay[i - 2].isalpha())
+            glued_r = after.isalpha() or (after == "-" and j + 1 < len(hay) and hay[j + 1].isalpha())
+            if glued_l or glued_r:
+                i += 1
+                continue
+        out.append((i, j))
+        i = j
     return out
 
 
-def _stress_query_llm(todo, model, host, backend, silero_hints, cache_prefix, log_fn):
-    """todo: [(слово, контекст, ключ_вхождения)] -> заполняет
-    _ollama_stress_cache одним запросом к LLM (при ошибке — подсказкой
-    silero-stress или None, чтобы не долбить недоступный сервер заново на
-    каждом куске)."""
-    if not todo:
-        return
-    with_hints = [(w, ctx, silero_hints.get(w, "")) for w, ctx, _ck in todo]
-    try:
-        raw_text = _local_chat_request(_ollama_stress_prompt(with_hints), model, host=host,
-                                        backend=backend, log_fn=log_fn,
-                                        max_tokens=80 + 30 * len(todo))
-        results = _extract_json_array(raw_text)
-    except Exception as e:
-        if log_fn:
-            log_fn(f"{backend} (расстановка ударений) недоступна ({e}) — "
-                   + ("использую подсказку silero-stress." if silero_hints else
-                      "пропускаю, остальной текст по-прежнему обрабатывает RUAccent."))
-        results = None
-    if results is not None and len(results) == len(todo):
-        for (w, _ctx, ck), (_w, _c, hint), out in zip(todo, with_hints, results):
-            out = str(out).strip().lower()
-            # Валидный ответ — "+" перед ударной гласной, либо случай "ё"
-            # (всегда ударная сама по себе, см. _ollama_stress_prompt).
-            valid = "+" in out or "ё" in out
-            _stress_cache_set(cache_prefix, w, ck, out if valid else (hint or None))
-    else:
-        if results is not None and log_fn:
-            log_fn(f"{backend} вернул {len(results)} ответов вместо {len(todo)} — "
-                   "использую подсказки silero-stress там, где они есть.")
-        for (w, _ctx, ck), (_w, _c, hint) in zip(todo, with_hints):
-            _stress_cache_set(cache_prefix, w, ck, hint or None)
-
-
-def prewarm_ollama_stress(chapter_text: str, model: str, host: str = "", log_fn=None,
-                           silero_stress_accentor=None, backend: str = "ollama",
-                           batch_size: int = 25) -> None:
-    """Разрешает ударения ВСЕХ омографов главы заранее — пачками по
-    batch_size слов за один запрос к LLM (а не по запросу на каждый кусок
-    текста): иначе на длинной главе это сотни медленных обращений к
-    локальной модели. Результат оседает в _ollama_stress_cache, откуда его
-    потом берёт _ollama_stress_overrides при озвучке каждого куска."""
-    if not model:
-        return
-    items = _stress_collect(chapter_text, all_occurrences=True)
-    prefix = (backend, model, host or "")
-    todo = [it for it in items if _stress_cache_get(prefix, it[0], it[2]) is _STRESS_MISS]
-    if not todo:
-        return
-    silero_hints: dict = {}
-    if silero_stress_accentor is not None:
+def stress_word_variants(text: str, word: str, silero_accentor=None, limit: int = 200,
+                         left: int = 320, right: int = 120) -> "list[dict]":
+    """What the pipeline (silero-stress with its left context -> grammar gate -> sanitizer, WITHOUT the
+    user's dictionary) makes of EVERY occurrence of `word` in `text`. Used by the dictionary editor's
+    homograph alert: several different forms for one spelling means the word is context-dependent
+    in this chapter, and a forced dictionary entry would flatten all of them to one form.
+    Returns [{"pos": offset in text, "form": "вс+ё", "context": "..."}], at most `limit` entries;
+    an occurrence the models could not align is skipped."""
+    acc = silero_accentor if silero_accentor is not None else _load_silero_stress()
+    if acc is None:
+        return []
+    res = []
+    for s_, e_ in find_word_occurrences(text, word)[:limit]:
+        a = max(0, s_ - left)
+        if a > 0:                       # start the window at a word boundary
+            sp = text.find(" ", a, s_)
+            a = sp + 1 if sp != -1 else a
+        b = min(len(text), e_ + right)
+        window = text[a:b]
+        k = len(_STRESS_WORD_RE.findall(text[a:s_]))
         try:
-            silero_hints = _silero_stress_omograph_overrides(chapter_text, silero_stress_accentor)
+            marked = global_prose_sanitizer(_grammar_gate_pass(apply_silero_layer(window, acc)))
         except Exception:
-            silero_hints = {}
-    if log_fn:
-        log_fn(f"Ударения-омографы через {backend}: {len(todo)} вхождений в главе, "
-               f"запросов к модели: {(len(todo) + batch_size - 1) // batch_size}...")
-    for i in range(0, len(todo), batch_size):
-        _stress_query_llm(todo[i:i + batch_size], model, host, backend, silero_hints, prefix, log_fn)
+            continue
+        toks = _OUT_WORD_RE.findall(marked)
+        src = _STRESS_WORD_RE.findall(window)
+        if len(toks) != len(src) or k >= len(toks):
+            continue
+        form = toks[k]
+        if form.replace("+", "").lower().replace("ё", "е") != text[s_:e_].lower().replace("ё", "е"):
+            continue
+        ctx = text[max(0, s_ - 60):e_ + 60].replace("\n", " ")
+        res.append({"pos": s_, "form": form.lower(), "context": ctx})
+    return res
 
 
-def _ollama_stress_overrides(text: str, model: str, host: str = "", log_fn=None,
-                              silero_stress_accentor=None, backend: str = "ollama") -> dict:
-    """Аналог _silero_stress_omograph_overrides (движок ударений 'ollama' /
-    'lmstudio'): ударение слов-омографов из ambiguous_stress_words_ru.txt
-    определяет локальная LLM по контексту конкретного употребления — у LLM,
-    в отличие от словаря/модели расстановки ударений, есть доступ к смыслу
-    всего предложения. RUAccent по-прежнему расставляет ударения во всём
-    остальном тексте, как и в режиме 'hybrid'.
+def _parse_stress_reply(raw_text: str, n: int) -> dict:
+    """Ответ модели -> {номер_с_0: строка}. Понимает JSON-объект {"1": ..},
+    JSON-массив (по порядку) и мусор вокруг; частичный ответ — не ошибка."""
+    import json as _json
+    res = {}
+    m = re.search(r"\{.*\}", raw_text or "", flags=re.DOTALL)
+    if m:
+        try:
+            obj = _json.loads(m.group(0))
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    try:
+                        i = int(re.sub(r"\D", "", str(k))) - 1
+                    except ValueError:
+                        continue
+                    if 0 <= i < n and isinstance(v, (str, int)):
+                        res[i] = str(v)
+                return res
+        except ValueError:
+            pass
+    arr = _extract_json_array(raw_text or "")
+    if arr and len(arr) == n:  # массив принимаем только если длина сошлась
+        res = {i: str(v) for i, v in enumerate(arr)}
+    return res
 
-    silero_stress_accentor — опционально: её предположение передаётся LLM как
-    подсказка-мнение (см. _ollama_stress_prompt) и служит ОТКАТОМ, если LLM
-    недоступна/ответила нераспознаваемо.
-
-    Обычно всё уже посчитано заранее на уровне главы (prewarm_ollama_stress),
-    и здесь — только чтение кэша; обращение к LLM остаётся для слов у самого
-    края куска текста, которых нет в кэше. При любой ошибке тихо возвращает
-    то, что есть, не прерывая синтез."""
-    if not model:
-        return {}
-    items = _stress_collect(text, all_occurrences=False)
-    if not items:
-        return {}
-    prefix = (backend, model, host or "")
-    todo = [it for it in items if _stress_cache_get(prefix, it[0], it[2]) is _STRESS_MISS]
-    if todo:
-        silero_hints: dict = {}
-        if silero_stress_accentor is not None:
-            try:
-                silero_hints = _silero_stress_omograph_overrides(text, silero_stress_accentor)
-            except Exception:
-                silero_hints = {}
-        _stress_query_llm(todo, model, host, backend, silero_hints, prefix, log_fn)
-    overrides = {}
-    for w, _ctx, ck in items:
-        out = _stress_cache_get(prefix, w, ck)
-        if out and out is not _STRESS_MISS:
-            overrides[w] = out
-    return overrides
 
 
 def _emphasis_kind(part_text: str) -> "str | None":
@@ -4057,11 +4889,12 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
                put_accent: bool = True, put_yo: bool = True, on_progress=None,
                chapter_indices=None, char_ranges=None, dialogue_speakers=None, attribution=None,
                should_stop=None, play_fn=None,
-               stress_engine: str = "ruaccent", stress_dict_path: "Path | str | None" = None,
+               stress_engine: str = "silero", stress_dict_path: "Path | str | None" = None,
                emphasize: bool = True, use_vad_trim: bool = True,
                use_stress_online: bool = False,
                book_stress_overrides_path: "Path | str | None" = None,
-               stress_ollama_model: str = "", stress_ollama_host: str = ""):
+               strip_monosyllables: bool = True,
+               stress_review: "bool | None" = None):
     """Озвучка через Silero TTS — нейросетевой русский голос, локально.
     По умолчанию v5_5_ru (последняя модель: ударения, омографы, вопросы).
 
@@ -4089,25 +4922,11 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     прямой речи (абзацы, начинающиеся с тире) — см. _group_paragraphs_by_voice.
     Остальной текст (авторская речь) звучит голосом speaker, как обычно.
 
-    stress_engine — какой движок расставляет ударения помимо словаря
-    (stress_dict) и встроенного в Silero put_accent: "ruaccent" (по
-    умолчанию, как раньше), "silero_stress" (полная замена RUAccent на
-    silero-stress), "hybrid" (RUAccent как основа + silero-stress только
-    для слов-омографов из ambiguous_stress_words_ru.txt) или "ollama"
-    (RUAccent как основа; для омографов — КОМБИНАЦИЯ: если silero-stress
-    установлена, её предположение передаётся локальной LLM через Ollama
-    как подсказка, а решает по смыслу контекста конкретного предложения
-    LLM — и служит откатом, если сама Ollama недоступна; без silero-stress
-    решает только LLM "с нуля". Требует запущенного Ollama и модели в
-    stress_ollama_model/stress_ollama_host). "none" (или любое другое
-    значение) — не использовать ни один из них, как раньше --no-ruaccent.
-    stress_dict_path — свой словарь
-    "слово": "сл+ово" (JSON) для конкретных имён/терминов книги, которые
-    ни RUAccent, ни Silero не знают; словарь применяется раньше RUAccent и
-    имеет приоритет над ним (см. apply_stress_dictionary,
-    load_stress_dictionary). По умолчанию ищется файл
-    stress_dictionary.json рядом со скриптом — его не обязательно
-    указывать явно.
+    stress_engine — "silero" (по умолчанию): словарь -> silero-stress ->
+    грамматический шлюз slovnet -> санитайзер; "none" — не расставлять ударения
+    самим (остаётся только put_accent Silero). stress_dict_path — свой словарь
+    "слово": "сл+ово" (JSON) для имён/терминов книги; он применяется раньше
+    silero-stress и имеет над ним приоритет (см. load_stress_dictionary).
 
     emphasize — небольшое усиление интонации для кусков текста,
     заканчивающихся "?"/"!" (см. apply_emphasis) — приближение к тому,
@@ -4118,12 +4937,19 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     import wave
 
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
-    stress_engine = (stress_engine or "ruaccent").lower()
-    accentizer = _load_ruaccent() if stress_engine in ("ruaccent", "hybrid", "ollama", "lmstudio") else None
-    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama", "lmstudio") else None
+    stress_engine = normalize_stress_engine(stress_engine)
+    reset_stress_review(label=Path(outdir).name)
+    set_strip_monosyllables(strip_monosyllables)
+    if stress_review is not None:
+        set_stress_review(stress_review)
+    silero_stress_accentor = _load_silero_stress() if stress_engine_needs_silero(stress_engine) else None
+    # The client chain owns the marks only when silero-stress really loaded; otherwise Silero's own
+    # put_accent/put_yo stay available as the fallback.
+    _chain_active = stress_layers_are_client_side(stress_engine, silero_stress_accentor)
+    set_keep_hyphens(_chain_active)
     if stress_dict:
-        print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
-              f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
+        print(f"Ручной словарь ударений: {len(stress_dict)} слов(а) "
+              "(forced_stress_words.json + manual overrides) — для них нейросеть не вызывается.")
     vad_model, vad_get_timestamps = _load_silero_vad() if use_vad_trim else (None, None)
 
     allowed = speakers_for_model(model_id)
@@ -4153,12 +4979,12 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         # либо звучат странно.
         part_text = numbers_to_words_ru(part_text)
         # Порядок важен: сначала свой словарь (высший приоритет — конкретные
-        # имена/термины книги), потом RUAccent (общая подстраховка для
-        # всего остального). Слова из словаря на время RUAccent прячутся за
+        # имена/термины книги), потом silero-stress (общая подстраховка для
+        # всего остального). Слова из словаря на время silero-stress прячутся за
         # плейсхолдерами (apply_stress_dictionary_protected) и возвращаются
         # обратно уже после него (restore_stress_placeholders) — иначе на
         # составных словах через дефис ("во-первых", "по-русски" и т.п.)
-        # RUAccent может не узнать уже стоящее "+"-ударение и добавить своё
+        # акцентор может не узнать уже стоящее "+"-ударение и добавить своё
         # ещё раз, поверх; два ударения в одном слове звучат как заметное
         # "растягивание"/искажение при синтезе. put_accent=True ниже
         # остаётся включённым как ещё один, третий по счёту, уровень
@@ -4171,25 +4997,10 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         # stress_dict (исключены как омографы), поэтому решение по
         # конкретному фрагменту подмешиваем во ВРЕМЕННУЮ копию словаря,
         # ничего не сохраняя в JSON.
-        _case_overrides = resolve_case_ambiguous_nouns(part_text)
-        _case_overrides.update(resolve_lemma_homographs(part_text))
-        if stress_engine == "hybrid" and silero_stress_accentor is not None:
-            _case_overrides.update(_silero_stress_omograph_overrides(part_text, silero_stress_accentor))
-        if stress_engine in ("ollama", "lmstudio"):
-            _case_overrides.update(_ollama_stress_overrides(
-                part_text, stress_ollama_model, host=stress_ollama_host, log_fn=print,
-                silero_stress_accentor=silero_stress_accentor, backend=stress_engine))
-        _effective_stress_dict = stress_dict
-        if _case_overrides:
-            _effective_stress_dict = dict(stress_dict)
-            _effective_stress_dict.update(_case_overrides)
-        part_text, _stress_placeholders = apply_stress_dictionary_protected(part_text, _effective_stress_dict)
-        if stress_engine == "silero_stress" and silero_stress_accentor is not None:
-            part_text = apply_silero_stress(part_text, silero_stress_accentor)
-        elif accentizer is not None:
-            part_text = apply_ruaccent(part_text, accentizer)
+        part_text, _stress_placeholders = apply_stress_dictionary_protected(part_text, stress_dict)
+        part_text = apply_stress_layers(part_text, stress_engine, silero_stress_accentor)
         part_text = restore_stress_placeholders(part_text, _stress_placeholders)
-        # put_yo — тоже встроенный механизм САМОГО Silero (не RUAccent), и он
+        # put_yo — тоже встроенный механизм САМОГО Silero (не silero-stress), и он
         # применяется к уже восстановленному тексту целиком, без разбора, что
         # именно пришло из словаря — в отличие от put_accent (который, судя
         # по всему, не трогает буквы там, где уже стоит "+"), put_yo может
@@ -4201,12 +5012,15 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         # (там, где она действительно нужна), а не надеяться на угадывание.
         # На остальные (более частые) фрагменты без словарных слов это не
         # влияет — там put_yo работает как раньше.
-        effective_put_yo = put_yo and not _stress_placeholders
+        # Pass-through guarantee: when the client chain (dictionary -> silero-stress -> gate)
+        # is active, Silero's own put_accent/put_yo are OFF so it can never alter a "+" word.
+        effective_put_yo = put_yo and not _stress_placeholders and not _chain_active
+        _eff_put_accent = put_accent and not _chain_active
         return model.apply_tts(
             text=part_text,
             speaker=part_speaker,
             sample_rate=sample_rate,
-            put_accent=put_accent,
+            put_accent=_eff_put_accent,
             put_yo=effective_put_yo,
         ).numpy()
 
@@ -4251,6 +5065,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             print("Остановлено пользователем (после предыдущей главы).")
             break
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
+        reset_stress_context()
         out_path = outdir / fname
 
         fingerprint = _params_fingerprint(
@@ -4261,7 +5076,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
             stress_engine=stress_engine, emphasize=emphasize,
-            stress_dict_size=len(stress_dict), use_vad_trim=use_vad_trim,
+            stress_dict_digest=stress_dict_digest(stress_dict, text), use_vad_trim=use_vad_trim,
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -4274,9 +5089,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю: {title} -> {fname}")
 
-        if stress_engine in ("ollama", "lmstudio"):
-            prewarm_ollama_stress(text, stress_ollama_model, host=stress_ollama_host, log_fn=print,
-                                   silero_stress_accentor=silero_stress_accentor, backend=stress_engine)
+        run_stress_review_for_chapter(text, stress_dict, title)
 
         # Группируем по голосу (диалоги/повествование, см. dialogue_speakers,
         # и/или LLM-атрибуция по персонажам, см. attribution), затем каждую
@@ -4365,6 +5178,13 @@ def _xml_escape(s: str) -> str:
              .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+# Усиление вопросов/восклицаний. Раньше было pitch="high"/rate="fast" — это
+# крупные пресеты Silero, из-за них интонация «скакала» на каждой реплике.
+EMPHASIS_QUESTION_PITCH = "+15%"
+EMPHASIS_EXCLAIM_PITCH = "+10%"
+EMPHASIS_EXCLAIM_RATE = "107%"
+
+
 def _prosody_wrap(escaped_sentence: str, original_sentence: str, emphasize: bool) -> str:
     """Слегка усиливает интонацию вопросительных/восклицательных предложений
     через <prosody pitch=.../rate=...> поверх того, что модель и так делает
@@ -4374,9 +5194,9 @@ def _prosody_wrap(escaped_sentence: str, original_sentence: str, emphasize: bool
         return f"<s>{escaped_sentence}</s>"
     stripped = original_sentence.rstrip()
     if stripped.endswith("?"):
-        return f'<s><prosody pitch="high">{escaped_sentence}</prosody></s>'
+        return f'<s><prosody pitch="{EMPHASIS_QUESTION_PITCH}">{escaped_sentence}</prosody></s>'
     if stripped.endswith("!"):
-        return f'<s><prosody pitch="high" rate="fast">{escaped_sentence}</prosody></s>'
+        return f'<s><prosody pitch="{EMPHASIS_EXCLAIM_PITCH}" rate="{EMPHASIS_EXCLAIM_RATE}">{escaped_sentence}</prosody></s>'
     return f"<s>{escaped_sentence}</s>"
 
 
@@ -4405,7 +5225,7 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
     вопросов/восклицаний (emphasize) — Silero поддерживает вложенные
     <prosody>, внутренний переопределяет только то, что задаёт сам.
 
-    Ударения (RUAccent) в готовый SSML не добавляются здесь — это делает
+    Ударения (silero-stress) в готовый SSML не добавляются здесь — это делает
     сервер (silero_rest_service.py) при получении запроса, в том числе для
     уже готового SSML, который присылает этот клиент.
     """
@@ -4458,6 +5278,11 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
             cur_len += len(para) + 1
     if cur:
         chunks.append("\n".join(cur))
+    # Every chunk is a separate synthesis call (a possible timbre jump). A tiny tail chunk is
+    # appended to the previous one instead of being voiced on its own.
+    if len(chunks) > 1 and len(chunks[-1]) < 150 and len(chunks[-2]) + len(chunks[-1]) + 1 <= max_len + 250:
+        chunks[-2] = chunks[-2] + "\n" + chunks[-1]
+        chunks.pop()
     return chunks or [text]
 
 
@@ -4470,9 +5295,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                      stress_dict_path: "Path | str | None" = None,
                      use_vad_trim: bool = True, use_stress_online: bool = False,
                      book_stress_overrides_path: "Path | str | None" = None,
-                     stress_engine: str = "ruaccent",
-                     stress_ollama_model: str = "", stress_ollama_host: str = "",
-                     smart_emotion: bool = False, emotion_attribution=None):
+                     stress_engine: str = "silero",
+                     smart_emotion: bool = False, emotion_attribution=None,
+                     strip_monosyllables: bool = True,
+                     stress_review: "bool | None" = None):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -4495,9 +5321,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     stress_dict_path — тот же словарь ударений "слово": "сл+ово" (JSON), что
     и у run_silero (см. load_stress_dictionary) — здесь применяется на
     стороне клиента, ДО построения SSML/отправки на сервер, поэтому у
-    слов из словаря приоритет над RUAccent, который сервис (silero_rest_service.py)
-    и так применяет к присланному тексту/SSML: RUAccent не переставляет
-    "+"-ударение там, где оно уже явно указано.
+    слов из словаря приоритет над silero-stress. Сервис (silero_rest_service.py)
+    сам ударения не расставляет: при server_accent=false он озвучивает текст
+    ровно с теми "+", что прислал клиент.
 
     smart_emotion — LLM (см. classify_paragraph_emotions_llm, тот же
     механизм, что и --yandex-smart-emotion) определяет эмоцию КАЖДОГО
@@ -4524,20 +5350,23 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     import wave as wave_mod
 
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
+    pron_subs = load_pronunciation_substitutions()
     if stress_dict:
-        print(f"Загружен словарь ударений: {len(stress_dict)} слов(а) из "
-              f"{Path(stress_dict_path) if stress_dict_path else DEFAULT_STRESS_DICT_PATH}")
+        print(f"Ручной словарь ударений: {len(stress_dict)} слов(а) "
+              "(forced_stress_words.json + manual overrides) — для них нейросеть не вызывается.")
     vad_model, vad_get_timestamps = _load_silero_vad() if use_vad_trim else (None, None)
 
-    # stress_engine — тут применяется ЦЕЛИКОМ на клиенте, ДО отправки на
-    # сервис (silero_rest_service.py сам всегда прогоняет присланный текст
-    # через RUAccent, но не трогает слова, где уже стоит "+" — см.
-    # _protect_already_accented там же). Поэтому 'ruaccent' (по умолчанию)
-    # ничего здесь не меняет — RUAccent как и раньше отрабатывает на
-    # сервере; 'hybrid' и 'silero_stress' подмешивают/заменяют ударения
-    # ДО отправки, а сервер лишь не трогает уже проставленные "+".
-    stress_engine = (stress_engine or "ruaccent").lower()
-    silero_stress_accentor = _load_silero_stress() if stress_engine in ("silero_stress", "hybrid", "ollama", "lmstudio") else None
+    # stress_engine применяется ЦЕЛИКОМ на клиенте, ДО отправки на сервис:
+    # словарь -> silero-stress -> грамматический шлюз -> санитайзер. Сервис
+    # (silero_rest_service.py) ударения не расставляет и сохраняет все "+".
+    stress_engine = normalize_stress_engine(stress_engine)
+    reset_stress_review(label=Path(outdir).name)
+    set_strip_monosyllables(strip_monosyllables)
+    if stress_review is not None:
+        set_stress_review(stress_review)
+    silero_stress_accentor = _load_silero_stress() if stress_engine_needs_silero(stress_engine) else None
+    _client_layers = stress_layers_are_client_side(stress_engine, silero_stress_accentor)
+    set_keep_hyphens(_client_layers)
 
     if dialogue_speakers:
         allowed = speakers_for_model(model_id)
@@ -4597,42 +5426,19 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                 raise e
         raise last_exc
 
-    def _effective_stress_dict_for(text_chunk: str) -> dict:
-        """См. resolve_case_ambiguous_nouns/resolve_lemma_homographs —
-        временно подмешивает решённые по контексту формы (не сохраняется
-        в JSON)."""
-        overrides = resolve_case_ambiguous_nouns(text_chunk)
-        overrides.update(resolve_lemma_homographs(text_chunk))
-        if not overrides:
-            return stress_dict
-        merged = dict(stress_dict)
-        merged.update(overrides)
-        return merged
-
     def _accented_text_for_rest(plain_text_chunk: str) -> str:
-        """Готовит текст ПЕРЕД отправкой на silero_rest_service.py — см.
-        пояснение про stress_engine выше. Для 'ruaccent' — просто словарь,
-        как и раньше. Для 'hybrid' — словарь + ударения для слов-омографов
-        от silero-stress (остальное по-прежнему достаётся серверному
-        RUAccent). Для 'silero_stress' — словарь (под защитой плейсхолдеров,
-        чтобы silero-stress их не трогала) + вся оставшаяся расстановка
-        ударений тоже через silero-stress, целиком на клиенте — сервер в
-        этом случае почти ничего не добавляет, т.к. все слова уже придут
-        с "+"."""
-        effective_dict = _effective_stress_dict_for(plain_text_chunk)
-        if stress_engine == "hybrid" and silero_stress_accentor is not None:
-            effective_dict = dict(effective_dict)
-            effective_dict.update(_silero_stress_omograph_overrides(plain_text_chunk, silero_stress_accentor))
-        if stress_engine in ("ollama", "lmstudio"):
-            effective_dict = dict(effective_dict)
-            effective_dict.update(_ollama_stress_overrides(
-                plain_text_chunk, stress_ollama_model, host=stress_ollama_host, log_fn=print,
-                silero_stress_accentor=silero_stress_accentor, backend=stress_engine))
-        if stress_engine == "silero_stress" and silero_stress_accentor is not None:
-            protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, effective_dict)
-            protected = apply_silero_stress(protected, silero_stress_accentor)
-            return restore_stress_placeholders(protected, placeholders)
-        return apply_stress_dictionary(plain_text_chunk, effective_dict)
+        """Prepares the text BEFORE it goes to silero_rest_service.py: the user's dictionary words,
+        then silero-stress, the grammar gate and the sanitizer. The service keeps every "+"."""
+        # Digits -> words BEFORE the stress layers, so "десять" gets its own stress mark (the
+        # service would otherwise convert them after the layers, unstressed, or not at all).
+        plain_text_chunk, _pron_held = protect_pronunciation_substitutions(plain_text_chunk, pron_subs)
+        plain_text_chunk = numbers_to_words_ru(plain_text_chunk)
+        if _client_layers:
+            protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, stress_dict)
+            protected = apply_stress_layers(protected, stress_engine, silero_stress_accentor)
+            return restore_pronunciation_substitutions(restore_stress_placeholders(protected, placeholders), _pron_held)
+        return restore_pronunciation_substitutions(
+            strip_monosyllable_stress(apply_stress_dictionary(plain_text_chunk, stress_dict)), _pron_held)
 
     # Заполняется заново для каждой главы (см. основной цикл ниже) —
     # {абзац_исходного_текста: {"rate":..,"pitch":..}} по классификации LLM.
@@ -4664,6 +5470,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             "speaker": chunk_speaker,
             "sample_rate": sample_rate,
             "raw_ssml": "true",
+            "strip_mono": "true" if strip_monosyllables else "false",
+            "server_accent": "false" if _client_layers else "true",
         })
         level = resp.headers.get("X-Synthesis-Level", "as-is")
         if level != "as-is":
@@ -4677,6 +5485,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             "text_to_speech": _accented_text_for_rest(plain_text_chunk),
             "speaker": chunk_speaker,
             "sample_rate": sample_rate,
+            "strip_mono": "true" if strip_monosyllables else "false",
+            "server_accent": "false" if _client_layers else "true",
         })
         return resp.content
 
@@ -4725,6 +5535,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             print("Остановлено пользователем (после предыдущей главы).")
             break
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
+        reset_stress_context()
         out_path = outdir / fname
 
         fingerprint = _params_fingerprint(
@@ -4733,8 +5544,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             comma_break_ms=comma_break_ms, emphasize=emphasize, max_len=max_len,
             dialogue_speakers=",".join(dialogue_speakers) if dialogue_speakers else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
-            stress_dict_size=len(stress_dict), use_vad_trim=use_vad_trim, stress_engine=stress_engine,
-            smart_emotion=smart_emotion,
+            stress_dict_digest=stress_dict_digest(stress_dict, text), use_vad_trim=use_vad_trim,
+            stress_engine=stress_engine, smart_emotion=smart_emotion,
+            **({"pron_digest": _pd} if (_pd := pronunciation_digest(pron_subs, text)) else {}),
         )
         if _is_already_done(out_path, fingerprint):
             print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено с теми же параметрами): {title} -> {fname}")
@@ -4747,12 +5559,11 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю (silero_rest): {title} -> {fname}")
 
-        if stress_engine in ("ollama", "lmstudio"):
-            prewarm_ollama_stress(text, stress_ollama_model, host=stress_ollama_host, log_fn=print,
-                                   silero_stress_accentor=silero_stress_accentor, backend=stress_engine)
+        _sg = _stall_guard_start(f"chapter {idx}: preparation + first fragment")
+        run_stress_review_for_chapter(text, stress_dict, title)
 
         _chapter_para_prosody = {}
-        if smart_emotion:
+        if smart_emotion and LLM_FEATURES_ENABLED:
             chapter_paras = [p for p in text.split("\n") if p.strip()]
             _emo_creds = emotion_attribution if emotion_attribution is not None else attribution
             try:
@@ -4766,7 +5577,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                     log_fn=log,
                 )
                 _chapter_para_prosody = {
-                    p: SILERO_EMOTION_PROSODY[lbl] for p, lbl in zip(chapter_paras, emo_labels)
+                    p: pr for p, pr in zip(chapter_paras, smooth_emotion_prosody(emo_labels))
                 }
                 log(f"smart_emotion: определены эмоции для {len(chapter_paras)} абзац(ев) главы.")
             except Exception as e:
@@ -4798,11 +5609,13 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                     on_progress(pos, total, chunk_no, chunks_total)
                 continue
             audio = synth_chunk(chunk, chunk_no, idx, title, chunk_voice)
+            _stall_guard_stop(_sg)
             audio_parts.append(audio)
             audio_parts.append(pause)
             if on_progress:
                 on_progress(pos, total, chunk_no, chunks_total)
 
+        _stall_guard_stop(_sg)
         if not audio_parts:
             continue
 
@@ -4984,6 +5797,7 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
             print("Остановлено пользователем (после предыдущей главы).")
             break
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
+        reset_stress_context()
         out_path = outdir / fname
 
         fingerprint = _params_fingerprint(
@@ -5104,7 +5918,7 @@ _PIPER_VOICE_CACHE: dict = {}
 
 
 def _piper_voice_dir() -> Path:
-    d = Path(__file__).resolve().parent / "piper_voices"
+    d = _app_paths.user_file("piper_voices")
     d.mkdir(exist_ok=True)
     return d
 
@@ -5205,6 +6019,7 @@ def run_piper(chapters, outdir: Path, start: int, voice: str, play: bool,
             print("Остановлено пользователем (после предыдущей главы).")
             break
         fname = f"{idx:03d}_{sanitize_filename(title)}.wav"
+        reset_stress_context()
         out_path = outdir / fname
 
         fingerprint = _params_fingerprint(
@@ -5356,7 +6171,293 @@ def run_offline(chapters, start: int, rate: int, voice_hint: str, voice_id: str 
 # CLI
 # --------------------------------------------------------------------------
 
+def _stress_selftest() -> None:
+    """--stress-selftest: the real chain (user dictionary -> silero-stress -> grammar gate ->
+    sanitizer) on a few hard sentences, printed so the result can be checked by eye."""
+    silero = _load_silero_stress()
+    stress_dict = load_stress_dictionary()
+    print(f"manual dictionary: {len(stress_dict)} word(s); silero-stress: {'yes' if silero else 'no'}")
+    for sentence in ("Он сказал себе, что всё хорошо, и подошел к двери.",
+                     "Хотел я зайти в замок, но ключ в замок не подошел.",
+                     "Все пришли, но это все, что он знал.",
+                     "Когда-нибудь кто-то скажет: дай-ка мне сети и земли."):
+        prot, ph = apply_stress_dictionary_protected(sentence, stress_dict)
+        out = apply_stress_layers(prot, "silero", silero)
+        print(restore_stress_placeholders(out, ph))
+
+
+# --- «Анализ омографов книги» (Stress Dictionary tab, gui_stress_editor.py; no console command) ---------
+# Scan = the SAME chain the audio gets (digits -> words, ё marks, silero-stress primed with the previous
+# paragraph, grammar gate, sanitizer), chapter by chapter, WITHOUT the user's dictionaries: what the models
+# decide for each occurrence of a homograph is recorded as a PHRASE key (the word plus 1-2 neighbours).
+# Never a flat single-word entry - that would flatten the other readings. forced_stress_words.json still
+# wins at synthesis time.
+_BBD_VOWEL_RE = re.compile(r"[аеёиоуыэюя]", re.I)
+# extra homographs that are not in the ambiguous list (one-vowel words are filtered out of it)
+_EXTRA_HOMOGRAPHS = ("все",)
+# context windows (offsets of the first/last word relative to the target), tried in this order:
+# "мы все побежали", "в этой земли", "земли лены харрингтон", then wider ones
+_BBD_WINDOWS = ((-1, 1), (-2, 0), (0, 2), (-2, 1), (-1, 2), (-2, 2), (-1, 0), (0, 1))
+
+
+def _bbd_norm(w: str) -> str:
+    return w.lower().replace("ё", "е")
+
+
+def homograph_targets() -> set:
+    """Plain lower-case spellings (е for ё) of the doubtful words: the grammar gate's paradigm table
+    (земли, сети, трети, голоса, корпуса...), the ambiguous-stress list and _EXTRA_HOMOGRAPHS (все)."""
+    t = set(_EXTRA_HOMOGRAPHS)
+    try:
+        import grammar_gate
+        t.update(_bbd_norm(k) for k in grammar_gate.PARADIGM_TABLE)
+    except Exception:
+        pass
+    try:
+        t.update(_bbd_norm(w) for w in _load_ambiguous_stress_words())
+    except Exception:
+        pass
+    return t
+
+
+def _bbd_value(out_tok: str, target: bool = False) -> "tuple[str, bool]":
+    """(lower-case form, reading known?) for one output token. One-vowel words lose their mark; a
+    multi-syllable word counts as known when it carries a '+' or ё. A TARGET keeps/gets its mark even
+    with one vowel ("все" -> "вс+е", "вс+ё"), because that mark is exactly the reading we record."""
+    t = out_tok.lower()
+    plain = t.replace("+", "")
+    vowels = list(_BBD_VOWEL_RE.finditer(plain))
+    if target and "+" not in t and "ё" not in plain and len(vowels) == 1:
+        i = vowels[0].start()
+        return plain[:i] + "+" + plain[i:], True
+    if len(vowels) <= 1 and "ё" not in plain:
+        return plain, False
+    return t, ("+" in t or "ё" in plain)
+
+
+def scan_book_stress(chapters, silero_accentor, targets=None, log_fn=print, cancel=None) -> "list[list[tuple]]":
+    """Runs every paragraph of every chapter through the default pipeline (so the context priming works
+    exactly as in synthesis) and returns, per paragraph, word tuples
+    (key, value, is_target_reading, joined_to_next, chapter_no): key = source spelling lower-cased,
+    value = pipeline output lower-cased (with '+'), joined_to_next = only whitespace separates it from
+    the next word (a phrase key may continue). `cancel` (anything with is_set()) aborts with InterruptedError."""
+    import time as _time
+    t0 = _time.time()
+    targets = targets or set()
+    set_keep_hyphens(True)
+    paras: list = []
+    total = len(chapters)
+    for ci, (title, text) in enumerate(chapters, 1):
+        reset_stress_context()                      # first paragraph of a chapter has no left context
+        first, n_words, n_hits = len(paras), 0, 0
+        for para in numbers_to_words_ru(text or "").split("\n"):
+            if not para.strip():
+                continue
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("cancelled")
+            protected, ph = apply_stress_dictionary_protected(para, {})     # only the ё marks
+            marked = restore_stress_placeholders(apply_stress_layers(protected, "silero", silero_accentor), ph)
+            src = [(m.group(0), m.start(), m.end()) for m in _STRESS_WORD_RE.finditer(para)]
+            out_tokens = _OUT_WORD_RE.findall(marked)
+            mapping = _align_plain([_bbd_norm(w) for w, _s, _e in src], out_tokens)
+            row = []
+            for i, (w, s, e) in enumerate(src):
+                j = mapping.get(i)
+                is_t = j is not None and "ё" not in w.lower() and _bbd_norm(w) in targets
+                value, known = _bbd_value(out_tokens[j], is_t) if j is not None else (w.lower(), False)
+                hit = is_t and known
+                n_hits += hit
+                nxt = src[i + 1][1] if i + 1 < len(src) else None
+                joined = nxt is not None and para[e:nxt] != "" and para[e:nxt].strip() == ""
+                row.append((w.lower(), value, hit, joined, ci))
+            n_words += len(row)
+            if row:
+                paras.append(row)
+        log_fn(f"  [{ci}/{total}] {title[:50]!r}: {len(paras) - first} paragraphs, {n_words} words, "
+               f"{n_hits} homograph occurrence(s) ({_time.time() - t0:.0f} s)")
+    return paras
+
+
+def derive_homograph_phrases(paras, max_phrases_per_word: int = 60,
+                             only_multi: bool = True) -> "tuple[dict, dict]":
+    """(entries, stats). entries = {"мы все побежали": "мы вс+е побежали"}: phrase keys only. With
+    only_multi (default) a word is kept only when the book reads it in at least two ways. For each
+    occurrence the first window (1-2 words around it) whose words occur with ONE reading of the target in
+    the whole book is used, so the keys never contradict each other."""
+    readings: dict = {}                    # key -> {reading: [count, {chapters}]}
+    occ: dict = {}                         # key -> [(para index, word index)]
+    for pi, row in enumerate(paras):
+        for wi, (key, value, hit, _j, ch) in enumerate(row):
+            if hit:
+                rec = readings.setdefault(key, {}).setdefault(value, [0, set()])
+                rec[0] += 1
+                rec[1].add(ch)
+                occ.setdefault(key, []).append((pi, wi))
+    chosen_words = [k for k, v in readings.items() if len(v) > 1 or not only_multi]
+
+    def window(pi, wi, lo, hi):
+        row = paras[pi]
+        a, b = wi + lo, wi + hi
+        if a < 0 or b >= len(row) or any(not row[k][3] for k in range(a, b)):
+            return None
+        toks = row[a:b + 1]
+        return (" ".join(_bbd_norm(t[0]) for t in toks), " ".join(t[0] for t in toks),
+                " ".join(t[1] for t in toks))
+
+    phrases: dict = {}                     # normalised key -> [display key, value, count, reading]
+    conflicted: set = set()
+    unresolved: dict = {}
+    for key in chosen_words:
+        places = occ[key]
+        owners_by_window = []
+        for lo, hi in _BBD_WINDOWS:
+            owners: dict = {}
+            for pi, wi in places:
+                w = window(pi, wi, lo, hi)
+                if w:
+                    owners.setdefault(w[0], set()).add(paras[pi][wi][1])
+            owners_by_window.append(owners)
+        picked: dict = {}
+        for pi, wi in places:
+            reading = paras[pi][wi][1]
+            for (lo, hi), owners in zip(_BBD_WINDOWS, owners_by_window):
+                w = window(pi, wi, lo, hi)
+                if w and len(owners[w[0]]) == 1:
+                    rec = picked.setdefault(w[0], [w[1], w[2], 0, reading, paras[pi][wi][4]])
+                    rec[2] += 1
+                    break
+            else:
+                unresolved[key] = unresolved.get(key, 0) + 1
+        by_reading: dict = {}                       # cap per word, fair between readings
+        for nkey, rec in picked.items():
+            by_reading.setdefault(rec[3], []).append((nkey, rec))
+        queues = [sorted(v, key=lambda x: -x[1][2]) for v in by_reading.values()]
+        kept = []
+        while queues and len(kept) < max_phrases_per_word:
+            for q in list(queues):
+                if q and len(kept) < max_phrases_per_word:
+                    kept.append(q.pop(0))
+                if not q:
+                    queues.remove(q)
+        for nkey, rec in kept:
+            old = phrases.get(nkey)
+            if nkey in conflicted:
+                continue
+            if old and old[1] != rec[1]:           # two homographs side by side disagree on the neighbour
+                conflicted.add(nkey)
+                phrases.pop(nkey, None)
+            elif not old:
+                phrases[nkey] = rec
+
+    entries = {phrases[n][0]: phrases[n][1] for n in sorted(phrases)}
+    items = [{"key": phrases[n][0], "value": phrases[n][1], "count": phrases[n][2], "chapter": phrases[n][4]}
+             for n in sorted(phrases)]
+    stats = {
+        "items": items,
+        "homograph_occurrences": sum(len(v) for v in occ.values()),
+        "homograph_words_found": len(readings),
+        "homograph_words_multi": sum(1 for v in readings.values() if len(v) > 1),
+        "phrase_keys": len(entries),
+        "unresolved_occurrences": sum(unresolved.values()),
+        "unresolved_words": sorted(unresolved, key=lambda k: -unresolved[k])[:10],
+        "words_report": {k: {r: v[0] for r, v in sorted(readings[k].items(), key=lambda x: -x[1][0])}
+                         for k in sorted(chosen_words, key=lambda k: -sum(v[0] for v in readings[k].values()))[:15]},
+    }
+    return entries, stats
+
+
+def _grammar_gate_available() -> bool:
+    try:
+        import grammar_gate
+        return bool(grammar_gate._load())
+    except Exception:
+        return False
+
+
+def analyze_chapters_homographs(chapters, max_phrases_per_word: int = 60, only_multi: bool = True,
+                                progress_cb=None, cancel=None) -> "tuple[dict, dict]":
+    """Engine of the «Анализ омографов книги» button (gui_stress_editor.py; there is no console command):
+    scans the already loaded chapters [(title, text)] with the default stress pipeline and returns
+    (entries, stats) - entries = {"мы все побежали": "мы вс+е побежали"}, stats["items"] = per phrase
+    {key, value, count, chapter}. Runs in a GUI worker thread; `progress_cb(str)` gets a line per chapter,
+    `cancel.is_set()` aborts (InterruptedError). Raises RuntimeError when silero-stress is missing."""
+    silero = _load_silero_stress()
+    if silero is None:
+        raise RuntimeError("silero-stress не установлен - нечем разрешать ударения")
+    targets = homograph_targets()
+    log = progress_cb or (lambda m: None)
+    log(f"Глав: {len(chapters)}; слов-омографов в списке: {len(targets)}; "
+        f"грамматический шлюз: {'вкл' if _grammar_gate_available() else 'ВЫКЛ (падежные омографы не разбираются)'}")
+    paras = scan_book_stress(chapters, silero, targets, log, cancel)
+    entries, stats = derive_homograph_phrases(paras, max_phrases_per_word, only_multi)
+    stats["chapters"] = len(chapters)
+    stats["words_total"] = sum(len(r) for r in paras)
+    return entries, stats
+
+
+SUBCOMMANDS = ("fetch-models", "selftest", "serve-silero", "gui")
+
+
+def run_subcommand(argv: "list[str]") -> int:
+    """Internal orchestrator: every non-synthesis phase is a subcommand of this one program
+    (`fb2_reader[.exe] <subcommand> ...`), so a frozen build needs no side scripts or python.exe.
+    Callable from the GUI as well (it spawns `[sys.executable, "serve-silero"]` when frozen)."""
+    import app_paths
+    ap = argparse.ArgumentParser(prog="fb2_reader", description="fb2_reader orchestrator")
+    sub = ap.add_subparsers(dest="command", required=True)
+    f = sub.add_parser("fetch-models", help="download grammar-gate models (and optionally the stress corpus)")
+    f.add_argument("--corpus", action="store_true", help="also fetch stress_corpus_ru.tsv.gz")
+    sub.add_parser("selftest", help="check that silero-stress, the grammar gate and the asset paths resolve")
+    sv = sub.add_parser("serve-silero", help="run the Silero REST service in this process")
+    sv.add_argument("--host", default="0.0.0.0")
+    sv.add_argument("--port", type=int, default=5010)
+    sub.add_parser("gui", help="graphical interface")
+    ns = ap.parse_args(argv)
+
+    if app_paths.is_frozen():
+        os.chdir(app_paths.app_dir())          # relative paths (logs, outputs) land next to the exe
+        app_paths.seed_defaults()
+    if ns.command == "fetch-models":
+        import grammar_gate
+        print("grammar models ->", grammar_gate.fetch_models())
+        if ns.corpus:
+            print("corpus: run the corpus download from the GUI/README (word-form only; not needed for training)")
+        return 0
+    if ns.command == "selftest":
+        import grammar_gate
+        print(app_paths.describe())
+        ok = True
+        ss = _load_silero_stress()
+        print("silero-stress:", "ok" if ss is not None else "MISSING (pip install silero-stress)")
+        ok = ss is not None
+        print("grammar gate:", "ON" if grammar_gate._load() else "OFF (packages/models missing)")
+        if grammar_gate._load():
+            print(grammar_gate.grammar_gate("Он сидел у воды."))
+        return 0 if ok else 1
+    if ns.command == "serve-silero":
+        import uvicorn
+        import silero_rest_service
+        uvicorn.run(silero_rest_service.app, host=ns.host, port=ns.port, log_level="info")
+        return 0
+    if ns.command == "gui":
+        from fb2_reader_gui import run_gui
+        run_gui()
+        return 0
+    return 2
+
+
 def main():
+    import multiprocessing
+    multiprocessing.freeze_support()          # frozen exe: worker processes must not re-run main()
+    if len(sys.argv) > 1 and sys.argv[1] in SUBCOMMANDS:
+        sys.exit(run_subcommand(sys.argv[1:]))
+    try:
+        import app_paths as _ap
+        if _ap.is_frozen():
+            os.chdir(_ap.app_dir())
+            _ap.seed_defaults()
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
     ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
     ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
@@ -5443,33 +6544,26 @@ def main():
     ap.add_argument("--no-yo", action="store_true",
                      help="не заменять 'е' на 'ё' там, где нужно, в silero-режиме "
                           "(по умолчанию заменяется)")
-    ap.add_argument("--no-ruaccent", action="store_true",
-                     help="не использовать RUAccent в дополнение к встроенному в Silero "
-                          "put_accent в silero-режиме (по умолчанию используется, если "
-                          "пакет ruaccent установлен) — то же самое, что --stress-engine none")
-    ap.add_argument("--stress-engine", type=str, default="ruaccent",
-                     choices=["ruaccent", "silero_stress", "hybrid", "ollama", "lmstudio", "none"],
-                     help="движок автоматической расстановки ударений (сверх словаря "
-                          "stress_dict и put_accent) для silero/silero_rest-режимов: "
-                          "'ruaccent' (по умолчанию, как раньше) / 'silero_stress' (новая "
-                          "модель от Silero, https://github.com/snakers4/silero-stress, "
-                          "полная замена RUAccent) / 'hybrid' (RUAccent как основа + "
-                          "silero-stress только для слов-омографов из "
-                          "ambiguous_stress_words_ru.txt) / 'ollama' (RUAccent как основа + "
-                          "локальная LLM через Ollama решает ударение омографов по смыслу "
-                          "контекста, см. --stress-ollama-model/--ollama-host) / 'none' "
-                          "(ничего из этого)")
-    ap.add_argument("--stress-ollama-model", type=str, default="",
-                     help="модель Ollama для --stress-engine ollama (например "
-                          "'qwen2.5:7b-instruct') — должна быть заранее скачана "
-                          "('ollama pull <модель>')")
+    ap.add_argument("--stress-selftest", action="store_true",
+                     help="accentuate a few test sentences through the full pipeline "
+                          "(dictionary -> silero-stress -> grammar gate) and exit")
+    ap.add_argument("--keep-monosyllable-stress", action="store_true",
+                     help="do not strip the '+' mark from one-vowel words")
+    ap.add_argument("--no-stress-review", action="store_true",
+                     help="do not write the per-chapter review list "
+                          "review_list.json (same as AUDIOBOOK_STRESS_REVIEW=0)")
+    ap.add_argument("--stress-engine", type=str, default="silero",
+                     choices=["silero", "none", "ruaccent", "silero_stress", "hybrid", "ollama", "lmstudio"],
+                     help="'silero' (default) - dictionary -> silero-stress -> grammar gate -> "
+                          "sanitizer; 'none' - switch automatic stress off. Legacy values "
+                          "(ruaccent/silero_stress/hybrid/ollama/lmstudio) are accepted and mean 'silero'.")
+    ap.add_argument("--stress-ollama-model", type=str, default="", help=argparse.SUPPRESS)
     ap.add_argument("--ollama-host", type=str, default="",
-                     help="адрес сервера Ollama, если не стандартный http://localhost:11434 "
-                          "— используется и для --stress-engine ollama, и для "
-                          "--attribution-provider ollama")
+                     help="адрес локального LLM-сервера только для --attribution-provider "
+                          "ollama/lmstudio (в расстановке ударений LLM не участвует)")
     ap.add_argument("--stress-dict", type=str, default="",
                      help="свой словарь ударений (JSON: {\"слово\": \"сл+ово\"}) для "
-                          "silero-режима — приоритетнее RUAccent, для имён/терминов книги. "
+                          "silero-режима — приоритетнее silero-stress, для имён/терминов книги. "
                           "По умолчанию: stress_dictionary.json рядом со скриптом, если есть")
     ap.add_argument("--no-vad-trim", action="store_true",
                      help="не обрезать тишину по краям фрагментов через silero-vad в "
@@ -5486,7 +6580,7 @@ def main():
                           "может попасть не тот вариант) и содержат отдельные готовые ошибки "
                           "даже на простых словах ('пока', 'именно') — включённое по "
                           "умолчанию, это раньше портило произношение обычных слов, которые "
-                          "RUAccent и без словаря обычно угадывает по контексту правильно. "
+                          "silero-stress и без словаря обычно угадывает по контексту правильно. "
                           "Включайте только если специально хотите пополнить словарь и готовы "
                           "потом вручную проверять/чистить stress_dictionary.json.")
     ap.add_argument("--no-stress-online", action="store_true",
@@ -5568,6 +6662,12 @@ def main():
                      help="Folder ID для провайдера yandexgpt — можно использовать тот же, что "
                           "и --yandex-folder-id; для gemini/anthropic не нужен")
     args = ap.parse_args()
+    if args.no_stress_review:
+        globals()["STRESS_REVIEW_ENABLED"] = False
+
+    if args.stress_selftest:
+        _stress_selftest()
+        return
 
     if args.check_model_updates:
         from silero_config import check_for_model_updates
@@ -5627,7 +6727,8 @@ def main():
     attribution_api_key = args.attribution_api_key or os.environ.get("YANDEX_API_KEY", "") \
         or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
     attribution_model = args.attribution_model or ATTRIBUTION_PROVIDERS[attribution_provider]["default_model"]
-    attribution_folder_id = args.attribution_folder_id or args.yandex_folder_id
+    attribution_folder_id = args.attribution_folder_id or args.yandex_folder_id \
+        or os.environ.get("YANDEX_FOLDER_ID", "")
     attribution = {
         "api_key": attribution_api_key, "model": attribution_model,
         "provider": attribution_provider, "folder_id": attribution_folder_id,
@@ -5645,13 +6746,13 @@ def main():
                    put_accent=not args.no_accent, put_yo=not args.no_yo,
                    chapter_indices=chapter_indices, dialogue_speakers=dialogue_speakers,
                    attribution=attribution,
-                   stress_engine=("none" if args.no_ruaccent else args.stress_engine),
-                   stress_ollama_model=args.stress_ollama_model, stress_ollama_host=args.ollama_host,
+                   stress_engine=args.stress_engine,
                    emphasize=not args.no_emphasis,
                    stress_dict_path=args.stress_dict or None,
                    use_vad_trim=not args.no_vad_trim,
                    use_stress_online=args.stress_online,
-                   book_stress_overrides_path=book_manual_stress_overrides_path(args.book))
+                   book_stress_overrides_path=book_manual_stress_overrides_path(args.book),
+                   strip_monosyllables=not args.keep_monosyllable_stress)
     elif args.mode == "silero_rest":
         run_silero_rest(chapters, args.outdir, args.start, args.speaker, args.sample_rate, args.play,
                          args.rest_url, args.sentence_break_ms, args.paragraph_break_ms,
@@ -5662,9 +6763,9 @@ def main():
                          use_vad_trim=not args.no_vad_trim,
                          use_stress_online=args.stress_online,
                          book_stress_overrides_path=book_manual_stress_overrides_path(args.book),
-                         stress_engine=("none" if args.no_ruaccent else args.stress_engine),
-                         stress_ollama_model=args.stress_ollama_model, stress_ollama_host=args.ollama_host,
-                         smart_emotion=args.smart_emotion)
+                         stress_engine=args.stress_engine,
+                         smart_emotion=args.smart_emotion,
+                         strip_monosyllables=not args.keep_monosyllable_stress)
     elif args.mode == "cosyvoice":
         cosyvoice_dialogue_voices = [v.strip() for v in args.cosyvoice_dialogue_voices.split(",") if v.strip()] or None
         run_cosyvoice(chapters, args.outdir, args.start, args.cosyvoice_voice, args.sample_rate, args.play,
@@ -5708,4 +6809,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # `import fb2_reader` from the GUI must reuse this running module, not load a 2nd copy
+    sys.modules.setdefault("fb2_reader", sys.modules["__main__"])
     main()

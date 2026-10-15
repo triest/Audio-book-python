@@ -1,0 +1,520 @@
+{
+ "_readme": "Gold set for stress_benchmark.py. Authored by hand (not by a model under test). Each case: text + targets [form, ...]; a form is the word with '+' before the stressed vowel. 'any' lists alternative acceptable forms. Ambiguous words with no single canonical reading must NOT be added here. Please review and extend with failures from real books.",
+ "cases": [
+  {
+   "cat": "homograph",
+   "text": "Он сказал себе, что замок пуст.",
+   "targets": [
+    {
+     "form": "з+амок",
+     "homograph": true
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Дверной замок заклинило.",
+   "targets": [
+    {
+     "form": "зам+ок"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Он повернул ключ в замке.",
+   "targets": [
+    {
+     "form": "замк+е"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Из муки испекли хлеб.",
+   "targets": [
+    {
+     "form": "мук+и",
+     "homograph": true
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Он терпел муки совести.",
+   "targets": [
+    {
+     "form": "м+уки"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Всё, что он видел, было ложью.",
+   "targets": [
+    {
+     "form": "вс+ё"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Все пришли вовремя.",
+   "targets": [
+    {
+     "form": "все",
+     "homograph": true
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Он сделает все, чтобы выжить.",
+   "targets": [
+    {
+     "form": "вс+ё"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Ей все известно.",
+   "targets": [
+    {
+     "form": "вс+ё"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Я знаком с этим человеком.",
+   "targets": [
+    {
+     "form": "знак+ом"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Он куда больше хотел жить.",
+   "targets": [
+    {
+     "form": "б+ольше"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Часовые встали на караул.",
+   "targets": [
+    {
+     "form": "кара+ул",
+     "any": [
+      "караул"
+     ]
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Она закусила губы.",
+   "targets": [
+    {
+     "form": "г+убы"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Облака плыли над городом.",
+   "targets": [
+    {
+     "form": "облак+а"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Города лежали в руинах.",
+   "targets": [
+    {
+     "form": "город+а"
+    }
+   ]
+  },
+  {
+   "cat": "homograph",
+   "text": "Острова на горизонте таяли.",
+   "targets": [
+    {
+     "form": "остров+а"
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "Он глубоко вздохнул.",
+   "targets": [
+    {
+     "form": "глубок+о"
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "Это не давало покоя самому графу.",
+   "targets": [
+    {
+     "form": "самом+у",
+     "homograph": true
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "Она взяла себя в руки.",
+   "targets": [
+    {
+     "form": "в р+уки",
+     "homograph": true
+    }
+   ],
+   "phrase": true
+  },
+  {
+   "cat": "inflected",
+   "text": "Его подчиненные верили ему.",
+   "targets": [
+    {
+     "form": "подчин+ённые"
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "Импульсные ружья вскинули.",
+   "targets": [
+    {
+     "form": "+импульсные"
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "Системы жизнеобеспечения отказали.",
+   "targets": [
+    {
+     "form": "жизнеобесп+ечения"
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "Такая вероятность была мала.",
+   "targets": [
+    {
+     "form": "так+ая"
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "За два года она поняла всё.",
+   "targets": [
+    {
+     "form": "понял+а"
+    }
+   ]
+  },
+  {
+   "cat": "inflected",
+   "text": "Он подошел к окну.",
+   "targets": [
+    {
+     "form": "подош+ёл"
+    }
+   ]
+  },
+  {
+   "cat": "yo",
+   "text": "Зеленый лес шумел.",
+   "targets": [
+    {
+     "form": "зел+ёный"
+    }
+   ]
+  },
+  {
+   "cat": "yo",
+   "text": "Он нес тяжелый рюкзак.",
+   "targets": [
+    {
+     "form": "н+ёс"
+    },
+    {
+     "form": "тяж+ёлый"
+    }
+   ]
+  },
+  {
+   "cat": "prose",
+   "text": "Капитан внимательно посмотрел на экран и медленно кивнул.",
+   "targets": [
+    {
+     "form": "капит+ан"
+    },
+    {
+     "form": "вним+ательно"
+    },
+    {
+     "form": "посмотр+ел"
+    },
+    {
+     "form": "м+едленно"
+    },
+    {
+     "form": "кивн+ул"
+    }
+   ]
+  },
+  {
+   "cat": "prose",
+   "text": "За окном шел дождь, и город казался пустым.",
+   "targets": [
+    {
+     "form": "окн+ом"
+    },
+    {
+     "form": "г+ород"
+    },
+    {
+     "form": "каз+ался"
+    },
+    {
+     "form": "пуст+ым"
+    }
+   ]
+  },
+  {
+   "cat": "prose",
+   "text": "Корабль медленно развернулся и лег на новый курс.",
+   "targets": [
+    {
+     "form": "кор+абль"
+    },
+    {
+     "form": "разверн+улся"
+    },
+    {
+     "form": "н+овый"
+    }
+   ]
+  },
+  {
+   "cat": "prose",
+   "text": "Она не знала, что ответить, и молча смотрела в сторону.",
+   "targets": [
+    {
+     "form": "отв+етить"
+    },
+    {
+     "form": "молч+а"
+    },
+    {
+     "form": "смотр+ела"
+    },
+    {
+     "form": "ст+орону"
+    }
+   ]
+  },
+  {
+   "cat": "prose",
+   "text": "Начальник станции вызвал офицеров и объявил тревогу.",
+   "targets": [
+    {
+     "form": "нач+альник"
+    },
+    {
+     "form": "ст+анции"
+    },
+    {
+     "form": "в+ызвал"
+    },
+    {
+     "form": "офиц+еров"
+    },
+    {
+     "form": "объяв+ил"
+    },
+    {
+     "form": "трев+огу"
+    }
+   ]
+  },
+  {
+   "cat": "prose",
+   "text": "Договор был подписан ещё вчера, но никто не позвонил.",
+   "targets": [
+    {
+     "form": "догов+ор"
+    },
+    {
+     "form": "подп+исан"
+    },
+    {
+     "form": "вчер+а"
+    },
+    {
+     "form": "позвон+ил"
+    }
+   ]
+  },
+  {
+   "cat": "prose",
+   "text": "Красивая девушка включила звонок и закрыла дверь.",
+   "targets": [
+    {
+     "form": "крас+ивая"
+    },
+    {
+     "form": "включ+ила"
+    },
+    {
+     "form": "звон+ок"
+    },
+    {
+     "form": "закр+ыла"
+    }
+   ]
+  },
+  {
+   "cat": "rare",
+   "text": "Это было просто феномен, а не случайность.",
+   "targets": [
+    {
+     "form": "феном+ен"
+    }
+   ]
+  },
+  {
+   "cat": "rare",
+   "text": "Мы обсудили каталог и квартал.",
+   "targets": [
+    {
+     "form": "катал+ог"
+    },
+    {
+     "form": "кварт+ал"
+    }
+   ]
+  },
+  {
+   "cat": "rare",
+   "text": "Он принял алкоголь и свёклу.",
+   "targets": [
+    {
+     "form": "алког+оль"
+    },
+    {
+     "form": "св+ёклу"
+    }
+   ]
+  },
+  {
+   "cat": "rare",
+   "text": "Эксперт изучил документы и прочёл их.",
+   "targets": [
+    {
+     "form": "эксп+ерт"
+    },
+    {
+     "form": "изуч+ил"
+    },
+    {
+     "form": "докум+енты"
+    }
+   ],
+   "note": "прочёл: ё stressed implicitly"
+  },
+  {
+   "cat": "dialogue",
+   "text": "— Ты слышишь меня? — спросил он.",
+   "targets": [
+    {
+     "form": "сл+ышишь"
+    },
+    {
+     "form": "спрос+ил"
+    }
+   ]
+  },
+  {
+   "cat": "dialogue",
+   "text": "— Отдай мне ключ, — тихо сказала она.",
+   "targets": [
+    {
+     "form": "отд+ай"
+    }
+   ],
+   "optional": true
+  },
+  {
+   "cat": "names",
+   "text": "Командор Нимиц отдал приказ.",
+   "targets": [
+    {
+     "form": "н+имиц",
+     "any": [
+      "ним+иц"
+     ]
+    }
+   ],
+   "optional": true,
+   "note": "proper name: the model may not know it; dictionary covers it (see dict cases)"
+  }
+ ],
+ "dict_cases": [
+  {
+   "text": "Адмирал Нимиц вошёл в рубку.",
+   "forced": {
+    "нимиц": "н+имиц"
+   },
+   "targets": [
+    {
+     "form": "н+имиц",
+     "dictonly": true
+    }
+   ]
+  },
+  {
+   "text": "Лена Харрингтон сказала правду.",
+   "forced": {
+    "лена харрингтон": "л+ена харр+ингтон"
+   },
+   "targets": [
+    {
+     "form": "л+ена",
+     "dictonly": true
+    },
+    {
+     "form": "харр+ингтон",
+     "dictonly": true
+    }
+   ]
+  },
+  {
+   "text": "Он взял замок и открыл замок.",
+   "forced": {
+    "замок": "зам+ок"
+   },
+   "targets": [
+    {
+     "form": "зам+ок",
+     "dictonly": true
+    }
+   ],
+   "note": "global dictionary entry beats the model on all occurrences (documented homograph risk)"
+  }
+ ]
+}

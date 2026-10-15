@@ -18,13 +18,10 @@ from pathlib import Path
 
 
 def _app_dir() -> Path:
-    """Папка, где лежит программа. В обычном запуске (python fb2_reader_gui.py)
-    это папка со скриптом. В собранной PyInstaller-версии (.exe) __file__
-    указывает на временную папку распаковки, которая меняется при каждом
-    запуске — поэтому там нужно брать папку, где лежит сам .exe."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    """Папка, где лежит программа (рядом с .exe в собранной версии, рядом со скриптами в обычной);
+    единая логика путей — в app_paths.py."""
+    import app_paths
+    return app_paths.app_dir()
 
 
 def _make_logs_dir() -> Path:

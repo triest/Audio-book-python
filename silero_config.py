@@ -264,7 +264,9 @@ def load_silero_package(model_id: str = DEFAULT_SILERO_MODEL, device=None):
         device = torch.device("cpu")
 
     cfg = SILERO_MODELS[model_id]
-    local_file = cfg["local_file"]
+    import app_paths
+    # next to the program (the .exe folder when frozen), not relative to whatever the cwd is
+    local_file = str(app_paths.resolve_asset(cfg["local_file"]))
     if not os.path.isfile(local_file):
         print(f"Скачиваю модель {model_id} ({local_file})…")
         torch.hub.download_url_to_file(cfg["package_url"], local_file)

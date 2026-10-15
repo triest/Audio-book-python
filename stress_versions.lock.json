@@ -1,0 +1,31 @@
+{
+ "python": "3.14.0",
+ "packages": {
+  "silero-stress": "1.5",
+  "silero": "0.5.5",
+  "torch": "2.14.1+cu126",
+  "slovnet": "0.6.0",
+  "navec": "0.10.0",
+  "razdel": "0.5.0",
+  "pymorphy3": "2.0.6",
+  "numpy": "2.5.3"
+ },
+ "files": {
+  "silero_stress/data/accentor.pt": {
+   "sha256": "aecb207df9db34a079de2ba91edba2a9333839ad24de0cf17e7bc82424876786",
+   "bytes": 56049647
+  },
+  "grammar_gate_models/navec_news_v1_1B_250K_300d_100q.tar": {
+   "sha256": "f07270833d78523edc5781538d67038e95b43975e4a7ae757c693b687f9cbfca",
+   "bytes": 26634240
+  },
+  "grammar_gate_models/slovnet_morph_news_v1.tar": {
+   "sha256": "54812762a641c742dbfa9c950c4b53bbb469301983077ed01b9f074643d540d3",
+   "bytes": 2580480
+  },
+  "stress_corpus_ru.tsv.gz": {
+   "sha256": "3cff0e1a36e874d2376c7a1a54f1454efa762cbd210ab72a0df33350908ff948",
+   "bytes": 10511909
+  }
+ }
+}

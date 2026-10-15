@@ -6,6 +6,9 @@ rem (This file's own messages are in English on purpose - see
 rem install.bat for why. The program itself works in Russian as usual.)
 cd /d "%~dp0"
 
+rem Grammar gate (case/number stress homographs) is ON by default; to switch it off for a test:
+rem set AUDIOBOOK_GRAMMAR_GATE=0
+
 if not exist ".venv\Scripts\python.exe" (
     call install.bat
     if not exist ".venv\Scripts\python.exe" (

@@ -144,33 +144,33 @@ class ServiceManagementMixin:
         self._qwen_local_proc = None
         self._qwen_local_started_by_us = False
 
+    @staticmethod
+    def _service_python() -> str:
+        """Interpreter for the service: the project's own .venv (where install.bat put fastapi,
+        silero...) when it exists, otherwise the interpreter running the GUI."""
+        venv_py = _app_dir() / ".venv" / "Scripts" / "python.exe"
+        return str(venv_py) if venv_py.exists() else sys.executable
+
     def _ensure_rest_service_running(self, rest_url: str, ready_timeout: float = 600.0) -> bool:
+        """Thread-safe wrapper: the startup recycle (see _startup_recycle_services) and a
+        "Start" click must never spawn two Silero REST processes at once."""
+        with self._rest_svc_lock:
+            return self._ensure_rest_service_running_impl(rest_url, ready_timeout)
+
+    def _ensure_rest_service_running_impl(self, rest_url: str, ready_timeout: float = 600.0) -> bool:
         """Запускает silero_rest_service.py в фоне (без консоли пользователя)
         и ждёт, пока он не начнёт отвечать на rest_url. При первом запуске
         сервис может несколько минут скачивать модель — поэтому таймаут
         большой, а в журнал периодически пишется, что процесс ещё идёт."""
-        if getattr(sys, "frozen", False):
-            # Собранная в один .exe версия (PyInstaller) не содержит
-            # отдельного python.exe — sys.executable указывает на сам этот
-            # exe, поэтому "запустить silero_rest_service.py тем же
-            # интерпретатором" тут не сработает. В таком случае проще
-            # использовать локальный режим Silero (он не требует сервиса)
-            # либо запускать программу из исходников через run_gui.bat.
-            self.after(0, lambda: self.log(
-                "Автозапуск сервиса Silero REST недоступен в собранной .exe-версии "
-                "программы. Используйте режим «Silero (локально)» — он не требует "
-                "отдельного сервиса, — либо запустите программу из исходников "
-                "(run_gui.bat) и включите автозапуск там."
-            ))
-            return False
         if self._rest_proc is None or self._rest_proc.poll() is not None:
             service_path = _app_dir() / "silero_rest_service.py"
-            if not service_path.exists():
+            frozen = bool(getattr(sys, "frozen", False))
+            if not frozen and not service_path.exists():
                 self.after(0, lambda: self.log(f"Не найден файл сервиса: {service_path}"))
                 return False
             try:
                 popen_kwargs = dict(
-                    cwd=str(service_path.parent),
+                    cwd=str(_app_dir()),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -180,7 +180,8 @@ class ServiceManagementMixin:
                     # без отдельного окна консоли для сервиса
                     popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                 self._rest_proc = subprocess.Popen(
-                    [sys.executable, str(service_path)], **popen_kwargs
+                    ([sys.executable, "serve-silero"] if frozen
+                     else [self._service_python(), str(service_path)]), **popen_kwargs
                 )
             except Exception as e:
                 err = str(e)
@@ -678,3 +679,175 @@ class ServiceManagementMixin:
 
         self.after(0, lambda: self.log("Сервис CosyVoice не успел запуститься за отведённое время."))
         return False
+
+    # ------------------------------------------------------------------
+    # Startup recycle of the Silero REST service
+    # ------------------------------------------------------------------
+    # On launch: find the old silero_rest_service.py process(es) (by command line AND by the
+    # Python process that listens on the service port), kill them with their child trees,
+    # wait for the port to be released, then start a fresh service with the same
+    # interpreter / working folder the normal auto-start uses. Every step is logged to the
+    # GUI log (which is also written to the log file). Nothing here may raise into the GUI.
+
+    @staticmethod
+    def _run_hidden(cmd: list, timeout: float = 20.0):
+        """Runs a console tool without a window. Returns (returncode, stdout) or (None, "")."""
+        try:
+            kw = dict(capture_output=True, text=True, errors="replace", timeout=timeout)
+            if sys.platform == "win32":
+                kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+            r = subprocess.run(cmd, **kw)
+            return r.returncode, (r.stdout or "")
+        except Exception:
+            return None, ""
+
+    @staticmethod
+    def _parse_process_json(text: str) -> list:
+        """PowerShell ConvertTo-Json gives one object, a list, or nothing -> [{pid, cmd}]."""
+        text = (text or "").strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return []
+        if isinstance(data, dict):
+            data = [data]
+        out = []
+        for item in data if isinstance(data, list) else []:
+            try:
+                out.append({"pid": int(item.get("ProcessId")), "cmd": str(item.get("CommandLine") or ""),
+                            "name": str(item.get("Name") or "").lower()})
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return out
+
+    @classmethod
+    def _list_python_processes(cls) -> list:
+        rc, out = cls._run_hidden([
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe' "
+            "OR Name='cmd.exe'\" | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
+        ])
+        return cls._parse_process_json(out) if rc == 0 else []
+
+    @classmethod
+    def _pid_alive(cls, pid: int) -> bool:
+        rc, out = cls._run_hidden(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], timeout=10.0)
+        return rc is not None and f'"{pid}"' in out
+
+    @classmethod
+    def _safe_port_holders(cls, port: int) -> set:
+        try:
+            return {int(x) for x in cls._pids_listening_on_port(port)}
+        except Exception:
+            return set()
+
+    @classmethod
+    def _find_service_pids(cls, script_name: str, port: int) -> dict:
+        """{pid: reason} of processes to stop: any python process whose command line contains
+        script_name, plus any PYTHON process listening on `port`. A non-python process that
+        holds the port is deliberately left alone (reported by the caller)."""
+        own = os.getpid()
+        procs = cls._list_python_processes()
+        by_pid = {p["pid"]: p["cmd"] for p in procs if p.get("name", "python.exe").startswith("python")}
+        found = {}
+        # the run_service_forever.bat wrapper restarts the service 3 s after it dies - it must go first
+        for p in procs:
+            if p.get("name") == "cmd.exe" and "run_service_forever" in p["cmd"].lower():
+                found[p["pid"]] = "run_service_forever.bat wrapper (would respawn the service)"
+        for p in procs:
+            if p.get("name", "python.exe").startswith("python") \
+                    and p["pid"] != own and script_name.lower() in p["cmd"].lower():
+                found[p["pid"]] = f"runs {script_name}"
+        holders = cls._safe_port_holders(port)
+        for pid in holders:
+            if pid == own or pid in found:
+                continue
+            if pid in by_pid:
+                found[pid] = f"python process listening on port {port}"
+            else:
+                found[-pid] = f"NOT a python process (pid {pid}) holds port {port} - left alone"
+        return found
+
+    @classmethod
+    def _kill_pid_tree(cls, pid: int) -> str:
+        """Returns "killed", "already gone" or "denied" (still alive after taskkill)."""
+        if not cls._pid_alive(pid):
+            return "already gone"
+        cls._run_hidden(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=20.0)
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            if not cls._pid_alive(pid):
+                return "killed"
+            time.sleep(0.4)
+        return "denied"
+
+    def _startup_recycle_services(self):
+        """Entry point, called once from the GUI initialisation. Runs in a worker thread."""
+        try:
+            if not self.recycle_services_var.get():
+                return
+        except Exception:
+            return
+        if sys.platform != "win32":
+            self.log("Service recycle: skipped (Windows-only: uses taskkill/tasklist).")
+            return
+        rest_url = self.rest_url_var.get().strip()
+        auto_start = bool(self.auto_start_rest_var.get())
+        threading.Thread(target=self._recycle_rest_service, args=(rest_url, auto_start),
+                         daemon=True).start()
+
+    def _recycle_rest_service(self, rest_url: str, auto_start: bool):
+        def log(msg: str):
+            self.after(0, lambda m=msg: self.log("[service recycle] " + m))
+
+        try:
+            if getattr(sys, "frozen", False):
+                log("skipped: the frozen .exe build cannot restart silero_rest_service.py.")
+                return
+            if not self._rest_url_is_local(rest_url):
+                log(f"skipped: {rest_url} is not a local address.")
+                return
+            from urllib.parse import urlparse
+            port = urlparse(rest_url).port or 5010
+            with self._rest_svc_lock:
+                log(f"looking for old Silero REST service processes (script or port {port})...")
+                found = self._find_service_pids("silero_rest_service.py", port)
+                to_kill = {p: why for p, why in found.items() if p > 0}
+                for p, why in found.items():
+                    if p < 0:
+                        log("WARNING: " + why)
+                if not to_kill:
+                    log("no old service process found.")
+                denied = []
+                for pid, why in to_kill.items():
+                    res = self._kill_pid_tree(pid)
+                    log(f"PID {pid} ({why}): {res}.")
+                    if res == "denied":
+                        denied.append(pid)
+                if denied:
+                    log(f"WARNING: could not stop PID(s) {denied} (access denied?). Close them manually or "
+                        f"start this program as administrator. A fresh service was NOT started.")
+                    return
+                if to_kill:
+                    deadline = time.time() + 10.0
+                    while time.time() < deadline and self._safe_port_holders(port):
+                        time.sleep(0.5)
+                if self._safe_port_holders(port):
+                    log(f"WARNING: port {port} is still busy - a fresh service was NOT started.")
+                    return
+                if not auto_start:
+                    log("old processes cleaned up; auto-start of the service is switched off, so no "
+                        "new one is started (it starts on demand when you press the start button).")
+                    return
+                log("starting a fresh service...")
+                ok = self._ensure_rest_service_running_impl(rest_url)
+                if ok:
+                    pid = self._rest_proc.pid if self._rest_proc is not None else "?"
+                    log(f"fresh Silero REST service is ACTIVE (PID {pid}, {rest_url}).")
+                else:
+                    log("the fresh service did NOT come up - see the [сервис Silero REST] lines above.")
+        except Exception as e:
+            _log_exception_to_file("startup recycle of the Silero REST service")
+            log(f"failed with {type(e).__name__}: {e} (the program keeps working; the service starts on demand).")

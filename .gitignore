@@ -77,3 +77,23 @@ stress_corpus_ru.tsv.gz
 # Ротированные логи (fb2_reader_gui.log.1, .2 и т.п.) - *.log их не ловит.
 *.log.*
 /logs/
+ruaccent_predictor_pkg/
+config.json
+review_list.json
+
+# Служебное: бэкапы правок (*.bak_*), черновики, архив — не для репозитория.
+_archive/
+*.bak
+*.bak_*
+# Собранный PyInstaller-ом exe (~3 ГБ) — собирается install.bat, GitHub такое не принимает.
+*.exe
+# Модели грамматического шлюза — их качает `fb2_reader.py fetch-models` (install.bat).
+grammar_gate_models/
+# Результаты озвучки (папки audiobook_output*).
+/audiobook_output*/
+
+# Генерируется программой рядом с review_list.json.
+review_list_paste.txt
+
+# Книги (авторское право) — не для публичного репозитория.
+*.fb2

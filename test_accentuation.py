@@ -107,6 +107,8 @@ for sentence, expected in CASES:
           out.replace("+", "").replace("ё", "е").replace("Ё", "Е")
           == sentence.replace("ё", "е").replace("Ё", "Е"), f"(got {out!r})")
 
+check("no false ё in 'королевой/королеву/королева'",
+      all("ё" not in run_chain(x).lower() for x in ("Несмотря на сомнения учреждения королевой нового титула.", "Он видел королеву.", "Королева молчала.")))
 print("=== global_prose_sanitizer (pure rules) ===")
 ALL = ("Могущий человек. Его губы. Глубоко дышал. Подошло самому графу. Она поняла. Такая жизнь. Также так. "
        "Ей 10 лёт.")
@@ -572,6 +574,14 @@ check("questions: answer spreads to case forms sharing the stem",
       _sq.propagate("тейс+ман", ["тейсман", "тейсмана"], None) == {"тейсман": "тейс+ман", "тейсмана": "тейс+мана"})
 check("questions: answer does not spread when the stress is outside the shared stem",
       _sq.propagate("лафолл+е", ["лафолле", "лафоль"], None) == {"лафолле": "лафолл+е"})
+
+# --- runtime text guard: a stress layer may add "+" and swap е/ё, never change letters ---
+import fb2_reader as _fr
+_st0 = _fr._fallback_stats.get("text_guard", 0)
+check("text guard: marks and е/ё pass", _fr._text_guard("Мы все побежали", "Мы вс+ё побежали", "t") == "Мы вс+ё побежали")
+check("text guard: lost word -> layer input kept", _fr._text_guard("замок щёлкнул", "зам+ок", "t") == "замок щёлкнул")
+check("text guard: changed letters -> layer input kept", _fr._text_guard("замок", "зам+ука", "t") == "замок")
+check("text guard: counter counts only violations", _fr._fallback_stats.get("text_guard", 0) - _st0 == 2)
 
 print(f"\n{PASSES} passed, {len(FAILS)} failed, {len(KNOWN_LIMITATIONS)} known limitation(s)")
 sys.exit(1 if FAILS else 0)

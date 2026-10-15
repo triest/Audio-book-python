@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ from fb2_reader import (
     QWEN_TTS_LOCAL_VOICES,
     QWEN_TTS_LOCAL_DEFAULT_VOICE,
     book_manual_stress_overrides_path,
+    stress_dry_run,
     _load_character_voice_map,
     _save_character_voice_map,
     cosyvoice_list_voices,
@@ -112,7 +114,10 @@ class TextRedirector(io.TextIOBase):
         pass
 
 
-SETTINGS_PATH = _app_dir() / "fb2_reader_settings.json"
+SETTINGS_PATH = _app_dir() / "config.json"
+# older versions kept the same data in fb2_reader_settings.json: it is read once (when
+# config.json does not exist yet) and the next save writes config.json.
+LEGACY_SETTINGS_PATH = _app_dir() / "fb2_reader_settings.json"
 
 # Какие поля запоминаются между запусками программы (имя атрибута-переменной
 # -> ничего больше не нужно, tk.Variable сама знает свой тип через .get()).
@@ -122,7 +127,6 @@ SETTINGS_FIELDS = [
     "cosyvoice_rest_url_var", "cosyvoice_engine_var",
     "sentence_break_var", "paragraph_break_var", "comma_break_var",
     "accent_var", "yo_var", "emphasis_var", "stress_engine_var", "smart_emotion_var",
-    "stress_ollama_model_var",
     "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
     "yandex_emotion_var", "yandex_smart_emotion_var",
     "qwen_api_key_var", "qwen_voice_var",
@@ -130,6 +134,9 @@ SETTINGS_FIELDS = [
     "dialogue_var", "attribution_var", "attribution_provider_var",
     "attribution_api_key_var", "attribution_model_var", "attribution_folder_id_var",
     "ollama_host_var",
+    # accentuation pipeline (Oct 2026) + service recycle
+    "stress_review_var",
+    "strip_mono_var", "recycle_services_var",
 ]
 
 
@@ -137,14 +144,17 @@ from gui_service_management import ServiceManagementMixin
 from gui_voice_profiles import CosyVoiceVoicesMixin
 from gui_player import PlayerMixin
 from gui_ui_builder import UIBuilderMixin
+from gui_stress_editor import StressEditorMixin
+from gui_stress_questions import StressQuestionsMixin
 
 
-class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UIBuilderMixin, tk.Tk):
+class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UIBuilderMixin,
+                   StressEditorMixin, StressQuestionsMixin, tk.Tk):
     def __init__(self, initial_book: Path | None = None):
         super().__init__()
         self.title("FB2 Audiobook — озвучивание книг")
         self.minsize(920, 640)
-        self.geometry("1020x720")
+        self.geometry("1120x780")
 
         self.book_path: Path | None = None
         self.book_title = ""
@@ -182,24 +192,39 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                                          # если пользователь успел выбрать другую главу
         self._player_updating_scale = False  # True, пока сама программа двигает ползунок
 
+        self._rest_svc_lock = threading.RLock()   # see _ensure_rest_service_running / recycle
+
         self._build_ui()
         self._bind_events()
         self._load_settings()
+        self._lock_llm_features()
 
         if initial_book and initial_book.exists():
             self.load_book(initial_book)
+        else:
+            self._restore_last_book()
+
+        # recycle the Silero REST service on every launch (kill the old process, start a fresh one)
+        self.after(800, self._startup_recycle_services)
+        # periodic autosave so a crash / kill does not lose the interface state
+        self.after(60_000, self._autosave_tick)
 
     def _load_settings(self):
         """Восстанавливает сохранённые настройки (в т.ч. API-ключ Yandex,
         Folder ID и остальные поля) из предыдущего запуска, если файл
         настроек существует. Ошибки чтения тихо игнорируются — при первом
         запуске файла ещё нет, это нормально."""
-        if not SETTINGS_PATH.exists():
+        src = SETTINGS_PATH if SETTINGS_PATH.exists() else (
+            LEGACY_SETTINGS_PATH if LEGACY_SETTINGS_PATH.exists() else None)
+        if src is None:
             return
         try:
-            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            data = json.loads(src.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
+        self._saved_voice = data.get("voice_var")
+        self._saved_book = data.get("_last_book")
+        self._restore_geometry(data.get("_geometry"))
         for name in SETTINGS_FIELDS:
             if name not in data:
                 continue
@@ -215,12 +240,84 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             self._last_dirs = {str(k): str(v) for k, v in last_dirs.items()}
         # mode_var/model_var могли поменяться — обновить зависящие от них
         # виджеты (список голосов, доступность полей и т.п.)
+        # legacy configs: LM Studio/Ollama/Qwen attribution provider or stress engine -> Yandex / silero
+        if self.attribution_provider_var.get() not in self._attribution_provider_by_title:
+            self.attribution_provider_var.set(self._attribution_title_by_provider[DEFAULT_ATTRIBUTION_PROVIDER])
+            self.attribution_model_var.set(ATTRIBUTION_PROVIDERS[DEFAULT_ATTRIBUTION_PROVIDER]["default_model"])
+            self.ollama_host_var.set("")
+        if self.stress_engine_var.get() not in ("silero", "none"):
+            self.stress_engine_var.set("silero")
         self._on_model_changed()
         self._on_mode_changed()
         self._on_dialogue_toggle()
         self._on_attribution_toggle()
         self._on_attribution_provider_change(reset_model=False)
         self._on_stress_engine_change()
+        self._lock_llm_features()
+        # the voice list is rebuilt by the handlers above, so the saved voice is applied last
+        try:
+            if self._saved_voice and self._saved_voice in tuple(self.voice_combo["values"]):
+                self.voice_var.set(self._saved_voice)
+        except Exception:
+            pass
+        if src is LEGACY_SETTINGS_PATH:
+            self._save_settings()          # migrate: create config.json right away
+
+    def _restore_geometry(self, geo):
+        """Restores the window size/position if it is still on a visible part of the screen."""
+        try:
+            import re as _re
+            m = _re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", str(geo or ""))
+            if not m:
+                return
+            w, h, x, y = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            if w < 600 or h < 400:
+                return
+            if not (-w + 100 < x < self.winfo_screenwidth() - 100 and 0 <= y < self.winfo_screenheight() - 100):
+                self.geometry(f"{w}x{h}")          # size only
+                return
+            self.geometry(geo)
+        except Exception:
+            pass
+
+    def _restore_last_book(self):
+        p = getattr(self, "_saved_book", None)
+        try:
+            if p and Path(p).is_file():
+                self.load_book(Path(p))
+        except Exception:
+            _log_exception_to_file("restoring the last opened book")
+
+    def _autosave_tick(self):
+        try:
+            self._save_settings()
+        finally:
+            self.after(60_000, self._autosave_tick)
+
+    def _set_optimal_settings(self):
+        """"Set Optimal Settings": the best FREE, fully local configuration (no LLM, no cloud API). Nothing local-LLM
+        is touched (no port 1234 probing, no `lms load`)."""
+        # --- stress: 100% local, no LLM ---
+        self.stress_engine_var.set("silero")
+        self.stress_review_var.set(True)      # review list -> review_list.json
+        self.strip_mono_var.set(True)         # no "+" on one-vowel words
+        self.accent_var.set(True)
+        self.yo_var.set(True)
+        # --- no LLM / cloud features: attribution and smart emotions stay OFF ---
+        self._lock_llm_features()
+        self.dialogue_var.set(False)          # single narrator: no voice rotation between quotes
+        try:
+            self.dialogue_check.configure(state="disabled")
+        except Exception:
+            pass
+        self._on_dialogue_toggle()
+        self._on_attribution_toggle()
+        self._on_attribution_provider_change(reset_model=False)
+        self._on_stress_engine_change()
+        self.log("Optimal settings applied (100% local/free, single process): forced dictionary -> "
+                 "silero-stress -> slovnet grammar gate; review list ON (review_list.json), monosyllable "
+                 "stress OFF (stripped); speaker attribution and smart emotions disabled.")
+        self._save_settings()
 
     def _save_settings(self):
         """Сохраняет текущие настройки в JSON-файл рядом со скриптом —
@@ -237,9 +334,15 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                 pass
         data["_last_dirs"] = self._last_dirs
         try:
-            SETTINGS_PATH.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            data["voice_var"] = self.voice_var.get()
+            data["_last_book"] = str(self.book_path) if self.book_path else (getattr(self, "_saved_book", None) or "")
+            data["_geometry"] = self.geometry()
+        except Exception:
+            pass
+        try:
+            tmp = SETTINGS_PATH.with_name(SETTINGS_PATH.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, SETTINGS_PATH)
         except OSError as e:
             self.log(f"Не удалось сохранить настройки: {e}")
 
@@ -268,9 +371,10 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         в обычной программе для просмотра текста, откуда его можно
         свободно выделять и копировать — в отличие от окна журнала внутри
         программы."""
-        if _log_file_handle:
+        handle = gui_shared._log_file_handle      # re-bound by gui_shared at runtime: read it through the module
+        if handle:
             try:
-                _log_file_handle.flush()
+                handle.flush()
             except Exception:
                 pass
         if not LOG_FILE_PATH.exists():
@@ -376,7 +480,13 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             n = len(text)
             for w in widgets:
                 w.configure(state="normal", to=n)
-            if self.char_to_var.get() in (0,) or self.char_to_var.get() > n:
+            # a different chapter was selected -> the fragment range always restarts as "whole chapter"
+            # (a stale "до символа" from a shorter chapter used to cut the next chapter short)
+            if getattr(self, "_range_chapter_idx", None) != idx:
+                self._range_chapter_idx = idx
+                self.char_from_var.set(0)
+                self.char_to_var.set(n)
+            elif self.char_to_var.get() in (0,) or self.char_to_var.get() > n:
                 self.char_to_var.set(n)
             self.char_from_spin.configure(to=n)
             self.char_range_hint.configure(
@@ -384,6 +494,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                      f"Оставьте 0 и {n}, чтобы озвучить целиком."
             )
         else:
+            self._range_chapter_idx = None
+            self.char_from_var.set(0)
+            self.char_to_var.set(0)
             for w in widgets:
                 w.configure(state="disabled")
             self.char_range_hint.configure(
@@ -789,6 +902,44 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             state="normal" if self.dialogue_var.get() else "disabled"
         )
 
+    def _open_stress_dictionary(self):
+        """Opens forced_stress_words.json (absolute-priority manual stress dictionary) in the
+        system's default editor. Entries look like "слово": "сл+ово" ('+' BEFORE the stressed
+        vowel); the file is re-read at the start of every synthesis run."""
+        try:
+            from fb2_reader import ensure_forced_stress_file
+            path = ensure_forced_stress_file()
+            if sys.platform == "win32":
+                # Notepad explicitly: the default .json handler may be an IDE (e.g. Cursor) that asks to sign in
+                try:
+                    subprocess.Popen(["notepad.exe", str(path)])
+                except OSError:
+                    os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self.log("Словарь открыт. После редактирования сохраните файл и перезапустите главу. "
+                     "Каждая форма слова пишется с новой строки.")
+        except Exception as e:
+            messagebox.showerror("Словарь ударений", f"Не удалось открыть файл: {e}")
+
+    def _lock_llm_features(self):
+        """Fully local/free mode: speaker attribution and smart emotions (LLM / cloud API) are
+        switched off and their controls greyed out."""
+        for name in ("attribution_var", "smart_emotion_var", "yandex_smart_emotion_var"):
+            var = getattr(self, name, None)
+            if var is not None:
+                var.set(False)
+        for name in ("attribution_check", "smart_emotion_check", "yandex_smart_emotion_check"):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.configure(state="disabled")
+                except Exception:
+                    pass
+        self._on_attribution_toggle()
+
     def _on_attribution_toggle(self):
         state = "normal" if self.attribution_var.get() else "disabled"
         self.attribution_api_key_entry.configure(state=state)
@@ -799,10 +950,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.attribution_provider_combo.configure(state="readonly" if self.attribution_var.get() else "disabled")
 
     def _on_stress_engine_change(self):
-        if self.stress_engine_var.get() in ("ollama", "lmstudio"):
-            self.stress_ollama_row.grid()
-        else:
-            self.stress_ollama_row.grid_remove()
+        # the stress flow is LLM-free: legacy values (ruaccent/ollama/lmstudio/hybrid/silero_stress) -> silero
+        if self.stress_engine_var.get() not in ("silero", "none"):
+            self.stress_engine_var.set("silero")
 
     def _current_attribution_provider_key(self):
         return self._attribution_provider_by_title.get(
@@ -817,8 +967,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.attribution_key_hint_label.configure(text=info["key_hint"])
         key_labels = {
             "yandexgpt": "Yandex API-ключ:", "gemini": "Google API-ключ:",
-            "anthropic": "Anthropic API-ключ:", "ollama": "API-ключ (не используется):",
-            "lmstudio": "API-ключ (не используется):",
+            "anthropic": "Anthropic API-ключ:",
         }
         self.attribution_key_label.configure(text=key_labels.get(provider, "API-ключ:"))
         needs_folder = provider == "yandexgpt"
@@ -833,6 +982,21 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         else:
             self.attribution_ollama_host_label.master.pack_forget()
 
+    def _attribution_effective_key(self, provider=None) -> str:
+        """Attribution key; for Yandex it falls back to the Yandex SpeechKit key field and then
+        to the YANDEX_API_KEY environment variable."""
+        provider = provider or self._current_attribution_provider_key()
+        key = self.attribution_api_key_var.get().strip()
+        if not key and provider == "yandexgpt":
+            key = (self.yandex_api_key_var.get().strip()
+                   or os.environ.get("YANDEX_API_KEY", "").strip())
+        return key
+
+    def _attribution_effective_folder(self) -> str:
+        return (self.attribution_folder_id_var.get().strip()
+                or self.yandex_folder_id_var.get().strip()
+                or os.environ.get("YANDEX_FOLDER_ID", "").strip())
+
     def _selected_attribution(self, ignore_checkbox: bool = False):
         """{"api_key":..., "model":..., "provider":..., "folder_id":...,
         "ollama_host":...}, если включена галочка «Определять, какой
@@ -845,15 +1009,16 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         (--yandex-smart-emotion/--smart-emotion), которая пользуется тем же
         LLM-ключом, но не обязана требовать одновременно включённой
         атрибуции говорящих."""
+        return None   # local/free mode: no LLM attribution / emotions (see _lock_llm_features)
         if not ignore_checkbox and not self.attribution_var.get():
             return None
         provider = self._current_attribution_provider_key()
-        api_key = self.attribution_api_key_var.get().strip()
-        if not api_key and provider not in ("ollama", "lmstudio"):
+        api_key = self._attribution_effective_key(provider)
+        if not api_key:
             return None
         model = self.attribution_model_var.get().strip() \
             or ATTRIBUTION_PROVIDERS[provider]["default_model"]
-        folder_id = self.attribution_folder_id_var.get().strip()
+        folder_id = self._attribution_effective_folder()
         ollama_host = self.ollama_host_var.get().strip()
         return {"api_key": api_key, "model": model, "provider": provider,
                 "folder_id": folder_id, "ollama_host": ollama_host}
@@ -1023,462 +1188,94 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.log("Запрошена остановка после текущей главы…")
 
     def check_ambiguous_stress(self):
-        """Кнопка «Проверить ударения» — сканирует ТЕКСТ выбранной книги (не
-        аудио) на предмет слов, у которых ударение зависит от контекста
-        (омографы), и открывает готовый текстовый отчёт. Быстрая
-        альтернатива тому, чтобы ловить неправильные ударения на слух в
-        многочасовой готовой озвучке — см. check_ambiguous_stress.py."""
+        """Кнопка «Проверить ударения»: сухой прогон ТОЙ ЖЕ цепочки, что получает озвучка (числа -> слова,
+        словарь forced_stress_words.json -> silero-stress -> грамматический шлюз slovnet ->
+        global_prose_sanitizer), но без синтеза звука. Результат — текст с «+» в окне."""
         if self._worker and self._worker.is_alive():
             messagebox.showinfo("Проверка ударений", "Дождитесь окончания текущей озвучки.")
             return
-        if not self.book_path:
-            messagebox.showwarning("Проверка ударений", "Сначала выберите книгу.")
+        if not self.chapters:
+            messagebox.showwarning("Проверка ударений", "Сначала загрузите книгу.")
             return
-
-        try:
-            import check_ambiguous_stress
-        except Exception as e:
-            messagebox.showerror(
-                "Проверка ударений",
-                f"Не удалось загрузить check_ambiguous_stress.py:\n{e}"
-            )
-            return
-
-        book_path = self.book_path
-        out_path = Path(str(book_path.with_suffix("")) + ".ambiguous_stress_report.txt")
-
-        self.log(f"\n--- Проверка ударений по тексту: {book_path.name} ---")
+        sel = self.chapters_list.curselection()
+        idx = sel[0] if sel else 0
+        title, text = self.chapters[idx]
+        if len(sel) == 1:                       # a single chapter with a fragment range -> only that fragment
+            try:
+                a, b = int(self.char_from_var.get()), int(self.char_to_var.get())
+                a = max(0, min(a, len(text)))
+                b = max(a, min(b, len(text))) if b > 0 else len(text)
+                text = text[a:b]
+            except (ValueError, tk.TclError):
+                pass
+        strip_mono = self.strip_mono_var.get()
+        book_overrides = book_manual_stress_overrides_path(self.book_path) if self.book_path else None
+        self.log(f"\n--- Проверка ударений (сухой прогон, без звука): «{title}», {len(text)} символов ---")
         self.check_stress_btn.configure(state="disabled")
 
         def worker():
             try:
-                report_text, stats = check_ambiguous_stress.analyze_book(
-                    book_path, top=200, max_examples=3,
-                    progress_cb=lambda msg: self.after(0, self.log, msg),
-                )
-                out_path.write_text(report_text, encoding="utf-8")
+                marked, info = stress_dry_run(
+                    text, strip_monosyllables=strip_mono, book_overrides_path=book_overrides,
+                    progress_cb=lambda msg: self.after(0, self.log, msg))
             except Exception as e:
-                self.after(0, self.log, f"Проверка ударений не удалась: {e}")
-                self.after(0, messagebox.showerror, "Проверка ударений", str(e))
+                self.after(0, self.log, f"Проверка ударений не удалась: {type(e).__name__}: {e}")
+                self.after(0, messagebox.showerror, "Проверка ударений", f"{type(e).__name__}: {e}")
                 self.after(0, lambda: self.check_stress_btn.configure(state="normal"))
                 return
 
             def done():
                 self.check_stress_btn.configure(state="normal")
-                self.log(
-                    f"Отчёт готов: {out_path.name}\n"
-                    f"  Раздел 1 (программа решает сама): {stats['auto_unique']} слов, "
-                    f"{stats['auto_total']} вхождений\n"
-                    f"  Раздел 2 (без автоматики — можно проставить ударения ниже): "
-                    f"{stats['plain_unique']} слов, {stats['plain_total']} вхождений"
-                )
-                self._open_stress_review_dialog(stats, out_path)
+                self.log(f"Готово за {info['seconds']:.1f} с. "
+                         f"меток «+»: {info['marks']}; слов из словаря в базе: {info['dictionary_words']}; "
+                         f"замен е→ё: {info['yo_swapped']}; проставлено silero-stress: {info['silero_filled']}.")
+                self._show_stress_preview(title, marked, info)
 
             self.after(0, done)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _open_stress_review_dialog(self, stats: dict, report_out_path: Path,
-                                    limit: int = 300):
-        """Окно со списком спорных слов (раздел 2 отчёта — без автоматики),
-        отсортированных по частоте, с полем ввода напротив каждого. Идея
-        именно в этом (а не только в чтении отчёта): пользователь САМ
-        указывает нужное ударение для конкретных слов книги — программа
-        сохраняет их в manual_stress_overrides.json и будет применять при
-        каждой следующей озвучке этой (и любой другой) книги, где встретится
-        такое же слово. Пустые поля просто пропускаются."""
-        plain_words = stats.get("plain_words") or []
+    def _show_stress_preview(self, title: str, marked: str, info: dict):
+        """Окно с текстом главы после всех слоёв ударений («+» подсвечены); можно копировать/сохранять."""
         win = tk.Toplevel(self)
-        win.title(f"Проверка ударений — {stats.get('book_title', '')}")
-        win.geometry("880x640")
-        win.transient(self)
+        win.title(f"Ударения: {title}")
+        win.geometry("980x640")
+        head = (f"silero-stress: {'да' if info['silero_stress'] else 'нет'}  |  "
+                f"меток «+»: {info['marks']}  |  е→ё: {info['yo_swapped']}  |  {info['seconds']:.1f} с")
+        ttk.Label(win, text=head).pack(anchor="w", padx=8, pady=(8, 2))
+        ttk.Label(win, text="Ошибку правьте в forced_stress_words.json (кнопка «Открыть словарь ударений»): "
+                            "«слово»: «сл+ово», затем снова «Проверить ударения».",
+                  foreground="#555").pack(anchor="w", padx=8)
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8, pady=6)
+        txt = tk.Text(frame, wrap="word", font=("Consolas", 12))
+        sb = ttk.Scrollbar(frame, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", marked)
+        txt.tag_configure("mark", background="#ffe08a", foreground="#7a1f00")
+        for m in re.finditer(r"\+[А-Яа-яЁё]", marked):
+            txt.tag_add("mark", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        txt.configure(state="disabled")
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=8, pady=(0, 8))
 
-        info = ttk.Frame(win, padding=(10, 8))
-        info.pack(side="top", fill="x")
-        ttk.Label(
-            info,
-            text=(
-                "Щёлкните по ударной гласной букве в слове — вводить ничего не нужно. "
-                "Повторный щелчок по той же букве снимает выбор (слово будет пропущено). "
-                "Ударения сохраняются ОТДЕЛЬНО ДЛЯ ЭТОЙ КНИГИ (рядом с книгой, файл "
-                "«…manual_stress_overrides.json») — то же слово в другой книге можно "
-                "разметить иначе. Если у слова вообще не бывает другого варианта ударения "
-                "(список составлен по внешнему источнику и не идеален) — жмите «Это не "
-                "омограф»: это, наоборот, действует сразу для всех книг, потому что это "
-                "не выбор чтения, а факт о самом слове."
-            ),
-            wraplength=840, justify="left",
-        ).pack(anchor="w")
-        if len(plain_words) > limit:
-            ttk.Label(
-                info,
-                text=f"Показаны {limit} самых частых слов из {len(plain_words)} — "
-                     f"полный список со всеми примерами см. в текстовом отчёте "
-                     f"({report_out_path.name}).",
-                foreground="#a60", wraplength=840, justify="left",
-            ).pack(anchor="w", pady=(4, 0))
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(marked)
 
-        btn_row = ttk.Frame(win, padding=(10, 0, 10, 8))
-        btn_row.pack(side="bottom", fill="x")
-        status_label = ttk.Label(btn_row, text="")
-        status_label.pack(side="left")
-        ttk.Button(
-            btn_row, text="Открыть полный текстовый отчёт",
-            command=lambda: self._open_file_externally(report_out_path),
-        ).pack(side="right")
-        save_btn = ttk.Button(btn_row, text="Сохранить")
-        save_btn.pack(side="right", padx=(0, 8))
-        ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side="right", padx=(0, 8))
+        def save():
+            path = filedialog.asksaveasfilename(parent=win, defaultextension=".txt",
+                                                initialfile=f"{re.sub(r'[^\w-]+', '_', title).strip('_') or 'chapter'}_ударения.txt",
+                                                filetypes=[("Text", "*.txt")])
+            if path:
+                Path(path).write_text(marked, encoding="utf-8")
+                self.log(f"Текст с ударениями сохранён: {path}")
 
-        canvas_holder = ttk.Frame(win)
-        canvas_holder.pack(side="top", fill="both", expand=True, padx=10)
-        canvas = tk.Canvas(canvas_holder, highlightthickness=0)
-        scroll = ttk.Scrollbar(canvas_holder, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        rows_frame = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=rows_frame, anchor="nw")
-        rows_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
-        win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>")
-                 if e.widget is win else None)
-
-        _RU_VOWELS = set("аеёиоуыэюя")
-        letter_font = ("Segoe UI", 12)
-        letter_font_selected = ("Segoe UI", 12, "bold", "underline")
-
-        # selections[word] = индекс ударной буквы в word (или None — не выбрано)
-        selections: dict[str, "int | None"] = {}
-        # letter_labels[word] = [Label, ...] — по одной метке на КАЖДУЮ букву слова,
-        # чтобы при выборе можно было сбросить подсветку с предыдущей и включить на новой
-        letter_labels: dict[str, list] = {}
-
-        def select_letter(word, idx):
-            labels = letter_labels[word]
-            prev = selections.get(word)
-            if prev == idx:
-                # повторный щелчок по той же букве — снимаем выбор
-                labels[idx].configure(font=letter_font, foreground="black")
-                selections[word] = None
-                return
-            if prev is not None:
-                labels[prev].configure(font=letter_font, foreground="black")
-            labels[idx].configure(font=letter_font_selected, foreground="#c00")
-            selections[word] = idx
-
-        shown_words = plain_words[:limit]
-        for row_i, (word, count, examples) in enumerate(shown_words):
-            row = ttk.Frame(rows_frame, padding=(0, 3))
-            row.grid(row=row_i, column=0, sticky="ew")
-            rows_frame.grid_columnconfigure(0, weight=1)
-
-            head = ttk.Frame(row)
-            head.pack(side="top", fill="x")
-            ttk.Label(head, text=f"× {count}", width=6, foreground="#555").pack(side="left")
-
-            word_frame = ttk.Frame(head)
-            word_frame.pack(side="left", padx=(4, 0))
-            selections[word] = None
-            labels = []
-            letter_labels[word] = labels
-            for idx, ch in enumerate(word):
-                is_vowel = ch in _RU_VOWELS
-                lbl = tk.Label(
-                    word_frame, text=ch, font=letter_font,
-                    cursor="hand2" if is_vowel else "arrow",
-                    padx=0,
-                )
-                lbl.pack(side="left")
-                labels.append(lbl)
-                if is_vowel:
-                    lbl.bind("<Button-1>", lambda e, w=word, i=idx: select_letter(w, i))
-
-            def mark_not_ambiguous(w=word, rw=row, wf=word_frame):
-                try:
-                    import fb2_reader
-                    fb2_reader.mark_word_not_ambiguous(w)
-                except Exception as e:
-                    messagebox.showerror("Проверка ударений", f"Не удалось сохранить: {e}")
-                    return
-                selections.pop(w, None)
-                for lbl in letter_labels.get(w, []):
-                    lbl.configure(state="disabled", foreground="#aaa", cursor="arrow")
-                    lbl.unbind("<Button-1>")
-                not_ambig_btn.configure(text="✓ больше не спросим", state="disabled")
-                self.log(f'"{w}" отмечено как не омограф — больше не будет появляться '
-                         f"в этом списке (not_ambiguous_stress_words_ru.txt).")
-
-            not_ambig_btn = ttk.Button(
-                head, text="Это не омограф", command=mark_not_ambiguous,
-            )
-            not_ambig_btn.pack(side="right", padx=(6, 0))
-
-            if examples:
-                _, ctx = examples[0]
-                ttk.Label(
-                    row, text=ctx, foreground="#666", wraplength=800, justify="left"
-                ).pack(side="top", anchor="w", padx=(24, 0))
-            ttk.Separator(row, orient="horizontal").pack(side="bottom", fill="x", pady=(4, 0))
-
-        def do_save():
-            to_save = {}
-            for word, idx in selections.items():
-                if idx is None:
-                    continue
-                to_save[word] = word[:idx] + "+" + word[idx:]
-            if not to_save:
-                messagebox.showinfo("Проверка ударений", "Ни одна буква не выбрана.")
-                return
-            book_overrides_path = Path(stats["book_overrides_path"])
-            try:
-                import fb2_reader
-                fb2_reader.save_manual_stress_overrides(to_save, book_overrides_path)
-            except Exception as e:
-                messagebox.showerror("Проверка ударений", f"Не удалось сохранить: {e}")
-                return
-            self.log(f"Сохранено вручную заданных ударений для книги "
-                      f"«{stats.get('book_title', '')}»: {len(to_save)} "
-                      f"({book_overrides_path.name}) — "
-                      + ", ".join(f"{w}→{v}" for w, v in sorted(to_save.items())))
-            status_label.configure(text=f"Сохранено: {len(to_save)}")
-            messagebox.showinfo(
-                "Проверка ударений",
-                f"Сохранено {len(to_save)} слов(о) в {book_overrides_path.name} — "
-                "отдельный файл для ЭТОЙ книги, рядом с ней.\n"
-                "Они будут применены при следующей озвучке этой книги.",
-            )
-
-        save_btn.configure(command=do_save)
-
-    def open_stress_dictionary_editor(self):
-        """Кнопка «Словарь ударений» — полноценное управление всеми вручную
-        заданными ударениями: список (со всех источников — основной словарь,
-        общие ручные переопределения и, если книга открыта, ещё и её
-        собственные), поиск по слову, удаление, плюс форма добавления новой
-        записи (используется и для случая, когда слово не входит в отчёт
-        «Проверить ударения», но хочется задать ему ударение по привычке —
-        см. fb2_reader.add_preferred_stress)."""
-        import fb2_reader
-
-        win = tk.Toplevel(self)
-        win.title("Словарь ударений")
-        win.geometry("760x600")
-        win.transient(self)
-
-        # --- поиск + список ---
-        search_row = ttk.Frame(win, padding=(10, 8, 10, 4))
-        search_row.pack(side="top", fill="x")
-        ttk.Label(search_row, text="Поиск:").pack(side="left")
-        search_var = tk.StringVar()
-        search_entry = ttk.Entry(search_row, textvariable=search_var, width=30)
-        search_entry.pack(side="left", padx=(6, 0))
-        count_label = ttk.Label(search_row, text="", foreground="#555")
-        count_label.pack(side="left", padx=(10, 0))
-
-        list_frame = ttk.Frame(win, padding=(10, 0))
-        list_frame.pack(side="top", fill="both", expand=True)
-        columns = ("word", "stress", "source")
-        tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
-        tree.heading("word", text="Слово")
-        tree.heading("stress", text="Ударение")
-        tree.heading("source", text="Источник")
-        tree.column("word", width=180, anchor="w")
-        tree.column("stress", width=180, anchor="w")
-        tree.column("source", width=280, anchor="w")
-        tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=tree_scroll.set)
-        tree.pack(side="left", fill="both", expand=True)
-        tree_scroll.pack(side="right", fill="y")
-
-        book_path = self.book_path
-
-        def _source_label(source_path: Path) -> str:
-            if book_path is not None and Path(source_path) == fb2_reader.book_manual_stress_overrides_path(book_path):
-                return f"эта книга ({Path(source_path).name})"
-            if Path(source_path) == fb2_reader.DEFAULT_STRESS_DICT_PATH:
-                return "основной словарь"
-            if Path(source_path) == fb2_reader.DEFAULT_MANUAL_STRESS_OVERRIDES_PATH:
-                return "общие ручные (все книги)"
-            return Path(source_path).name
-
-        all_entries = []  # кэш последней загрузки, чтобы поиск не бил по диску на каждую букву
-
-        def reload_entries():
-            nonlocal all_entries
-            try:
-                all_entries = fb2_reader.list_stress_entries(book_path)
-            except Exception as e:
-                messagebox.showerror("Словарь ударений", f"Не удалось прочитать словари: {e}")
-                all_entries = []
-            apply_filter()
-
-        def apply_filter(*_args):
-            query = search_var.get().strip().lower()
-            tree.delete(*tree.get_children())
-            shown = 0
-            for e in all_entries:
-                if query and query not in e["word"]:
-                    continue
-                tree.insert("", "end", values=(e["word"], e["stress"], _source_label(e["source"])),
-                            tags=(str(e["source"]),))
-                shown += 1
-            count_label.configure(text=f"{shown} из {len(all_entries)}")
-
-        search_var.trace_add("write", apply_filter)
-
-        # --- удаление выбранной записи ---
-        actions_row = ttk.Frame(win, padding=(10, 6))
-        actions_row.pack(side="top", fill="x")
-
-        def delete_selected():
-            sel = tree.selection()
-            if not sel:
-                return
-            word, stress, _source_display = tree.item(sel[0], "values")
-            source_path = Path(tree.item(sel[0], "tags")[0])
-            if not messagebox.askyesno(
-                "Словарь ударений",
-                f'Удалить "{word}" ({stress}) из {source_path.name}?',
-            ):
-                return
-            try:
-                fb2_reader.delete_stress_entry(word, source_path)
-            except Exception as e:
-                messagebox.showerror("Словарь ударений", f"Не удалось удалить: {e}")
-                return
-            self.log(f'Словарь ударений: удалено "{word}" из {source_path.name}')
-            reload_entries()
-
-        ttk.Button(actions_row, text="Удалить выбранное", command=delete_selected).pack(side="left")
-        ttk.Button(actions_row, text="Обновить список", command=reload_entries).pack(
-            side="left", padx=(6, 0)
-        )
-
-        ttk.Separator(win, orient="horizontal").pack(side="top", fill="x", pady=(6, 0))
-
-        # --- добавление новой записи ---
-        add_label_row = ttk.Frame(win, padding=(10, 8, 10, 0))
-        add_label_row.pack(side="top", fill="x")
-        ttk.Label(
-            add_label_row,
-            text=(
-                "Добавить/изменить слово: введите его, нажмите «Показать буквы», "
-                "щёлкните по ударной гласной, «Сохранить». Действует сразу для всех книг."
-            ),
-            wraplength=720, justify="left",
-        ).pack(anchor="w")
-
-        entry_row = ttk.Frame(win, padding=(10, 4))
-        entry_row.pack(side="top", fill="x")
-        word_var = tk.StringVar()
-        word_entry = ttk.Entry(entry_row, textvariable=word_var, width=30)
-        word_entry.pack(side="left")
-
-        letters_holder = ttk.Frame(win, padding=(10, 10))
-        letters_holder.pack(side="top", fill="x")
-
-        status_label = ttk.Label(win, text="", padding=(10, 0))
-        status_label.pack(side="top", anchor="w")
-
-        btn_row = ttk.Frame(win, padding=(10, 8))
-        btn_row.pack(side="bottom", fill="x")
-        save_btn = ttk.Button(btn_row, text="Сохранить", state="disabled")
-        save_btn.pack(side="right")
-        ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side="right", padx=(0, 8))
-
-        _RU_VOWELS = set("аеёиоуыэюя")
-        letter_font = ("Segoe UI", 14)
-        letter_font_selected = ("Segoe UI", 14, "bold", "underline")
-
-        state = {"word": "", "labels": [], "selected": None}
-
-        def select_letter(idx):
-            labels = state["labels"]
-            prev = state["selected"]
-            if prev == idx:
-                labels[idx].configure(font=letter_font, foreground="black")
-                state["selected"] = None
-                save_btn.configure(state="disabled")
-                return
-            if prev is not None:
-                labels[prev].configure(font=letter_font, foreground="black")
-            labels[idx].configure(font=letter_font_selected, foreground="#c00")
-            state["selected"] = idx
-            save_btn.configure(state="normal")
-
-        def show_letters():
-            word = word_var.get().strip().lower()
-            for w in letters_holder.winfo_children():
-                w.destroy()
-            state["word"] = word
-            state["labels"] = []
-            state["selected"] = None
-            save_btn.configure(state="disabled")
-            status_label.configure(text="")
-            if not word:
-                return
-            _RU_LETTERS = set("абвгдежзийклмнопрстуфхцчшщъыьэюяё-")
-            if not all(ch in _RU_LETTERS for ch in word):
-                status_label.configure(
-                    text="Похоже, это не одно русское слово — проверьте ввод.",
-                    foreground="#a60",
-                )
-            for idx, ch in enumerate(word):
-                is_vowel = ch in _RU_VOWELS
-                lbl = tk.Label(
-                    letters_holder, text=ch, font=letter_font,
-                    cursor="hand2" if is_vowel else "arrow", padx=0,
-                )
-                lbl.pack(side="left")
-                state["labels"].append(lbl)
-                if is_vowel:
-                    lbl.bind("<Button-1>", lambda e, i=idx: select_letter(i))
-
-        word_entry.bind("<Return>", lambda e: show_letters())
-        ttk.Button(entry_row, text="Показать буквы", command=show_letters).pack(
-            side="left", padx=(6, 0)
-        )
-
-        def on_tree_select(_event):
-            sel = tree.selection()
-            if not sel:
-                return
-            word, _stress, _source_display = tree.item(sel[0], "values")
-            word_var.set(word)
-            show_letters()
-
-        tree.bind("<<TreeviewSelect>>", on_tree_select)
-
-        def do_save():
-            idx = state["selected"]
-            word = state["word"]
-            if idx is None or not word:
-                return
-            replacement = word[:idx] + "+" + word[idx:]
-            try:
-                dest = fb2_reader.add_preferred_stress(word, replacement)
-            except Exception as e:
-                messagebox.showerror("Словарь ударений", f"Не удалось сохранить: {e}")
-                return
-            self.log(f'Словарь ударений: "{word}" → "{replacement}" (сохранено в {dest.name})')
-            status_label.configure(text=f"Сохранено в {dest.name}.", foreground="#080")
-            word_var.set("")
-            for w in letters_holder.winfo_children():
-                w.destroy()
-            save_btn.configure(state="disabled")
-            word_entry.focus_set()
-            reload_entries()
-
-        save_btn.configure(command=do_save)
-
-        reload_entries()
-        word_entry.focus_set()
+        ttk.Button(row, text="Копировать", command=copy).pack(side="left")
+        ttk.Button(row, text="Сохранить…", command=save).pack(side="left", padx=6)
+        ttk.Button(row, text="Закрыть", command=win.destroy).pack(side="right")
 
     def _open_file_externally(self, path: Path):
         try:
@@ -1518,22 +1315,6 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
 
         dialogue_voices = self._selected_dialogue_voices()
 
-        if (self.attribution_var.get() and not self.attribution_api_key_var.get().strip()
-                and self._current_attribution_provider_key() not in ("ollama", "lmstudio")):
-            messagebox.showwarning(
-                "Определение говорящих",
-                "Включена галочка «Определять, какой персонаж говорит», но не указан "
-                "API-ключ — атрибуция будет пропущена, голоса для диалогов просто будут "
-                "чередоваться по кругу, как без неё."
-            )
-        elif (self.attribution_var.get()
-              and self._current_attribution_provider_key() == "yandexgpt"
-              and not self.attribution_folder_id_var.get().strip()):
-            messagebox.showwarning(
-                "Определение говорящих",
-                "Для YandexGPT нужен ещё и Folder ID (можно взять тот же, что и для Yandex "
-                "SpeechKit, кнопкой в разделе диалогов) — без него атрибуция будет пропущена."
-            )
         attribution = self._selected_attribution()
 
         self._save_settings()
@@ -1573,8 +1354,8 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         put_accent=self.accent_var.get(),
                         put_yo=self.yo_var.get(),
                         stress_engine=self.stress_engine_var.get(),
-                        stress_ollama_model=self.stress_ollama_model_var.get().strip(),
-                        stress_ollama_host=self.ollama_host_var.get().strip(),
+                        strip_monosyllables=self.strip_mono_var.get(),
+                        stress_review=self.stress_review_var.get(),
                         on_progress=self._on_synthesis_progress,
                         chapter_indices=chapter_indices,
                         char_ranges=char_ranges,
@@ -1626,10 +1407,10 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                             if self.book_path else None
                         ),
                         stress_engine=self.stress_engine_var.get(),
-                        stress_ollama_model=self.stress_ollama_model_var.get().strip(),
-                        stress_ollama_host=self.ollama_host_var.get().strip(),
-                        smart_emotion=self.smart_emotion_var.get(),
+                        smart_emotion=False,
                         emotion_attribution=self._selected_attribution(ignore_checkbox=True),
+                        strip_monosyllables=self.strip_mono_var.get(),
+                        stress_review=self.stress_review_var.get(),
                     )
                 elif mode == "yandex":
                     run_yandex(
@@ -1649,7 +1430,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         attribution=attribution,
                         should_stop=lambda: self._stop_requested,
                         play_fn=self._embedded_play,
-                        smart_emotion=self.yandex_smart_emotion_var.get(),
+                        smart_emotion=False,
                         emotion_attribution=self._selected_attribution(ignore_checkbox=True),
                     )
                 elif mode == "qwen_tts":
@@ -1800,7 +1581,10 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                 # переменную except-блока при выходе из него, и к моменту,
                 # когда self.after() вызовет эту лямбду асинхронно, имя "e"
                 # снаружи уже не будет существовать (NameError).
-                err_text = str(e)
+                import traceback as _tb
+                err_text = str(e) or repr(e)   # EOFError()/AssertionError() have an empty str()
+                _full_tb = _tb.format_exc()
+                self.after(0, lambda t=_full_tb: self.log("Полный traceback ошибки озвучки:\n" + t))
                 self.after(0, lambda t=err_text: messagebox.showerror("Ошибка", t))
                 self.after(0, lambda t=err_text: self.log(f"ОШИБКА: {t}"))
             finally:

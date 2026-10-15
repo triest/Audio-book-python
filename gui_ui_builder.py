@@ -36,6 +36,12 @@ class UIBuilderMixin:
         main_tab = ttk.Frame(self.notebook)
         self.notebook.add(main_tab, text="Озвучка")
 
+        stress_tab = ttk.Frame(self.notebook)
+        self.notebook.add(stress_tab, text="Словарь ударений")
+
+        questions_tab = ttk.Frame(self.notebook)
+        self.notebook.add(questions_tab, text="Вопросы по ударению")
+
         voices_tab = ttk.Frame(self.notebook)
         self.notebook.add(voices_tab, text="Голоса CosyVoice")
 
@@ -133,9 +139,6 @@ class UIBuilderMixin:
             btn_row, text="Проверить ударения", command=self.check_ambiguous_stress
         )
         self.check_stress_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(
-            btn_row, text="Словарь ударений", command=self.open_stress_dictionary_editor
-        ).pack(side="left", padx=(8, 0))
 
         # --- встроенный плеер: играет уже озвученную главу (выбранную в
         # списке слева) или очередную главу сразу после её озвучки (если
@@ -344,6 +347,16 @@ class UIBuilderMixin:
         )
         self.auto_start_rest_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
 
+        row += 1
+        self.recycle_services_var = tk.BooleanVar(value=True)
+        self.recycle_services_check = ttk.Checkbutton(
+            settings,
+            text="При запуске программы перезапускать сервис Silero REST "
+                 "(убить старый процесс и поднять новый)",
+            variable=self.recycle_services_var,
+        )
+        self.recycle_services_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+
         self.cosyvoice_rest_url_var = tk.StringVar(value=COSYVOICE_DEFAULT_REST_URL)
         self.cosyvoice_engine_var = tk.StringVar(value=COSYVOICE_ENGINE_LABELS[COSYVOICE_DEFAULT_ENGINE])
         row += 1
@@ -418,11 +431,12 @@ class UIBuilderMixin:
         ttk.Separator(attr_section, orient="horizontal").pack(fill="x", pady=(8, 6))
 
         self.attribution_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        self.attribution_check = ttk.Checkbutton(
             attr_section,
-            text="Определять, КАКОЙ персонаж говорит (через LLM)",
+            text="Определять, КАКОЙ персонаж говорит (через LLM) — отключено в локальном режиме",
             variable=self.attribution_var, command=self._on_attribution_toggle,
-        ).pack(anchor="w")
+        )
+        self.attribution_check.pack(anchor="w")
 
         self.attribution_hint = ttk.Label(
             attr_section,
@@ -749,35 +763,44 @@ class UIBuilderMixin:
         ttk.Label(intonation, text="Модуль ударений (silero/silero_rest):").grid(
             row=irow, column=0, sticky="w", pady=3
         )
-        self.stress_engine_var = tk.StringVar(value="ruaccent")
+        # Внутри хранится короткий ключ движка (он же в настройках и CLI), а
+        # в списке показываются понятные подписи.
+        _stress_labels = {
+            "silero": "silero-stress + грамматический шлюз slovnet (локально, без ИИ)",
+            "none": "Без автоматических ударений (только словарь)",
+        }
+        _stress_by_label = {v: k for k, v in _stress_labels.items()}
+        self.stress_engine_var = tk.StringVar(value="silero")
+        self._stress_label_var = tk.StringVar(value=_stress_labels["silero"])
         self.stress_engine_combo = ttk.Combobox(
-            intonation, textvariable=self.stress_engine_var, state="readonly", width=16,
-            values=["ruaccent", "silero_stress", "hybrid", "ollama", "lmstudio"],
+            intonation, textvariable=self._stress_label_var, state="readonly", width=46,
+            values=list(_stress_labels.values()),
         )
         self.stress_engine_combo.grid(row=irow, column=1, sticky="w", pady=3)
-        self.stress_engine_combo.bind("<<ComboboxSelected>>", lambda e: self._on_stress_engine_change())
+
+        def _label_to_key(_e=None):
+            key = _stress_by_label.get(self._stress_label_var.get(), "silero")
+            if self.stress_engine_var.get() != key:
+                self.stress_engine_var.set(key)
+            self._on_stress_engine_change()
+
+        def _key_to_label(*_a):
+            lbl = _stress_labels.get(self.stress_engine_var.get())
+            if lbl and self._stress_label_var.get() != lbl:
+                self._stress_label_var.set(lbl)
+
+        self.stress_engine_var.trace_add("write", _key_to_label)
+        self.stress_engine_combo.bind("<<ComboboxSelected>>", _label_to_key)
 
         irow += 1
         ttk.Label(
             intonation,
-            text="ruaccent — как раньше; silero_stress — новая модель Silero целиком;\n"
-                 "hybrid — RUAccent + silero-stress только для слов-омографов;\n"
-                 "ollama — RUAccent + для омографов: silero-stress (если установлена) как "
-                 "подсказка + локальная LLM (Ollama) решает по смыслу контекста;\n"
-                 "lmstudio — то же, но через локальный сервер LM Studio",
-            foreground="gray", justify="left",
+            text="Один процесс, без LLM: 1) forced_stress_words.json (абсолютный приоритет, нейросеть "
+                 "эти слова не трогает) -> 2) silero-stress по контексту предложений -> 3) грамматический "
+                 "шлюз slovnet (падеж/число: земли, сети, голоса...) -> 4) частица-фильтр. "
+                 "Словарь удобно править на вкладке «Словарь ударений»",
+            foreground="gray", justify="left", wraplength=560,
         ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
-
-        irow += 1
-        self.stress_ollama_row = ttk.Frame(intonation)
-        self.stress_ollama_row.grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
-        ttk.Label(self.stress_ollama_row, text="Модель (Ollama/LM Studio) для ударений:").pack(side="left")
-        self.stress_ollama_model_var = tk.StringVar(value="qwen2.5:7b-instruct")
-        self.stress_ollama_model_entry = add_context_menu(
-            ttk.Entry(self.stress_ollama_row, textvariable=self.stress_ollama_model_var, width=22)
-        )
-        self.stress_ollama_model_entry.pack(side="left", padx=(6, 0))
-        self.stress_ollama_row.grid_remove()
 
         irow += 1
         self.yo_var = tk.BooleanVar(value=True)
@@ -786,6 +809,32 @@ class UIBuilderMixin:
             variable=self.yo_var,
         )
         self.yo_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+
+        irow += 1
+        self.stress_review_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            intonation,
+            text="Список слов на проверку → review_list.json (слова без ударения и неизвестные, по частоте)",
+            variable=self.stress_review_var,
+        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+
+        irow += 1
+        self.strip_mono_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            intonation,
+            text='Убирать «+» в односложных словах (слова с «ё» сохраняют ударение)',
+            variable=self.strip_mono_var,
+        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+
+        irow += 1
+        self.optimal_settings_button = ttk.Button(
+            intonation, text="Set Optimal Settings", command=self._set_optimal_settings,
+        )
+        self.optimal_settings_button.grid(row=irow, column=0, columnspan=2, sticky="w", pady=(6, 3))
+        self.open_stress_dict_button = ttk.Button(
+            intonation, text="Открыть словарь ударений", command=self._open_stress_dictionary,
+        )
+        self.open_stress_dict_button.grid(row=irow, column=1, sticky="w", padx=(150, 0), pady=(6, 3))
 
         irow += 1
         self.emphasis_var = tk.BooleanVar(value=True)
@@ -800,7 +849,7 @@ class UIBuilderMixin:
         self.smart_emotion_var = tk.BooleanVar(value=False)
         self.smart_emotion_check = ttk.Checkbutton(
             intonation,
-            text="Умная эмоция: LLM определяет эмоцию каждого абзаца по смыслу (только silero_rest)",
+            text="Умная эмоция (LLM) — отключено в локальном режиме",
             variable=self.smart_emotion_var,
         )
         self.smart_emotion_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
@@ -821,6 +870,8 @@ class UIBuilderMixin:
         self._update_mode_dependent_widgets()
 
         self._build_voices_tab(voices_tab)
+        self._build_stress_editor_tab(stress_tab)
+        self._build_stress_questions_tab(questions_tab)
     def _build_voices_tab(self, tab: ttk.Frame):
         """Отдельная вкладка «Голоса CosyVoice»: список уже сохранённых
         профилей голоса (они хранятся на самом сервисе CosyVoice REST, в

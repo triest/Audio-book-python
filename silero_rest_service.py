@@ -5,7 +5,6 @@ from starlette.concurrency import run_in_threadpool
 import uvicorn
 import torch
 import numpy as np
-from ruaccent import RUAccent
 import os
 import re
 import sys
@@ -18,7 +17,6 @@ app = FastAPI()
  
 version = "1.4"
 model = None
-accentizer = None
  
 # --------------------------------------------------------------------------
 # Логирование: всё пишем и в консоль, и в файл silero_rest_service.log —
@@ -61,67 +59,9 @@ from silero_config import DEFAULT_SILERO_MODEL, load_silero_package
 MODEL_ID = os.environ.get("SILERO_MODEL", DEFAULT_SILERO_MODEL)
  
  
-def _patch_ruaccent_token_type_ids(accentizer_obj):
-    """
-    Чинит несовместимость установленной версии пакета ruaccent с
-    onnxruntime/transformers: ONNX-модель расстановки ударений
-    (ruaccent/accent_model.py, метод put_accent -> session.run) требует
-    на входе token_type_ids, а код ruaccent передаёт только input_ids и
-    attention_mask. Из-за этого КАЖДЫЙ вызов accentizer.process_all(...)
-    падал с:
-      ValueError: Required inputs (['token_type_ids']) are missing from
-      input feed (['input_ids', 'attention_mask']).
-    что и приводило к HTTP 500 на 100% фрагментов (и SSML, и обычный
-    текст — оба пути идут через один и тот же accentizer).
- 
-    Патчим не сам пакет (его файлы на диске трогать нельзя — слетит при
-    обновлении), а конкретный ONNX InferenceSession уже загруженной
-    модели: оборачиваем session.run так, чтобы он сам подставлял нулевой
-    token_type_ids той же формы, что input_ids, если модель его требует,
-    а его не передали.
-    """
-    try:
-        # Внутри RUAccent.accent_model лежит объект с полем .session —
-        # это onnxruntime.InferenceSession для put_accent().
-        inner = getattr(accentizer_obj, "accent_model", None)
-        if inner is None or not hasattr(inner, "session"):
-            logger.warning(
-                "Не удалось найти accent_model.session у RUAccent — "
-                "пропускаю патч token_type_ids (возможно, изменилась "
-                "внутренняя структура пакета ruaccent)."
-            )
-            return
- 
-        session = inner.session
-        required_inputs = {i.name for i in session.get_inputs()}
-        if "token_type_ids" not in required_inputs:
-            # Установленная модель не требует token_type_ids — патч не нужен.
-            return
- 
-        original_run = session.run
- 
-        def patched_run(output_names, input_feed, run_options=None):
-            if "token_type_ids" not in input_feed and "input_ids" in input_feed:
-                input_feed = dict(input_feed)
-                input_feed["token_type_ids"] = np.zeros_like(input_feed["input_ids"])
-            return original_run(output_names, input_feed, run_options)
- 
-        session.run = patched_run
-        logger.info(
-            "Применён патч token_type_ids для ONNX-модели ударений ruaccent "
-            "(иначе синтез падал бы на каждом фрагменте)."
-        )
-    except Exception:
-        logger.warning(
-            "Не удалось применить патч token_type_ids для ruaccent — "
-            "ошибки 'Required inputs ([token_type_ids])' могут повториться:\n"
-            + traceback.format_exc()
-        )
- 
- 
 @app.on_event("startup")
 async def startup_event():
-    global model, accentizer
+    global model
  
     device = torch.device('cpu')
     torch.set_num_threads(4)
@@ -134,41 +74,31 @@ async def startup_event():
         logger.error("Failed to load TTS model:\n" + traceback.format_exc())
         model = None
  
-    try:
-        accentizer = RUAccent()
-        # 'turbo' больше не существует как значение omograph_model_size в
-        # актуальных версиях ruaccent — актуальные варианты: tiny, tiny2,
-        # tiny2.1, turbo2, turbo3, turbo3.1, big_poetry. Оставляем turbo3.1
-        # (лучшее качество омографов) — сама проблема с token_type_ids была
-        # не в omograph-модели, а в ГЛАВНОЙ модели ударений ruaccent
-        # (accent_model.py: put_accent), которая используется всегда,
-        # независимо от omograph_model_size. Исправляем её ниже patch'ем.
-        accentizer.load(omograph_model_size='turbo3.1', use_dictionary=True)
-        _patch_ruaccent_token_type_ids(accentizer)
-        logger.info("RUAccent model loaded successfully")
-    except Exception:
-        logger.error("Failed to load RUAccent model:\n" + traceback.format_exc())
-        accentizer = None
- 
- 
-_NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+# A leading "-" is a minus sign only when it is not glued to a word/number ("5-6" is a range).
+_NUMBER_RE = re.compile(r"(?P<neg>(?<![\w-])-)?(?P<num>\d+(?:[.,]\d+)?)(?P<hy>-(?=[^\W\d_]))?")
 
 
 def preprocess_text(text):
-    """Преобразует цифры в словесную форму (num2words). Раньше ловились
-    только "чистые" числа-слова целиком (word.isdigit()) — числа, слипшиеся
-    с буквами/знаками ("20-летие", "5%", "3,5"), не распознавались и
-    оставались цифрами. Теперь заменяется только цифровая часть таких
-    токенов, остальное остаётся как было."""
+    """Преобразует цифры в словесную форму (num2words). Заменяется только цифровая часть
+    токенов ("20-летие", "5%", "3,5"). Слова ВСЕГДА отделяются пробелами от соседних
+    букв/цифр ("10лет" -> "десять лет"): без отступов Silero склеивает число с соседним
+    словом и "проглатывает" его. Дефис между числом и буквами ("20-летие") заменяется пробелом."""
     def _repl(m):
-        raw = m.group(0)
+        raw = m.group("num")
         try:
             if "," in raw or "." in raw:
-                return num2words(float(raw.replace(",", ".")), lang="ru")
-            return num2words(int(raw), lang="ru")
+                words = num2words(float(raw.replace(",", ".")), lang="ru")
+            else:
+                words = num2words(int(raw), lang="ru")
         except Exception:
             logger.warning(f"Failed to convert number {raw!r} to words:\n" + traceback.format_exc())
-            return raw
+            return m.group(0)
+        if m.group("neg"):
+            words = "минус " + words
+        s, a, b = m.string, m.start(), m.end()
+        left = " " if a > 0 and re.match(r"\w", s[a - 1]) else ""
+        right = " " if m.group("hy") or (b < len(s) and re.match(r"\w", s[b])) else ""
+        return left + words + right
     return _NUMBER_RE.sub(_repl, text)
  
  
@@ -177,13 +107,14 @@ def preprocess_text(text):
     responses={200: {"content": {"audio/wav": {}}}},
     response_class=Response
 )
-async def getwav(text_to_speech: str, speaker: str = "xenia", sample_rate: int = 24000):
+async def getwav(text_to_speech: str, speaker: str = "xenia", sample_rate: int = 24000,
+                 strip_mono: bool = True, server_accent: bool = True):
     if model is None:
         raise HTTPException(status_code=500, detail="TTS model is not loaded")
  
     preprocessed_text = preprocess_text(text_to_speech)
-    accented_text = _run_accentizer(preprocessed_text)
-    logger.info(f"[/getwav] Text after accent processing: {accented_text[:200]}")
+    accented_text = _finalize_text(preprocessed_text, strip_mono)
+    logger.info(f"[/getwav] Text sent to Silero: {accented_text[:200]}")
  
     try:
         # model.save_wav — тяжёлая синхронная CPU-операция (секунды на
@@ -192,7 +123,8 @@ async def getwav(text_to_speech: str, speaker: str = "xenia", sample_rate: int =
         # запросы/health-check зависают, что тоже выглядит как "сервис
         # завис").
         path = await run_in_threadpool(model.save_wav, text=accented_text,
-                                        speaker=speaker, sample_rate=sample_rate)
+                                        speaker=speaker, sample_rate=sample_rate,
+                                        **_silero_own_guess(server_accent))
     except Exception:
         logger.error("[/getwav] Synthesis failed:\n" + traceback.format_exc())
         raise HTTPException(status_code=400, detail="TTS synthesis failed, see server log")
@@ -215,107 +147,51 @@ _PROSODY_TAG_RE = re.compile(r"</?prosody[^>]*>")
  
  
 # --------------------------------------------------------------------------
-# Две отдельные проблемы с RUAccent, которые видны на слух в готовой
-# озвучке (клиент fb2_reader.py, локальный словарь ударений уже расставляет
-# часть слов с "+" ДО отправки на этот сервис — см. apply_stress_dictionary
-# там же):
-#
-# 1) RUAccent может не узнать уже стоящее "+"-ударение в присланном тексте
-#    и попытаться расставить своё ещё раз, поверх — два ударения в одном
-#    слове звучат как заметное "растягивание". Чиним через protect/restore:
-#    любой токен, где уже стоит "+" (то есть словарь fb2_reader.py его уже
-#    обработал), на время process_all() прячется за плейсхолдером и
-#    возвращается на место как есть, без изменений.
-#
-# 2) У самого RUAccent (расстановка ударений и "ё" — одна и та же модель)
-#    заметно бывают ложные "е" -> "ё" там, где не нужно ("самое" -> "самоё"
-#    и т.п.) — жалоба пользователей "часто вместо е ставит ё". Раз "ё" в
-#    русском языке всегда ударная, а RUAccent параллельно с заменой буквы
-#    сам же расставляет "+", это можно проверить на внутреннюю
-#    согласованность: если "ё" появилась, а сам RUAccent не пометил её как
-#    ударную ("+" не стоит прямо перед этой "ё") — то его же собственная
-#    модель, по сути, сама себе противоречит, и такой "ё" мы не доверяем,
-#    возвращаем обратно "е". "Е" вместо "ё" на письме — обычное дело (в
-#    книгах "ё" почти всегда печатают как обычную "е"), а вот лишняя
-#    услышанная "ё" режет слух — так что при сомнении лучше смолчать про "ё".
+# The service does NOT accentuate. The client (fb2_reader.py) places every "+" itself
+# (user dictionary -> silero-stress -> grammar gate) and sends the marked text; the service
+# only turns digits into words, strips useless marks from one-vowel words and synthesizes
+# exactly what it was given. server_accent=true means "let Silero's own put_accent/put_yo guess"
+# (used when the client could not accentuate, e.g. silero-stress is not installed).
 # --------------------------------------------------------------------------
 
-_ALREADY_ACCENTED_RE = re.compile(r"[А-Яа-яЁё]*\+[А-Яа-яЁё-]*[А-Яа-яЁё]")
-_ACCENT_GUARD_RE = re.compile(r"ACCENTGUARD(\d+)")
+# Односложные слова, которым метка нужна: без неё Silero читает «лет» как «лёт».
+_MONO_KEEP_STRESS = frozenset({"лет"})
+_MONO_STRESS_RE = re.compile(r"[А-Яа-яЁё+]*\+[А-Яа-яЁё+]*")
 
 
-def _protect_already_accented(text: str) -> "tuple[str, dict]":
-    """Прячет за плейсхолдерами ACCENTGUARD{n} слова, где уже стоит "+"
-    (расставлено раньше — локальным словарём клиента или предыдущим
-    проходом этой же функции) — чтобы process_all() их не трогал вообще."""
-    placeholders: dict = {}
-    counter = [0]
-
+def _strip_monosyllable_stress(text: str) -> str:
+    """Removes "+" from one-vowel words ("+он", "н+ет", "д+ва"): the stress is
+    unambiguous there and the extra mark makes Silero stretch/emphasise the
+    word (mirrors fb2_reader.strip_monosyllable_stress). Words with "ё" keep their mark
+    ("вс+ё", "ч+ём") — "ё" is always stressed."""
     def repl(m: "re.Match") -> str:
-        idx = counter[0]
-        counter[0] += 1
-        placeholder = f"ACCENTGUARD{idx}"
-        placeholders[placeholder] = m.group(0)
-        return placeholder
-
-    return _ALREADY_ACCENTED_RE.sub(repl, text), placeholders
-
-
-def _restore_already_accented(text: str, placeholders: dict) -> str:
-    if not placeholders:
-        return text
-
-    def repl(m: "re.Match") -> str:
-        return placeholders.get(m.group(0), "")
-
-    return _ACCENT_GUARD_RE.sub(repl, text)
+        w = m.group(0)
+        plain = w.replace("+", "")
+        if "ё" in plain.lower():
+            return w
+        if plain.lower() in _MONO_KEEP_STRESS:
+            return w
+        if len(re.findall(r"[аеёиоуыэюяАЕЁИОУЫЭЮЯ]", plain)) <= 1:
+            return plain
+        return w
+    return _MONO_STRESS_RE.sub(repl, text)
 
 
-def _sane_yo(text: str) -> str:
-    """"ё" без "+" прямо перед ней (т.е. сам RUAccent не считает её
-    ударной, хотя "ё" в русском языке всегда ударная) возвращается в "е" —
-    см. пояснение выше."""
-    chars = list(text)
-    for i, ch in enumerate(chars):
-        if ch not in ("ё", "Ё"):
-            continue
-        prev = chars[i - 1] if i > 0 else ""
-        if prev != "+":
-            chars[i] = "е" if ch == "ё" else "Е"
-    return "".join(chars)
+def _finalize_text(text: str, strip_mono: bool = True) -> str:
+    """Pass-through for the client's marks; only one-vowel words lose a useless "+"."""
+    return _strip_monosyllable_stress(text) if strip_mono else text
 
 
-def _run_accentizer(text: str) -> str:
-    """Единая точка вызова RUAccent для уже препроцессенного текста —
-    защищает уже акцентированные (клиентом) слова от повторной обработки
-    и подчищает внутренне противоречивые "ё" на выходе. Используется и
-    /getwav (обычный текст), и _accent_plain/accentize_ssml_text_nodes
-    (SSML, presented как один и тот же текстовый узел)."""
-    if accentizer is None:
-        return text
-    protected, placeholders = _protect_already_accented(text)
-    accented = accentizer.process_all(protected)
-    restored = _restore_already_accented(accented, placeholders)
-    return _sane_yo(restored)
-
-
-def _accent_plain(text: str) -> str:
-    """Прогоняет обычный (не-SSML) текст через preprocess_text + ударения."""
-    preprocessed = preprocess_text(text)
-    return _run_accentizer(preprocessed)
+def _prepare_plain(text: str, strip_mono: bool = True) -> str:
+    """Plain (non-SSML) text: digits -> words, then the pass-through."""
+    return _finalize_text(preprocess_text(text), strip_mono)
  
  
-def accentize_ssml_text_nodes(ssml: str) -> str:
-    """Расставляет ударения (через RUAccent) только в текстовых узлах SSML,
-    не трогая сами теги <speak>/<p>/<s>/<break .../>/<prosody ...>.
- 
-    Нужно и для SSML, построенного самим сервисом (raw_ssml=false), и для
-    готового SSML, присланного клиентом (raw_ssml=true, как это делает
-    fb2_reader.py) — в обоих случаях без этого шага модель могла бы не
-    получить + -ударений и хуже справляться с омографами (замо́к/за́мок и т.п.).
-    """
-    if accentizer is None:
-        return ssml
+def prepare_ssml_text_nodes(ssml: str, strip_mono: bool = True) -> str:
+    """Digits -> words in the text nodes of an SSML document only (tags <speak>/<p>/<s>/<break .../>/
+    <prosody ...> are untouched); the client's "+" marks pass through unchanged. Works for the SSML
+    built by the service itself (raw_ssml=false) and for client SSML (raw_ssml=true).
+    Digits must ALWAYS become words here: Silero swallows raw digits."""
     parts = _TAG_SPLIT_RE.split(ssml)
     out = []
     for part in parts:
@@ -324,7 +200,7 @@ def accentize_ssml_text_nodes(ssml: str) -> str:
         if part.startswith("<") and part.endswith(">"):
             out.append(part)
         else:
-            out.append(_accent_plain(part))
+            out.append(_prepare_plain(part, strip_mono))
     return "".join(out)
  
  
@@ -348,9 +224,9 @@ def _prosody_wrap(escaped_sentence: str, original_sentence: str,
         return f"<s>{escaped_sentence}</s>"
     stripped = original_sentence.rstrip()
     if stripped.endswith("?"):
-        return f'<s><prosody pitch="high">{escaped_sentence}</prosody></s>'
+        return f'<s><prosody pitch="+15%">{escaped_sentence}</prosody></s>'
     if stripped.endswith("!"):
-        return f'<s><prosody pitch="high" rate="fast">{escaped_sentence}</prosody></s>'
+        return f'<s><prosody pitch="+10%" rate="107%">{escaped_sentence}</prosody></s>'
     return f"<s>{escaped_sentence}</s>"
  
  
@@ -393,7 +269,14 @@ def build_ssml(text: str, sentence_break_ms: int = 320,
     return f"<speak>{body}</speak>"
  
  
-async def _synthesize_with_fallbacks(ssml: str, speaker: str, sample_rate: int) -> tuple:
+def _silero_own_guess(server_accent: bool) -> dict:
+    """server_accent=False: the client already placed every "+" (user dictionary / silero-stress /
+    grammar gate), so Silero's built-in guessing is switched OFF and it only executes our marks."""
+    return {} if server_accent else {"put_accent": False, "put_yo": False}
+
+
+async def _synthesize_with_fallbacks(ssml: str, speaker: str, sample_rate: int,
+                                     server_accent: bool = True) -> tuple:
     """Пытается синтезировать речь по SSML в несколько шагов, с понижением
     сложности разметки, чтобы в итоге всегда что-то сгенерировалось:
  
@@ -414,7 +297,8 @@ async def _synthesize_with_fallbacks(ssml: str, speaker: str, sample_rate: int) 
     for label, candidate_ssml in attempts:
         try:
             path = await run_in_threadpool(model.save_wav, ssml_text=candidate_ssml,
-                                            speaker=speaker, sample_rate=sample_rate)
+                                            speaker=speaker, sample_rate=sample_rate,
+                                            **_silero_own_guess(server_accent))
             if label != "as-is":
                 logger.warning(f"SSML synthesis succeeded only after fallback '{label}'")
             return path, label
@@ -426,7 +310,8 @@ async def _synthesize_with_fallbacks(ssml: str, speaker: str, sample_rate: int) 
     try:
         plain = strip_ssml_to_plain_text(ssml)
         path = await run_in_threadpool(model.save_wav, text=plain,
-                                        speaker=speaker, sample_rate=sample_rate)
+                                        speaker=speaker, sample_rate=sample_rate,
+                                        **_silero_own_guess(server_accent))
         logger.warning("SSML synthesis failed completely, fell back to plain text")
         return path, "plain-text-fallback"
     except Exception:
@@ -442,7 +327,7 @@ async def _synthesize_with_fallbacks(ssml: str, speaker: str, sample_rate: int) 
 async def getssmlwav(text_to_speech: str, speaker: str = "xenia", sample_rate: int = 24000,
                       sentence_break_ms: int = 320, paragraph_break_ms: int = 550,
                       comma_break_ms: int = 180, raw_ssml: bool = False,
-                      emphasize: bool = True):
+                      emphasize: bool = True, strip_mono: bool = True, server_accent: bool = True):
     """Синтез речи с интонационными паузами и вопросительной/восклицательной
     интонацией. Всегда пытается вернуть аудио, даже если сложная SSML-
     разметка не синтезируется — см. _synthesize_with_fallbacks.
@@ -452,7 +337,7 @@ async def getssmlwav(text_to_speech: str, speaker: str = "xenia", sample_rate: i
       уже готовый SSML-документ, если raw_ssml=true.
     - raw_ssml: если true, text_to_speech передаётся моделью как SSML
       (ожидается валидный <speak>...</speak>); ударения всё равно
-      расставляются сервером перед синтезом (см. accentize_ssml_text_nodes).
+      расставляются сервером перед синтезом (см. prepare_ssml_text_nodes).
     - emphasize: усиливать ли pitch/rate у вопросительных и восклицательных
       предложений (только для raw_ssml=false — при raw_ssml=true разметку
       уже задаёт клиент).
@@ -471,12 +356,12 @@ async def getssmlwav(text_to_speech: str, speaker: str = "xenia", sample_rate: i
             emphasize=emphasize,
         )
  
-    ssml = accentize_ssml_text_nodes(ssml)
+    ssml = prepare_ssml_text_nodes(ssml, strip_mono)
  
     logger.info(f"SSML for synthesis ({len(ssml)} chars): {ssml[:300]}{'...' if len(ssml) > 300 else ''}")
  
     try:
-        path, level = await _synthesize_with_fallbacks(ssml, speaker, sample_rate)
+        path, level = await _synthesize_with_fallbacks(ssml, speaker, sample_rate, server_accent)
     except Exception as e:
         logger.error("All synthesis attempts (including plain-text fallback) failed:\n" + traceback.format_exc())
         raise HTTPException(status_code=400, detail=f"SSML synthesis failed even with fallbacks: {e}")

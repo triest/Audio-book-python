@@ -1,0 +1,16 @@
+{
+ "_readme": "TTS-only pronunciation substitutions (the book text is never changed). Key = whole word, case-sensitive; value is spoken as written ('+' = stress). Added 10 Oct 2026. Evidence: narrator ASR of 'Флагман в изгнании'/'Испытание адом' (Whisper writes БГБ, ГБ, КФМ, НРХ in capitals = spelled by letters); the rest follow the same convention (consonant-only acronyms are spelled) and are NOT verified by listening.",
+ "БГБ": "б+э г+э б+э",
+ "ГБ": "г+э б+э",
+ "КФМ": "к+а +эф +эм",
+ "НРХ": "+эн +эр х+а",
+ "ВТК": "в+э т+э к+а",
+ "ЕКФ": "+е к+а +эф",
+ "ГКФ": "г+э к+а +эф",
+ "МВБ": "+эм в+э б+э",
+ "УТК": "+у т+э к+а",
+ "НЛАК": "+эн л+ак",
+ "НЛАКов": "+эн л+аков",
+ "g": "ж+е",
+ "_g_note": "'g' (ускорение свободного падения) молча пропускалось озвучкой; читается 'же'. Не подтверждено слухом/старыми аудиокнигами."
+}
