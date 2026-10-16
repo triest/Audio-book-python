@@ -156,7 +156,9 @@ _PROSODY_TAG_RE = re.compile(r"</?prosody[^>]*>")
 
 # Односложные слова, которым метка нужна: без неё Silero читает «лет» как «лёт».
 _MONO_KEEP_STRESS = frozenset({"лет"})
-_MONO_STRESS_RE = re.compile(r"[А-Яа-яЁё+]*\+[А-Яа-яЁё+]*")
+# Связка «да то,» ("Да то, Стью, ...") без обеих меток читается невнятно — оставляем «д+а т+о» как есть.
+_MONO_KEEP_PHRASE = r"(?<![А-Яа-яЁё+])[Дд]\+а т\+о(?![А-Яа-яЁё+])"
+_MONO_STRESS_RE = re.compile(_MONO_KEEP_PHRASE + r"|[А-Яа-яЁё+]*\+[А-Яа-яЁё+]*")
 
 
 def _strip_monosyllable_stress(text: str) -> str:
@@ -166,6 +168,8 @@ def _strip_monosyllable_stress(text: str) -> str:
     ("вс+ё", "ч+ём") — "ё" is always stressed."""
     def repl(m: "re.Match") -> str:
         w = m.group(0)
+        if " " in w:
+            return w          # phrase kept whole (_MONO_KEEP_PHRASE)
         plain = w.replace("+", "")
         if "ё" in plain.lower():
             return w
