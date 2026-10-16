@@ -5226,7 +5226,18 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 _SOFT_PAUSE_RE = re.compile(r"([,;:]|—|--)\s+")
 # «Да уж» без паузы между словами Silero сливает в «Длож»/«До уж» (замер ASR 16 окт 2026); 30 мс уже достаточно.
-_DA_UZH_RE = re.compile(r"(?<![А-Яа-яЁё+])([Дд]\+?а)\s+(?=\+?уж(?![А-Яа-яЁё]))")
+_DA_UZH_RE = re.compile(r"(?<![А-Яа-яЁё+])([Дд]\+?а)\s+(?=\+?(?:уж|и|еще|ещё|это|у|или|о)(?![А-Яа-яЁё]))")
+
+# Буква-индекс модификации после дефиса («Шрайки-А», «Шрайки-Б»): читается названием буквы, а не слепляется со словом.
+_LETTER_NAMES_RU = {"А": "а", "Б": "бэ", "В": "вэ", "Г": "гэ", "Д": "дэ", "Е": "е", "Ж": "жэ", "З": "зэ", "К": "ка",
+                    "Л": "эль", "М": "эм", "Н": "эн", "П": "пэ", "Р": "эр", "С": "эс", "Т": "тэ", "Ф": "эф", "Х": "ха"}
+_DESIGNATOR_LETTER_RE = re.compile(r"(?<=[а-яё])-([А-ЯЁ])(?![А-Яа-яЁё])")
+
+
+def spell_designator_letters(text: str) -> str:
+    """«Шрайки-Б» -> «Шрайки бэ», «Шрайки-А» -> «Шрайки а» (только для озвучки)."""
+    return _DESIGNATOR_LETTER_RE.sub(lambda m: " " + _LETTER_NAMES_RU.get(m.group(1), m.group(1)) if m.group(1) in _LETTER_NAMES_RU
+                                     else m.group(0), text)
 
 
 def _xml_escape(s: str) -> str:
@@ -5488,6 +5499,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         then silero-stress, the grammar gate and the sanitizer. The service keeps every "+"."""
         # Digits -> words BEFORE the stress layers, so "десять" gets its own stress mark (the
         # service would otherwise convert them after the layers, unstressed, or not at all).
+        plain_text_chunk = spell_designator_letters(plain_text_chunk)
         plain_text_chunk, _pron_held = protect_pronunciation_substitutions(plain_text_chunk, pron_subs)
         plain_text_chunk = numbers_to_words_ru(plain_text_chunk)
         if _client_layers:
