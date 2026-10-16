@@ -5228,16 +5228,29 @@ _SOFT_PAUSE_RE = re.compile(r"([,;:]|—|--)\s+")
 # «Да уж» без паузы между словами Silero сливает в «Длож»/«До уж» (замер ASR 16 окт 2026); 30 мс уже достаточно.
 _DA_UZH_RE = re.compile(r"(?<![А-Яа-яЁё+])([Дд]\+?а)\s+(?=\+?(?:уж|и|еще|ещё|это|у|или|о)(?![А-Яа-яЁё]))")
 
-# Буква-индекс модификации после дефиса («Шрайки-А», «Шрайки-Б»): читается названием буквы, а не слепляется со словом.
+# Буква-индекс модификации после дефиса («Шрайки-А», «Шрайки-Б»): читается названием буквы. Silero глотает «бэ» после слова
+# (замер ASR 16 окт 2026), поэтому в SSML буква получает паузу 100 мс и rate 80%. Ориентир — дефис, а не регистр слова.
 _LETTER_NAMES_RU = {"А": "а", "Б": "бэ", "В": "вэ", "Г": "гэ", "Д": "дэ", "Е": "е", "Ж": "жэ", "З": "зэ", "К": "ка",
                     "Л": "эль", "М": "эм", "Н": "эн", "П": "пэ", "Р": "эр", "С": "эс", "Т": "тэ", "Ф": "эф", "Х": "ха"}
 _DESIGNATOR_LETTER_RE = re.compile(r"(?<=[а-яё])-([А-ЯЁ])(?![А-Яа-яЁё])")
+_LETTER_MARK_RE = re.compile(r"\s*⟦([^⟧]+)⟧")
 
 
-def spell_designator_letters(text: str) -> str:
-    """«Шрайки-Б» -> «Шрайки бэ», «Шрайки-А» -> «Шрайки а» (только для озвучки)."""
-    return _DESIGNATOR_LETTER_RE.sub(lambda m: " " + _LETTER_NAMES_RU.get(m.group(1), m.group(1)) if m.group(1) in _LETTER_NAMES_RU
-                                     else m.group(0), text)
+def protect_designator_letters(text: str, held: dict) -> str:
+    """«Шрайки-Б» -> «Шрайки PRONSUBx»; в held буква лежит как маркер ⟦бэ⟧ (его разворачивает text_to_ssml; для обычного
+    текста — strip_letter_marks). Имена плейсхолдеров продолжают нумерацию held от protect_pronunciation_substitutions."""
+    def _sub(m):
+        name_ru = _LETTER_NAMES_RU.get(m.group(1))
+        if not name_ru:
+            return m.group(0)
+        ph = _pron_ph_name(len(held))
+        held[ph] = "⟦" + name_ru + "⟧"
+        return " " + ph
+    return _DESIGNATOR_LETTER_RE.sub(_sub, text)
+
+
+def strip_letter_marks(text: str) -> str:
+    return _LETTER_MARK_RE.sub(lambda m: " " + m.group(1), text)
 
 
 def _xml_escape(s: str) -> str:
@@ -5309,6 +5322,7 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
                 escaped,
             )
             escaped = _DA_UZH_RE.sub(r'\1<break time="60ms"/> ', escaped)
+            escaped = _LETTER_MARK_RE.sub(lambda m: f'<break time="100ms"/> <prosody rate="80%">{m.group(1)}</prosody>', escaped)
             s_chunks.append(_prosody_wrap(escaped, sent, emphasize))
         if s_chunks:
             inner = f'<break time="{sentence_break_ms}ms"/>'.join(s_chunks)
@@ -5499,8 +5513,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         then silero-stress, the grammar gate and the sanitizer. The service keeps every "+"."""
         # Digits -> words BEFORE the stress layers, so "десять" gets its own stress mark (the
         # service would otherwise convert them after the layers, unstressed, or not at all).
-        plain_text_chunk = spell_designator_letters(plain_text_chunk)
         plain_text_chunk, _pron_held = protect_pronunciation_substitutions(plain_text_chunk, pron_subs)
+        plain_text_chunk = protect_designator_letters(plain_text_chunk, _pron_held)
         plain_text_chunk = numbers_to_words_ru(plain_text_chunk)
         if _client_layers:
             protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, stress_dict)
@@ -5551,7 +5565,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
                                          enabled=use_stress_online)
         resp = _get_with_retry(plain_endpoint, {
-            "text_to_speech": _accented_text_for_rest(plain_text_chunk),
+            "text_to_speech": strip_letter_marks(_accented_text_for_rest(plain_text_chunk)),
             "speaker": chunk_speaker,
             "sample_rate": sample_rate,
             "strip_mono": "true" if strip_monosyllables else "false",
