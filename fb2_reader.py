@@ -3569,8 +3569,8 @@ def apply_stress_dictionary_protected(text: str, stress_dict: dict,
     return protected, placeholders
 
 
-# Односложные слова, которым метка нужна: без неё Silero читает «лет» как «лёт».
-_MONO_KEEP_STRESS = frozenset({"лет"})
+# Односложные слова, которым метка нужна: без неё Silero читает «лет» как «лёт», «пять» как «пить», «сто» как «ста».
+_MONO_KEEP_STRESS = frozenset({"лет", "пять", "сто"})
 # Связка «да то,» ("Да то, Стью, ...") без обеих меток читается невнятно — оставляем «д+а т+о» как есть.
 _MONO_KEEP_PHRASE = r"(?<![А-Яа-яЁё+])[Дд]\+а т\+о(?![А-Яа-яЁё+])"
 _MONO_STRESS_RE = re.compile(_MONO_KEEP_PHRASE + r"|[А-Яа-яЁё+]*\+[А-Яа-яЁё+]*")
