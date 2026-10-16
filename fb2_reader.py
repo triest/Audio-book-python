@@ -5225,6 +5225,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 _SOFT_PAUSE_RE = re.compile(r"([,;:]|—|--)\s+")
+# «Да уж» без паузы между словами Silero сливает в «Длож»/«До уж» (замер ASR 16 окт 2026); 30 мс уже достаточно.
+_DA_UZH_RE = re.compile(r"(?<![А-Яа-яЁё+])([Дд]\+?а)\s+(?=\+?уж(?![А-Яа-яЁё]))")
 
 
 def _xml_escape(s: str) -> str:
@@ -5295,6 +5297,7 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
                 lambda m: f'{_xml_escape(m.group(1))}<break time="{comma_break_ms}ms"/> ',
                 escaped,
             )
+            escaped = _DA_UZH_RE.sub(r'\1<break time="60ms"/> ', escaped)
             s_chunks.append(_prosody_wrap(escaped, sent, emphasize))
         if s_chunks:
             inner = f'<break time="{sentence_break_ms}ms"/>'.join(s_chunks)
