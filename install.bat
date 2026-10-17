@@ -116,6 +116,12 @@ rem pinned to the verified version (stress_versions.lock.json); upgrade procedur
 "%VENV_PY%" -m pip install silero-stress==1.5
 if errorlevel 1 echo WARNING: silero-stress failed to install - there will be no automatic stress marks ^(only the dictionary^).
 
+rem faster-whisper - speech recognition (ASR) for checking finished chapters (tools\audio_verify.py: coverage/WER/CER).
+rem Dev/QA tool only: the app does not import it, so it is not packed into the .exe. Optional: a failure is not fatal.
+rem The recognition model itself is downloaded from Hugging Face on first use, not here.
+"%VENV_PY%" -m pip install faster-whisper
+if errorlevel 1 echo WARNING: faster-whisper failed to install - audio checks by speech recognition will be unavailable.
+
 rem Leftovers of the removed RUAccent / ruaccent-predictor engines: drop them so they cannot bloat the .exe.
 "%VENV_PY%" -m pip uninstall -y ruaccent ruaccent-predictor >nul 2>nul
 if exist "%~dp0ruaccent_predictor_pkg" rmdir /s /q "%~dp0ruaccent_predictor_pkg"
