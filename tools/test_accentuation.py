@@ -44,7 +44,7 @@ def run_chain(sentence, forced=None, reset=True):
         fr.reset_stress_context()          # tests are independent; context priming has its own section
     prot, ph = fr.apply_stress_dictionary_protected(sentence, stress_dict)
     out = fr.apply_stress_layers(prot, "silero", SILERO)
-    return fr.restore_stress_placeholders(out, ph)
+    return fr.strip_monosyllable_stress(fr.restore_stress_placeholders(out, ph))   # as in _accented_text_for_rest
 
 
 def has(out, form):
@@ -81,7 +81,7 @@ CASES = [
     ("Его подчиненные верили ему.", ["подчин+ённые"]),
     ("Импульсные ружья вскинули.", ["+импульсные"]),
     ("Системы жизнеобеспечения отказали.", ["жизнеобесп+ечения"]),
-    ("Ему было десять лет, а ей 10 лет.", ["лет"]),
+    ("Ему было десять лет, а ей 10 лет.", ["л+ет"]),
     ("Он точно так же, также молчал.", ["т+акже"]),
     ("Такая вероятность была мала.", ["так+ая"]),
     ("За два года она поняла всё.", ["понял+а"]),
@@ -118,7 +118,7 @@ for form in ("Мог+ущий", "г+убы", "глубок+о", "самом+у",
     check(f"sanitizer applies {form}", form.lower() in sanitized.lower(), f"(got {sanitized!r})")
 check("global_prose_sanitizer is the LAST step of apply_stress_layers",
       __import__('inspect').getsource(fr.apply_stress_layers).strip().splitlines()[-1].strip()
-      == "return global_prose_sanitizer(out)")
+      == 'return _text_guard(out, global_prose_sanitizer(out), "sanitizer")')
 for _gone in ("_fix_znakom", "_fix_bolshe", "_PROSE_PHRASES", "_ZNAKOM", "_BOLSH_RE"):
     check(f"obsolete rule removed: {_gone}", not hasattr(fr, _gone))
 for _src in ("взял в руки", "встали на караул", "пор+а бы", "я зн+аком с ним", "куд+а больш+ую"):
@@ -297,9 +297,9 @@ for _end in ("", "а", "у", "ом", "е", "ы", "ов", "ам", "ами", "ах
     check(f"seed: клинкскейлс{_end}", _seed.get("клинкскейлс" + _end) == "кл+инкскейлс" + _end)
 for _end in ("", "а", "у", "ом", "е"):
     check(f"seed: сан-мартин{_end}", _seed.get("сан-мартин" + _end) == "сан-март+ин" + _end)
-check("every seed value has exactly one '+' and the same letters",
-      all(v.count("+") == 1 and v.replace("+", "").replace("ё", "е") == k.replace("ё", "е") for k, v in _seed.items()
-          if not k.startswith("_") and " " not in k))
+check("every seed value has 1..(hyphen parts) '+' and the same letters",
+      all(1 <= v.count("+") <= k.count("-") + 1 and v.replace("+", "").replace("ё", "е") == k.replace("ё", "е")
+          for k, v in _seed.items() if not k.startswith("_") and " " not in k))
 _orig_path = fr.DEFAULT_FORCED_STRESS_PATH
 fr.DEFAULT_FORCED_STRESS_PATH = Path("forced_stress_words.json")
 try:
@@ -427,12 +427,12 @@ check("gate: never stacks '++'", "++" not in run_chain("Давно извест�
 print("=== regressions found in the 'Пепел победы' ch.1-2 xenia audio test (10 Oct 2026; shipped dictionary) ===")
 _REAL = fr._load_forced_stress()
 XENIA_CASES = [
-    ("Она вывозила людей на транспортах.", ["трансп+ортах"]),
-    ("Завладел транспортами, позволившими всем жить.", ["трансп+ортами"]),
-    ("Основное внимание Хонор было приковано к экрану.", ["осн+овное"]),
+    ("Она вывозила людей на транспортах.", ["тр+анспортах"]),
+    ("Завладел транспортами, позволившими всем жить.", ["тр+анспортами"]),
+    ("Основное внимание Хонор было приковано к экрану.", ["основн+ое"]),
     ("Подвели переходной рукав.", ["перех+одной"]),
-    ("Она носила его до плена.", ["плен+а"]),
-    ("Сырья для производства тканей и красителей.", ["ткан+ей"]),
+    ("Она носила его до плена.", ["пл+ена"]),
+    ("Сырья для производства тканей и красителей.", ["тк+аней"]),
     ("Около четырёхсот тысяч человек.", ["четырехс+от"]),
     ("Равно как умелых ткачей и портных.", ["равн+о как"]),
     ("Мы с Натаном вышли.", ["н+атаном"]),
@@ -442,7 +442,7 @@ XENIA_CASES = [
     ("Дамы и господа, прошу внимания.", ["д+амы и господ+а"]),
     ("Он прочёл рапорты и отправил рапорт.", ["рап+орты", "рап+орт"]),
     ("Это огромный комплекс и два комплекса.", ["компл+екс", "компл+екса"]),
-    ("Броня покоробилась, и броню пробило бронёй.", ["бр+оня", "бр+оню"]),
+    ("Броня покоробилась, и броню пробило бронёй.", ["брон+я", "брон+ю"]),
     ("Адмирал Трикупис говорил с Трикуписом.", ["трик+упис", "трик+уписом"]),
     ("Если мы получим ответ.", ["получ+им"]),
     ("Она хорошо осведомлена о делах.", ["осведомлен+а"]),

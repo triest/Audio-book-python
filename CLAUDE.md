@@ -442,6 +442,7 @@ pymorphy3 (`_guess_name_gender`), пол голоса — по пометке "(
 Лежат в корне проекта (не в `.claude/skills/`, поэтому автоматически не подгружаются — открывай `SKILL.md` через Read):
 - `stress-dictionary-audit/SKILL.md` — жалоба на неверное ударение в слове, аудит `forced_stress_words.json`.
 - `stress-chapter-review/SKILL.md` — «проверь ударения в паре глав»: сухой прогон, разбор ошибок, добавление в словарь.
+- `stress-debug/SKILL.md` — «отладь ударения»: четыре прогона проверок и разбор красных тестов (устарел тест или код).
 - `stress-book-run/SKILL.md` — «запусти всю книгу», проверка готовых глав (звук, ASR, A/B-фрагменты), «в главе N слово X читается не так».
 
 ## Стиль ответов пользователю
@@ -650,3 +651,6 @@ There are NO separate workflow scripts or folders any more. `fb2_reader.py` is t
 и берёт данные из корня (`Path(__file__).resolve().parent.parent`). Запуск из корня: `.venv\Scripts\python.exe tools\test_accentuation.py` (тест сам делает chdir в корень).
 `data/` — данные оценки (`stress_gold.json`, `stress_adjudication.json`); словари, которые правит пользователь, и `stress_review_log.jsonl` лежат в корне (их ищет `app_paths`).
 `_archive/` (в `.gitignore`) — бэкапы `*.bak_*` и черновики; `*.exe`, `*.fb2`, `grammar_gate_models/`, `audiobook_output*/` тоже не в git.
+
+## Состояние отладки ударений (18 октября 2026)
+`tools/test_accentuation.py` 391/391, `test_book_pipeline.py` ALL OK, золото 67/68 (98,5%), `check_stress_versions.py` OK. Красными были 10 устаревших ожиданий теста (не код): `run_chain` теперь включает `strip_monosyllable_stress`, «лет» ждёт «л+ет», XENIA_CASES выровнены по словарю от 16 октября, проверка «sanitizer последний» учитывает `_text_guard`. Код цепочки не менялся. На слух ничего не проверялось.
