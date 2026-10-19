@@ -97,3 +97,4 @@ review_list_paste.txt
 
 # Книги (авторское право) — не для публичного репозитория.
 *.fb2
+.claude/settings.local.json
