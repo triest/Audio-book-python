@@ -146,10 +146,11 @@ from gui_player import PlayerMixin
 from gui_ui_builder import UIBuilderMixin
 from gui_stress_editor import StressEditorMixin
 from gui_stress_questions import StressQuestionsMixin
+from gui_stress_review import StressReviewMixin
 
 
 class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UIBuilderMixin,
-                   StressEditorMixin, StressQuestionsMixin, tk.Tk):
+                   StressEditorMixin, StressQuestionsMixin, StressReviewMixin, tk.Tk):
     def __init__(self, initial_book: Path | None = None):
         super().__init__()
         self.title("FB2 Audiobook — озвучивание книг")

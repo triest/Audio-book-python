@@ -42,6 +42,9 @@ class UIBuilderMixin:
         questions_tab = ttk.Frame(self.notebook)
         self.notebook.add(questions_tab, text="Вопросы по ударению")
 
+        review_tab = ttk.Frame(self.notebook)
+        self.notebook.add(review_tab, text="Сомнительные места")
+
         voices_tab = ttk.Frame(self.notebook)
         self.notebook.add(voices_tab, text="Голоса CosyVoice")
 
@@ -872,6 +875,7 @@ class UIBuilderMixin:
         self._build_voices_tab(voices_tab)
         self._build_stress_editor_tab(stress_tab)
         self._build_stress_questions_tab(questions_tab)
+        self._build_stress_review_tab(review_tab)
     def _build_voices_tab(self, tab: ttk.Frame):
         """Отдельная вкладка «Голоса CosyVoice»: список уже сохранённых
         профилей голоса (они хранятся на самом сервисе CosyVoice REST, в
