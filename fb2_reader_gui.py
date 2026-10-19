@@ -145,12 +145,11 @@ from gui_voice_profiles import CosyVoiceVoicesMixin
 from gui_player import PlayerMixin
 from gui_ui_builder import UIBuilderMixin
 from gui_stress_editor import StressEditorMixin
-from gui_stress_questions import StressQuestionsMixin
 from gui_stress_review import StressReviewMixin
 
 
 class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UIBuilderMixin,
-                   StressEditorMixin, StressQuestionsMixin, StressReviewMixin, tk.Tk):
+                   StressEditorMixin, StressReviewMixin, tk.Tk):
     def __init__(self, initial_book: Path | None = None):
         super().__init__()
         self.title("FB2 Audiobook — озвучивание книг")
@@ -1189,7 +1188,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.log("Запрошена остановка после текущей главы…")
 
     def check_ambiguous_stress(self):
-        """Кнопка «Проверить ударения»: сухой прогон ТОЙ ЖЕ цепочки, что получает озвучка (числа -> слова,
+        """Кнопка «Показать текст главы с ударениями» (вкладка «Проверка ударений»): сухой прогон ТОЙ ЖЕ цепочки, что получает озвучка (числа -> слова,
         словарь forced_stress_words.json -> silero-stress -> грамматический шлюз slovnet ->
         global_prose_sanitizer), но без синтеза звука. Результат — текст с «+» в окне."""
         if self._worker and self._worker.is_alive():
@@ -1200,6 +1199,13 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             return
         sel = self.chapters_list.curselection()
         idx = sel[0] if sel else 0
+        try:                                    # tab «Проверка ударений»: a single chapter typed in its «Главы» field wins
+            from gui_stress_review import _parse_chapters
+            only = _parse_chapters(self.sv_chapters_var.get(), len(self.chapters))
+            if only and len(only) == 1:
+                idx, sel = next(iter(only)), ()
+        except Exception:
+            pass
         title, text = self.chapters[idx]
         if len(sel) == 1:                       # a single chapter with a fragment range -> only that fragment
             try:
@@ -1245,7 +1251,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                 f"меток «+»: {info['marks']}  |  е→ё: {info['yo_swapped']}  |  {info['seconds']:.1f} с")
         ttk.Label(win, text=head).pack(anchor="w", padx=8, pady=(8, 2))
         ttk.Label(win, text="Ошибку правьте в forced_stress_words.json (кнопка «Открыть словарь ударений»): "
-                            "«слово»: «сл+ово», затем снова «Проверить ударения».",
+                            "«слово»: «сл+ово», затем снова «Показать текст главы с ударениями» (вкладка «Проверка ударений»).",
                   foreground="#555").pack(anchor="w", padx=8)
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=8, pady=6)

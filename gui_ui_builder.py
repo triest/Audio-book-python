@@ -39,11 +39,8 @@ class UIBuilderMixin:
         stress_tab = ttk.Frame(self.notebook)
         self.notebook.add(stress_tab, text="Словарь ударений")
 
-        questions_tab = ttk.Frame(self.notebook)
-        self.notebook.add(questions_tab, text="Вопросы по ударению")
-
         review_tab = ttk.Frame(self.notebook)
-        self.notebook.add(review_tab, text="Сомнительные места")
+        self.notebook.add(review_tab, text="Проверка ударений")
 
         voices_tab = ttk.Frame(self.notebook)
         self.notebook.add(voices_tab, text="Голоса CosyVoice")
@@ -138,10 +135,6 @@ class UIBuilderMixin:
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(btn_row, text="Остановить", command=self.request_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
-        self.check_stress_btn = ttk.Button(
-            btn_row, text="Проверить ударения", command=self.check_ambiguous_stress
-        )
-        self.check_stress_btn.pack(side="left", padx=(8, 0))
 
         # --- встроенный плеер: играет уже озвученную главу (выбранную в
         # списке слева) или очередную главу сразу после её озвучки (если
@@ -874,7 +867,6 @@ class UIBuilderMixin:
 
         self._build_voices_tab(voices_tab)
         self._build_stress_editor_tab(stress_tab)
-        self._build_stress_questions_tab(questions_tab)
         self._build_stress_review_tab(review_tab)
     def _build_voices_tab(self, tab: ttk.Frame):
         """Отдельная вкладка «Голоса CosyVoice»: список уже сохранённых

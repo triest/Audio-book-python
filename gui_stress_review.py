@@ -1,7 +1,7 @@
-"""Вкладка «Сомнительные места»: список мест книги, где ударение цепочки расходится с независимым корпусом (или слов из списка
-пользователя). У каждого места: контекст, «как звучит в готовой главе» (клип по кэшу ASR), «как прозвучит по текущим правилам»,
+"""Вкладка «Проверка ударений» (объединила бывшие «Вопросы по ударению» и «Сомнительные места»): список мест книги, где ударение
+сомнительно — имена, термины, нестабильные слова, расхождения цепочки с независимым корпусом, слова из поля «Свои слова». У каждого места: контекст, «как звучит в готовой главе» (клип по кэшу ASR), «как прозвучит по текущим правилам»,
 варианты ударения с ▶ и решение: подтвердить / исправить «только здесь» (фраза в файле правок книги) / исправить «везде» (словарь).
-Логика — `stress_review` (без Tk). Записи идут в те же файлы, что и вкладки «Словарь ударений» и «Вопросы по ударению».
+Логика — `stress_review` (без Tk). Записи идут в те же файлы, что и вкладка «Словарь ударений».
 Ударение в звуке подтверждает только слух: вкладка находит место, даёт послушать и записывает решение."""
 import queue
 import re
@@ -46,10 +46,13 @@ class StressReviewMixin:
         self._sv_state = srv.load_state()
         self._sv_queue: "queue.Queue" = queue.Queue()
         self._sv_asr_cache: dict = {}
-        self.sv_status_var = tk.StringVar(value="Загрузите книгу на вкладке «Озвучка», укажите главы и нажмите «Найти сомнительные места».")
+        self.sv_status_var = tk.StringVar(value="Загрузите книгу на вкладке «Озвучка», отметьте, что искать, и нажмите «Найти».")
         self.sv_chapters_var = tk.StringVar(value="")
         self.sv_words_var = tk.StringVar(value="")
         self.sv_corpus_var = tk.BooleanVar(value=True)
+        self.sv_names_var = tk.BooleanVar(value=True)
+        self.sv_terms_var = tk.BooleanVar(value=True)
+        self.sv_unstable_var = tk.BooleanVar(value=False)
         self.sv_hide_done_var = tk.BooleanVar(value=True)
         self.sv_choice_var = tk.StringVar(value="")
         self.sv_custom_var = tk.StringVar(value="")
@@ -57,26 +60,33 @@ class StressReviewMixin:
 
         parent.columnconfigure(0, weight=2, uniform="sv")
         parent.columnconfigure(1, weight=3, uniform="sv")
-        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1)
 
         top = ttk.Frame(parent)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
-        ttk.Label(top, text="Главы (пусто = все):").pack(side="left")
-        ttk.Entry(top, textvariable=self.sv_chapters_var, width=12).pack(side="left", padx=(4, 10))
-        ttk.Label(top, text="Слова (через запятую):").pack(side="left")
-        ttk.Entry(top, textvariable=self.sv_words_var, width=26).pack(side="left", padx=(4, 10))
-        ttk.Checkbutton(top, text="расхождения с корпусом", variable=self.sv_corpus_var).pack(side="left")
-        self.sv_scan_btn = ttk.Button(top, text="Найти сомнительные места", command=self._sv_scan_toggle)
-        self.sv_scan_btn.pack(side="left", padx=10)
-        ttk.Checkbutton(top, text="скрыть решённые", variable=self.sv_hide_done_var, command=self._sv_fill).pack(side="left")
+        ttk.Label(top, text="Искать:").pack(side="left")
+        for text, var in (("имена", self.sv_names_var), ("термины", self.sv_terms_var),
+                          ("нестабильные слова", self.sv_unstable_var), ("расхождения с корпусом", self.sv_corpus_var)):
+            ttk.Checkbutton(top, text=text, variable=var).pack(side="left", padx=(8, 0))
         self.sv_progress = ttk.Progressbar(top, mode="indeterminate", length=90)
         self.sv_progress.pack(side="right")
+        top2 = ttk.Frame(parent)
+        top2.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 0))
+        ttk.Label(top2, text="Главы (пусто = все):").pack(side="left")
+        ttk.Entry(top2, textvariable=self.sv_chapters_var, width=12).pack(side="left", padx=(4, 10))
+        ttk.Label(top2, text="Свои слова (через запятую):").pack(side="left")
+        ttk.Entry(top2, textvariable=self.sv_words_var, width=24).pack(side="left", padx=(4, 10))
+        self.sv_scan_btn = ttk.Button(top2, text="Найти", command=self._sv_scan_toggle)
+        self.sv_scan_btn.pack(side="left")
+        self.check_stress_btn = ttk.Button(top2, text="Показать текст главы с ударениями", command=self.check_ambiguous_stress)
+        self.check_stress_btn.pack(side="left", padx=10)
+        ttk.Checkbutton(top2, text="скрыть решённые", variable=self.sv_hide_done_var, command=self._sv_fill).pack(side="left")
 
         left = ttk.Frame(parent)
-        left.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=8)
-        self.sv_tree = ttk.Treeview(left, columns=("word", "reading", "count"), show="headings", selectmode="browse")
-        for col, text, w, anchor, stretch in (("word", "Слово", 120, "w", True), ("reading", "Сейчас", 120, "w", True),
-                                              ("count", "Раз", 44, "center", False)):
+        left.grid(row=2, column=0, sticky="nsew", padx=(8, 4), pady=8)
+        self.sv_tree = ttk.Treeview(left, columns=("word", "reading", "kind", "count"), show="headings", selectmode="browse")
+        for col, text, w, anchor, stretch in (("word", "Слово", 110, "w", True), ("reading", "Сейчас", 110, "w", True),
+                                              ("kind", "Тип", 90, "w", False), ("count", "Раз", 44, "center", False)):
             self.sv_tree.heading(col, text=text)
             self.sv_tree.column(col, width=w, anchor=anchor, stretch=stretch)
         self.sv_tree.tag_configure("fixed", foreground="#2e7d32")
@@ -88,7 +98,7 @@ class StressReviewMixin:
         self.sv_tree.bind("<<TreeviewSelect>>", self._sv_on_select)
 
         right = ttk.Frame(parent)
-        right.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        right.grid(row=2, column=1, sticky="nsew", padx=(4, 8), pady=8)
         self.sv_title = ttk.Label(right, text="", font=("TkDefaultFont", 12, "bold"))
         self.sv_title.pack(anchor="w")
         self.sv_sub = ttk.Label(right, text="", foreground="#555", wraplength=540, justify="left")
@@ -164,25 +174,26 @@ class StressReviewMixin:
             return
         chapters = list(getattr(self, "chapters", None) or [])
         if not chapters:
-            messagebox.showwarning("Сомнительные места", "Сначала загрузите книгу на вкладке «Озвучка».")
+            messagebox.showwarning("Проверка ударений", "Сначала загрузите книгу на вкладке «Озвучка».")
             return
         if getattr(self, "_worker", None) and self._worker.is_alive():
-            messagebox.showinfo("Сомнительные места", "Идёт озвучка: поиск использует те же модели ударений. Дождитесь её окончания.")
+            messagebox.showinfo("Проверка ударений", "Идёт озвучка: поиск использует те же модели ударений. Дождитесь её окончания.")
             return
-        for attr, title in (("_se_scan_running", "анализ омографов"), ("_sq_running", "анализ вопросов по ударению")):
-            fn = getattr(self, attr, None)
-            if fn and fn():
-                messagebox.showinfo("Сомнительные места", f"Идёт {title}: дождитесь его окончания.")
-                return
+        fn = getattr(self, "_se_scan_running", None)
+        if fn and fn():
+            messagebox.showinfo("Проверка ударений", "Идёт анализ омографов на вкладке «Словарь ударений»: дождитесь его окончания.")
+            return
         try:
             only = _parse_chapters(self.sv_chapters_var.get(), len(chapters))
         except ValueError as e:
-            messagebox.showwarning("Сомнительные места", str(e))
+            messagebox.showwarning("Проверка ударений", str(e))
             return
         words = [w for w in re.split(r"[,;\s]+", self.sv_words_var.get()) if w]
         use_corpus = bool(self.sv_corpus_var.get())
-        if not words and not use_corpus:
-            messagebox.showinfo("Сомнительные места", "Включите «расхождения с корпусом» или введите слова.")
+        want_q = {k for k, v in (("name", self.sv_names_var), ("unknown", self.sv_terms_var),
+                                 ("inconsistent", self.sv_unstable_var)) if v.get()}
+        if not words and not use_corpus and not want_q:
+            messagebox.showinfo("Проверка ударений", "Отметьте, что искать, или введите свои слова.")
             return
         skip = {k for k, v in self._sv_state.items() if v.get("status") in ("ok", "fixed")}
         try:
@@ -202,9 +213,26 @@ class StressReviewMixin:
 
         def work():
             try:
-                ms = srv.scan_moments(chapters, only_chapters=only, manual_words=words, use_corpus=use_corpus, skip_keys=skip,
-                                      book_overrides_path=book_over, cancel=cancel,
-                                      progress_cb=lambda m: self._sv_post(lambda m=m: self.sv_status_var.set(m)))
+                prog = lambda m: self._sv_post(lambda m=m: self.sv_status_var.set(m))
+                ms = []
+                if use_corpus or words:
+                    ms += srv.scan_moments(chapters, only_chapters=only, manual_words=words, use_corpus=use_corpus, skip_keys=skip,
+                                           book_overrides_path=book_over, cancel=cancel, progress_cb=prog)
+                if want_q:
+                    import stress_questions as sq
+                    idxs = sorted(only) if only is not None else list(range(len(chapters)))
+                    qs = sq.scan_chapters([chapters[i] for i in idxs], cancel=cancel, skip_words=sq.load_ok_words(), progress_cb=prog)
+                    for q in qs:
+                        if q["kind"] not in want_q:
+                            continue
+                        m = srv.from_question(q)
+                        for o in m["occ"]:              # question contexts count from the first scanned chapter: back to book indexes
+                            o["chapter"] = idxs[o["chapter"]] if 0 <= o["chapter"] < len(idxs) else o["chapter"]
+                        m["chapters"] = sorted({o["chapter"] for o in m["occ"]})
+                        if m["occ"]:
+                            ms.append(m)
+                for n, m in enumerate(ms):
+                    m["id"] = n
                 outcome = ("ok", ms)
             except InterruptedError:
                 outcome = ("cancel", None)
@@ -232,7 +260,7 @@ class StressReviewMixin:
             return
         self._sv_moments = payload
         self._sv_fill()
-        self.sv_status_var.set(f"Найдено мест: {len(payload)}. Выберите слово слева. Расхождение с корпусом — повод послушать, не ошибка.")
+        self.sv_status_var.set(f"Найдено мест: {len(payload)}. Выберите слово слева. Расхождение с корпусом и «нестабильное» — повод послушать, не ошибка.")
 
     # ---- list ----
     def _sv_state_of(self, q):
@@ -246,7 +274,7 @@ class StressReviewMixin:
             st = self._sv_state_of(q)
             if self.sv_hide_done_var.get() and st:
                 continue
-            iid = self.sv_tree.insert("", "end", values=(q["word"], q["reading"], q["count"]), tags=(st,) if st else ())
+            iid = self.sv_tree.insert("", "end", values=(q["word"], q["reading"], srv.KIND_TITLES.get(q["kind"], q["kind"]), q["count"]), tags=(st,) if st else ())
             self._sv_rows[iid] = q
             if keep == q["id"]:
                 self.sv_tree.selection_set(iid)
@@ -261,7 +289,10 @@ class StressReviewMixin:
         self._sv_occ = 0
         self.sv_title.configure(text=f"{q['word']}  →  читается «{q['reading']}»")
         corp = ", ".join(q["corpus"]) or "слова нет в корпусе"
-        self.sv_sub.configure(text=f"корпус: {corp}; всего вхождений: {q['count']}; главы: {', '.join(map(str, q['chapters'][:12]))}")
+        forms = ", ".join(q["group"][1:6])
+        warn = "  ВНИМАНИЕ: слово встречается с разными ударениями (возможно, омограф)." if q["kind"] == "inconsistent" else ""
+        self.sv_sub.configure(text=f"{srv.KIND_TITLES.get(q['kind'], q['kind'])}; корпус: {corp}; вхождений: {q['count']}; "
+                                   f"главы: {', '.join(map(str, q['chapters'][:12]))}" + (f"; формы: {forms}" if forms else "") + warn)
         for w in self.sv_cands.winfo_children():
             w.destroy()
         self.sv_choice_var.set("")
@@ -290,7 +321,7 @@ class StressReviewMixin:
         s = o["sentence"]
         for m in srv.TOK.finditer(s):
             self.sv_ctx.insert("end", s[pos:m.start()])
-            hit = srv.plain(m.group(0)) == q["word"]
+            hit = srv.plain(m.group(0)) == o.get("word", q["word"])
             self.sv_ctx.insert("end", m.group(0), ("hit",) if hit and k == o["idx"] else ())
             if hit:
                 k += 1
@@ -328,7 +359,7 @@ class StressReviewMixin:
         if words is None or wav is None:
             self.sv_status_var.set("Для этой главы нет готового аудио или распознавания: нажмите «Распознать главу».")
             return
-        loc = srv.locate_in_asr(words, o["sentence"], q["word"], o["idx"])
+        loc = srv.locate_in_asr(words, o["sentence"], o.get("word", q["word"]), o["idx"])
         if loc is None:
             self.sv_status_var.set("Не нашёл это место в распознанном тексте главы (ASR ошибся в окружающих словах).")
             return
@@ -344,7 +375,7 @@ class StressReviewMixin:
         if not q:
             return
         if getattr(self, "_worker", None) and self._worker.is_alive():
-            messagebox.showinfo("Сомнительные места", "Идёт озвучка: распознавание использует видеокарту, дождитесь её окончания.")
+            messagebox.showinfo("Проверка ударений", "Идёт озвучка: распознавание использует видеокарту, дождитесь её окончания.")
             return
         import fb2_reader
         root = Path(fb2_reader.__file__).resolve().parent
@@ -384,14 +415,18 @@ class StressReviewMixin:
             return
         o = q["occ"][self._sv_occ]
         if form:
-            if srv.plain(form.replace("+", "")) != q["word"] and form.replace("+", "") != q["raw"]:
+            if srv.plain(form.replace("+", "")) != q["word"]:
                 self.sv_status_var.set("Чтение должно состоять из тех же букв, что и слово.")
                 return
-            text = srv.render_occurrence(o["sentence"], q["word"], form, o["idx"])
+            f_occ = srv.form_for(q, o, form)
+            if not f_occ:
+                self.sv_status_var.set("На падежную форму этого вхождения выбранное ударение не переносится: послушайте другое вхождение.")
+                return
+            text = srv.render_occurrence(o["sentence"], o.get("word", q["word"]), f_occ, o["idx"])
         else:
             text = o["sentence"]
         url = (self.rest_url_var.get().strip() or "http://localhost:5010").rstrip("/")
-        voice = self._sq_voice() if hasattr(self, "_sq_voice") else "xenia"
+        voice = self._sv_voice()
         self.sv_status_var.set(f"Синтезирую: {text}")
 
         def work():
@@ -408,6 +443,12 @@ class StressReviewMixin:
                     f"Не удалось озвучить ({type(e).__name__}). Запущен ли сервис Silero по адресу {url}?"))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _sv_voice(self) -> str:
+        try:
+            return self._silero_voice_keys[self._silero_voice_labels.index(self.voice_var.get())]
+        except Exception:
+            return "xenia"
 
     def _sv_play_bytes(self, data: bytes, what: str):
         try:
@@ -436,6 +477,9 @@ class StressReviewMixin:
         q = self._sv_cur
         if not q:
             return
+        if q.get("question"):                       # names / terms / unstable words: never ask about this word again
+            import stress_questions as sq
+            sq.add_ok_words(q["group"])
         self._sv_save_state(q, "ok")
         self.sv_status_var.set(f"«{q['word']}»: чтение «{q['reading']}» подтверждено, больше не показываю.")
         self._sv_fill()
@@ -471,10 +515,14 @@ class StressReviewMixin:
             except Exception:
                 pass
             if path is None:
-                messagebox.showinfo("Сомнительные места", "Для записи «только здесь» загрузите книгу.")
+                messagebox.showinfo("Проверка ударений", "Для записи «только здесь» загрузите книгу.")
+                return
+            f_occ = srv.form_for(q, o, form)
+            if not f_occ:
+                self.sv_status_var.set("На падежную форму этого вхождения выбранное ударение не переносится: исправьте другое вхождение.")
                 return
             try:
-                key, val = srv.phrase_for_occurrence(o["sentence"], q["word"], form, o["idx"])
+                key, val = srv.phrase_for_occurrence(o["sentence"], o.get("word", q["word"]), f_occ, o["idx"])
             except ValueError as e:
                 self.sv_status_var.set(str(e))
                 return
@@ -485,24 +533,26 @@ class StressReviewMixin:
             try:
                 merge_phrases_into_file(path, {key: val})
             except Exception as e:
-                messagebox.showerror("Сомнительные места", f"Не удалось записать {path}:\n{e}")
+                messagebox.showerror("Проверка ударений", f"Не удалось записать {path}:\n{e}")
                 return
             what = f"фраза «{key}» → «{val}» ({Path(path).name})"
         else:
             if not messagebox.askyesno(
-                    "Сомнительные места",
+                    "Проверка ударений",
                     f"Слово «{q['word']}» будет читаться как «{form}» ВЕЗДЕ, во всех главах и во всех книгах.\n"
                     "Если у слова есть другие чтения (омограф), используйте «только это место». Продолжить?"):
                 return
             import stress_questions as sq
-            prev = self._se_entries.get(q["word"])
-            self._se_entries[q["word"]] = form
-            sq.log_answer(q["word"], form, prev, "stress_review tab (user chose after listening)")
+            forms = sq.answer_forms(q.get("question") or {"group": [q["word"]]}, form) if len(q["group"]) > 1 else {q["word"]: form}
+            for pl, fm in forms.items():
+                prev = self._se_entries.get(pl)
+                self._se_entries[pl] = fm
+                sq.log_answer(pl, fm, prev, "stress check tab (user chose after listening)")
             self._se_mark_dirty()
             if not self._se_save():
                 return
             self._se_fill_list()
-            what = f"словарь: {q['word']} → {form}"
+            what = "словарь: " + ", ".join(forms.values())
         try:
             self._se_flush_caches()
         except Exception:
@@ -511,7 +561,7 @@ class StressReviewMixin:
         chs = ", ".join(map(str, q["chapters"][:15]))
         self.sv_status_var.set(f"Записано: {what}. Затронуты главы: {chs}. Пересинтез — «Re-run Synthesis» на вкладке «Словарь ударений».")
         try:
-            self.log(f"Сомнительные места: {what}")
+            self.log(f"Проверка ударений: {what}")
         except Exception:
             pass
         self._sv_fill()

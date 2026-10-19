@@ -1,4 +1,4 @@
-"""Логика вкладки «Сомнительные места» (без Tk, тестируется отдельно): найти места, где ударение цепочки расходится с независимым
+"""Логика вкладки «Проверка ударений» (без Tk, тестируется отдельно): найти места, где ударение цепочки расходится с независимым
 корпусом (или слова из списка пользователя), показать каждое с контекстом, помочь послушать и либо подтвердить, либо исправить.
 
 Единица работы — «момент»: слово (plain) в конкретном чтении цепочки («земл+и») + все его вхождения в книге.
@@ -121,17 +121,48 @@ def scan_moments(chapters, only_chapters=None, manual_words=(), use_corpus=True,
                 mom = moments.setdefault(key, {
                     "id": 0, "word": pl, "raw": w.lower().replace("+", ""), "reading": w.lower(), "kind": "manual" if is_manual else "diff",
                     "corpus": sorted(corpus.get(pl, ())) if corpus else [], "occ": [], "count": 0, "state": "",
-                    "chapters": set()})
+                    "chapters": set(), "group": [pl]})
                 mom["count"] += 1
                 mom["chapters"].add(i)
                 if len(mom["occ"]) < max_occ:
-                    mom["occ"].append({"chapter": i, "para": pi, "sentence": sent, "idx": k})
+                    mom["occ"].append({"chapter": i, "para": pi, "sentence": sent, "idx": k, "word": pl})
     out = sorted(moments.values(), key=lambda q: (-q["count"], q["word"]))
     for n, q in enumerate(out):
         q["id"] = n
         q["chapters"] = sorted(q["chapters"])
         q["candidates"] = candidates_for(q["raw"], q["reading"])
     return out
+
+
+KIND_TITLES = {"name": "имя", "unknown": "термин", "inconsistent": "нестабильное", "diff": "расхождение", "manual": "своё слово"}
+
+
+def from_question(q: dict) -> dict:
+    """a stress_questions question (name / term / unstable word) as a moment of this module. Question contexts number chapters from 1
+    (list index + 1); moments use the list index, which is what the audio file name and the ASR cache use."""
+    group = list(q.get("group") or [q["word"]])
+    gset = set(group)
+    occ = []
+    for c in q.get("contexts", []):
+        sent = c["sentence"]
+        target = next((plain(t.group(0)) for t in TOK.finditer(sent) if plain(t.group(0)) in gset), None)
+        if target is None:
+            continue
+        idx = 0                                    # the first group token is the target, so it is the 0-th of its own form
+        occ.append({"chapter": int(c["chapter"]) - 1, "para": -1, "sentence": sent, "idx": idx, "word": target})
+    reading = q.get("model_form") or ""
+    return {"id": 0, "word": q["word"], "raw": q["word"], "reading": reading, "kind": q["kind"], "corpus": [], "occ": occ,
+            "count": q["count"], "state": "", "chapters": sorted({o["chapter"] for o in occ}), "group": group,
+            "candidates": list(q["candidates"]), "question": q}
+
+
+def form_for(moment: dict, occ: dict, chosen: str):
+    """the reading to put on THIS occurrence when the user chose `chosen` for the moment's word. For a name group the occurrence may be
+    a case form of the word: the choice spreads to it when the stressed vowel lies in the shared stem (stress_questions.propagate)."""
+    if occ.get("word", moment["word"]) == moment["word"]:
+        return chosen
+    import stress_questions as sq
+    return sq.answer_forms(moment.get("question") or {"group": moment["group"]}, chosen).get(occ["word"])
 
 
 def candidates_for(pl: str, first: "str | None" = None):

@@ -297,8 +297,8 @@ for _end in ("", "а", "у", "ом", "е", "ы", "ов", "ам", "ами", "ах
     check(f"seed: клинкскейлс{_end}", _seed.get("клинкскейлс" + _end) == "кл+инкскейлс" + _end)
 for _end in ("", "а", "у", "ом", "е"):
     check(f"seed: сан-мартин{_end}", _seed.get("сан-мартин" + _end) == "сан-март+ин" + _end)
-check("every seed value has 1..(hyphen parts) '+' and the same letters",
-      all(1 <= v.count("+") <= k.count("-") + 1 and v.replace("+", "").replace("ё", "е") == k.replace("ё", "е")
+check("every seed value has 1..(hyphen parts) '+' (or a stressed «ё») and the same letters",
+      all(1 <= v.count("+") + (v.count("ё") if "+" not in v else 0) <= k.count("-") + 1 and v.replace("+", "").replace("ё", "е") == k.replace("ё", "е")
           for k, v in _seed.items() if not k.startswith("_") and " " not in k))
 _orig_path = fr.DEFAULT_FORCED_STRESS_PATH
 fr.DEFAULT_FORCED_STRESS_PATH = Path("forced_stress_words.json")
