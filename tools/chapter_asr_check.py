@@ -75,19 +75,41 @@ def source_words(title, text):
     return [w for w in (norm(x) for x in (title + "\n" + body).split()) if w]
 
 
-def transcribe(wav, model_name):
+def load_16k(wav):
+    """wav -> mono float32 16 kHz array. faster-whisper's own decoder needs a newer PyAV than the venv has, so decode here."""
+    import numpy as np
+    with wave.open(str(wav)) as w:
+        sr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        raw = w.readframes(w.getnframes())
+    a = np.frombuffer(raw, dtype={1: np.uint8, 2: np.int16, 4: np.int32}[sw]).astype(np.float32)
+    a = (a - 128.0) / 128.0 if sw == 1 else a / float(2 ** (8 * sw - 1))
+    if ch > 1:
+        a = a.reshape(-1, ch).mean(axis=1)
+    if sr % 16000 == 0:                                 # 48000 -> 16000: mean of each group is a crude low-pass
+        k = sr // 16000
+        a = a[: len(a) // k * k].reshape(-1, k).mean(axis=1)
+    elif sr != 16000:
+        a = np.interp(np.arange(0, len(a) / sr, 1 / 16000), np.arange(len(a)) / sr, a).astype(np.float32)
+    return a.astype(np.float32)
+
+
+def transcribe(wav, model_name, chunk_s=300):
+    """Whole chapter in slices of chunk_s seconds (limits peak RAM; word times are shifted back by the slice offset)."""
     from faster_whisper import WhisperModel
+    audio = load_16k(wav)
     try:
         model = WhisperModel(model_name, device="cuda", compute_type="float16")
-        segs, _ = model.transcribe(str(wav), language="ru", word_timestamps=True, temperature=0.0,
-                                   condition_on_previous_text=False, vad_filter=False)
-        return [{"w": w.word.strip(), "s": round(w.start, 2), "e": round(w.end, 2)} for s in segs for w in (s.words or [])]
-    except Exception as e:                              # no CUDA / cuDNN libs: fall back to CPU
+        list(model.transcribe(audio[:32000], language="ru")[0])   # the generator is lazy: consume it so missing CUDA libs fail HERE
+    except Exception as e:                              # no CUDA / cuDNN / cuBLAS libs: fall back to CPU
         print(f"  GPU unavailable ({type(e).__name__}: {str(e)[:80]}), using CPU", file=sys.stderr)
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
-        segs, _ = model.transcribe(str(wav), language="ru", word_timestamps=True, temperature=0.0,
+    out, step = [], chunk_s * 16000
+    for off in range(0, len(audio), step):
+        segs, _ = model.transcribe(audio[off:off + step], language="ru", word_timestamps=True, temperature=0.0,
                                    condition_on_previous_text=False, vad_filter=False)
-        return [{"w": w.word.strip(), "s": round(w.start, 2), "e": round(w.end, 2)} for s in segs for w in (s.words or [])]
+        t0 = off / 16000
+        out += [{"w": w.word.strip(), "s": round(w.start + t0, 2), "e": round(w.end + t0, 2)} for s in segs for w in (s.words or [])]
+    return out
 
 
 def cut_clip(wav, start, end, dst):
