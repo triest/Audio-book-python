@@ -150,7 +150,7 @@ class StressReviewMixin:
                      width=11).pack(side="left")
         ttk.Label(llm, text="Модель (LM Studio/Ollama):").pack(side="left", padx=(8, 2))
         ttk.Entry(llm, textvariable=self.sv_llm_model_var, width=26).pack(side="left")
-        self.sv_llm_btn = ttk.Button(llm, text="Спросить LLM", command=self._sv_ask_llm)
+        self.sv_llm_btn = ttk.Button(llm, text="Спросить LLM (экспериментально)", command=self._sv_ask_llm)
         self.sv_llm_btn.pack(side="left", padx=8)
         ttk.Label(right, textvariable=self.sv_status_var, foreground="#555", wraplength=540,
                   justify="left").pack(side="bottom", anchor="w", pady=(6, 0))
