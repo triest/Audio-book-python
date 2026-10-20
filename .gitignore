@@ -103,3 +103,5 @@ review_list_paste.txt
 .venv_llm/
 llm_models/
 sample_book/
+
+*.stress_prepass.json

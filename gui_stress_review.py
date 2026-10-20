@@ -81,6 +81,7 @@ class StressReviewMixin:
         ttk.Entry(top2, textvariable=self.sv_words_var, width=24).pack(side="left", padx=(4, 10))
         self.sv_scan_btn = ttk.Button(top2, text="Найти", command=self._sv_scan_toggle)
         self.sv_scan_btn.pack(side="left")
+        ttk.Button(top2, text="Сохранённый предпроход", command=self._sv_load_saved).pack(side="left", padx=(6, 0))
         self.check_stress_btn = ttk.Button(top2, text="Показать текст главы с ударениями", command=self.check_ambiguous_stress)
         self.check_stress_btn.pack(side="left", padx=10)
         ttk.Checkbutton(top2, text="скрыть решённые", variable=self.sv_hide_done_var, command=self._sv_fill).pack(side="left")
@@ -186,6 +187,37 @@ class StressReviewMixin:
         return bool(self._sv_thread and self._sv_thread.is_alive())
 
     # ---- search ----
+    def _sv_load_saved(self):
+        """Загружает ранее сохранённый предпроход этой книги (<книга>.stress_prepass.json) без нового сканирования."""
+        if self._sv_running():
+            return
+        bp = getattr(self, "book_path", None)
+        if not bp:
+            messagebox.showwarning("Проверка ударений", "Сначала загрузите книгу на вкладке «Озвучка».")
+            return
+        import stress_prepass as sp
+        data = sp.load_prepass(bp, list(getattr(self, "chapters", None) or []) or None)
+        if data is None:
+            self.sv_status_var.set(f"Сохранённого предпрохода нет: {sp.prepass_path(bp).name}. Нажмите «Найти» с галочкой «ранжирование по признакам».")
+            return
+        import fb2_reader
+        import stress_questions as sq
+        decided = sq.dictionary_words(fb2_reader.DEFAULT_FORCED_STRESS_PATH) | sq.load_ok_words()
+        try:
+            bo = self._se_book_overrides_path()
+            if bo:
+                decided |= sq.dictionary_words(bo)
+        except Exception:
+            pass
+        ms = [m for m in data["moments"] if not all(w in decided for w in m.get("group") or [m["word"]])]
+        for n, m in enumerate(ms):
+            m["id"] = n
+            m["chapters"] = list(m.get("chapters", []))
+        self._sv_moments = ms
+        self._sv_fill()
+        note = (" ВНИМАНИЕ: текст книги изменился с тех пор." if data["stale"] else "") + (" Сканировались не все главы." if data["partial"] else "")
+        self.sv_status_var.set(f"Загружено из {sp.prepass_path(bp).name} ({data['created']}): мест {len(ms)}.{note} Решённые слова скрыты галочкой «скрыть решённые».")
+
     def _sv_scan_toggle(self):
         if self._sv_running():
             self._sv_cancel.set()
@@ -237,8 +269,15 @@ class StressReviewMixin:
                 ms = []
                 if use_prepass:
                     import stress_prepass as sp
-                    ms += sp.scan_prepass(chapters, only_chapters=only, skip_keys=skip, skip_words=__import__('stress_questions').load_ok_words(), book_overrides_path=book_over,
-                                          cancel=cancel, progress_cb=prog)
+                    pre = sp.scan_prepass(chapters, only_chapters=only, skip_keys=skip, skip_words=__import__('stress_questions').load_ok_words(),
+                                          book_overrides_path=book_over, cancel=cancel, progress_cb=prog)
+                    ms += pre
+                    bp = getattr(self, "book_path", None)
+                    if bp:
+                        try:
+                            sp.save_prepass(bp, chapters, pre, only_chapters=only)
+                        except Exception as e:
+                            prog(f"Не удалось сохранить предпроход: {e}")
                 if use_corpus or words:
                     seen = {w for m in ms for w in m["group"]}
                     ms += [m for m in srv.scan_moments(chapters, only_chapters=only, manual_words=words, use_corpus=use_corpus, skip_keys=skip,

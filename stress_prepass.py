@@ -27,10 +27,11 @@ import stress_review as srv
 
 VOWELS = "аеёиоуыэюя"
 LOWCONF_THRESHOLD = 0.9
-WEIGHTS = {"conflict": 3.0, "unstable": 1.0, "name": 1.0, "unknown": 1.5, "ctxdiff": 0.5}
+WEIGHTS = {"conflict": 3.0, "unstable": 1.0, "name": 1.0, "unknown": 1.5, "ctxdiff": 0.5, "conflict_common": 1.5}
 LOWCONF_MAX = 2.0
 MIN_SCORE = 2.5
-SIGNAL_TITLES = {"lowconf": "модель не уверена", "conflict": "расходится с корпусом", "unstable": "разные чтения в книге",
+COMMON_COUNT = 20
+SIGNAL_TITLES = {"lowconf": "модель не уверена", "conflict": "расходится с корпусом", "conflict_common": "частое слово, расходится с корпусом", "unstable": "разные чтения в книге",
                  "name": "имя", "unknown": "нет в словарях", "ctxdiff": "решил контекст"}
 
 
@@ -202,6 +203,9 @@ def scan_prepass(chapters, only_chapters=None, skip_keys=(), skip_words=(), prog
                 if k not in sig or (k == "lowconf" and v > sig[k]):
                     sig[k] = v
         cnt = sum(total[p] for p in members)
+        if "conflict" in sig and cnt >= COMMON_COUNT and not ({"unstable", "name", "unknown"} & set(sig)):
+            sig.pop("conflict")                     # частое слово с одним чтением по всей книге: корпус хранит одно чтение омографа, вес ниже
+            sig["conflict_common"] = True
         score = score_word(sig, cnt)
         if score < min_score:
             continue
@@ -227,3 +231,54 @@ def scan_prepass(chapters, only_chapters=None, skip_keys=(), skip_words=(), prog
 
 def describe_signals(sig: dict) -> str:
     return ", ".join(SIGNAL_TITLES.get(k, k) + (f" ({v})" if k == "lowconf" else "") for k, v in sig.items())
+
+
+# ---- сохранение результатов предпрохода рядом с книгой (<книга>.stress_prepass.json) ----
+PREPASS_VERSION = 1
+
+
+def prepass_path(book_path):
+    from pathlib import Path
+    p = Path(book_path)
+    return p.with_name(p.stem + ".stress_prepass.json")
+
+
+def chapters_hash(chapters) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for title, text in chapters:
+        h.update(str(title).encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(text).encode("utf-8"))
+        h.update(b"\1")
+    return h.hexdigest()[:16]
+
+
+def save_prepass(book_path, chapters, moments, only_chapters=None) -> "Path":
+    """Atomically writes the ranked list next to the book. `only_chapters` (None = whole book) is stored so a partial scan is not mistaken for a full one."""
+    import json
+    import os
+    import time
+    path = prepass_path(book_path)
+    data = {"version": PREPASS_VERSION, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "book_hash": chapters_hash(chapters),
+            "chapters_total": len(chapters), "only_chapters": sorted(only_chapters) if only_chapters is not None else None,
+            "moments": moments}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def load_prepass(book_path, chapters=None):
+    """-> {"moments", "created", "partial", "stale"} or None when there is no readable file. stale = the book text changed since the scan
+    (needs `chapters` to tell); dictionary edits do not make it stale, they only change which words are still open (the GUI hides decided ones)."""
+    import json
+    path = prepass_path(book_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != PREPASS_VERSION or not isinstance(data.get("moments"), list):
+        return None
+    return {"moments": data["moments"], "created": data.get("created", ""), "partial": data.get("only_chapters") is not None,
+            "stale": chapters is not None and data.get("book_hash") != chapters_hash(chapters), "path": str(path)}
