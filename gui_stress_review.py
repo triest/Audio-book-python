@@ -273,7 +273,7 @@ class StressReviewMixin:
                                           book_overrides_path=book_over, cancel=cancel, progress_cb=prog)
                     ms += pre
                     bp = getattr(self, "book_path", None)
-                    if bp:
+                    if bp and (only is None or not sp.prepass_path(bp).exists()):   # частичный поиск не затирает сохранённый полный
                         try:
                             sp.save_prepass(bp, chapters, pre, only_chapters=only)
                         except Exception as e:
