@@ -736,6 +736,54 @@ echo.
 
 :cosyvoice_done
 echo.
+
+rem ===============================================
+rem   Built-in local LLM (llama-cpp-python + Qwen2.5-7B-Instruct GGUF)
+rem   Optional, SEPARATE environment (.venv_llm). Used only by the
+rem   "Ask LLM" button on the stress-review tab - the audiobook
+rem   pipeline itself stays LLM-free. Prebuilt CUDA 12.4 wheel (no
+rem   compiler needed). Failures here are NOT fatal.
+rem ===============================================
+echo.
+echo ===============================================
+echo   Built-in local LLM - optional setup
+echo ===============================================
+set "LLM_PYLAUNCHER="
+for %%V in (3.11 3.12 3.10) do (
+    if not defined LLM_PYLAUNCHER (
+        py -%%V --version >nul 2>nul
+        if not errorlevel 1 set "LLM_PYLAUNCHER=py -%%V"
+    )
+)
+if not defined LLM_PYLAUNCHER (
+    echo WARNING: Python 3.10-3.12 not found - built-in LLM will not be available.
+    goto :llm_done
+)
+if not exist ".venv_llm\Scripts\python.exe" (
+    !LLM_PYLAUNCHER! -m venv .venv_llm
+    if errorlevel 1 (
+        echo WARNING: failed to create .venv_llm - built-in LLM will not be available.
+        goto :llm_done
+    )
+)
+set "LLM_PY=%~dp0.venv_llm\Scripts\python.exe"
+"%LLM_PY%" -m pip install --upgrade pip --quiet
+"%LLM_PY%" -m pip install "llama-cpp-python==0.3.4" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --only-binary=llama-cpp-python
+if errorlevel 1 (
+    echo WARNING: llama-cpp-python CUDA wheel failed to install - built-in LLM will not be available.
+    goto :llm_done
+)
+"%LLM_PY%" -m pip install "nvidia-cuda-runtime-cu12==12.4.*" "nvidia-cublas-cu12==12.4.*" fastapi uvicorn huggingface_hub
+"%LLM_PY%" "%~dp0llm_rest_service.py" --download
+if errorlevel 1 (
+    echo WARNING: failed to download the LLM weights ^(~4.7 GB^) - run install.bat again.
+) else (
+    echo Built-in LLM is ready: the "Ask LLM" button uses it ^(starts on first use, unloads from VRAM when idle^).
+)
+
+:llm_done
+echo.
+
 goto :done
 
 :warn_partial

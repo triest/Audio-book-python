@@ -584,5 +584,17 @@ check("text guard: lost word -> layer input kept", _fr._text_guard("замок �
 check("text guard: changed letters -> layer input kept", _fr._text_guard("замок", "зам+ука", "t") == "замок")
 check("text guard: counter counts only violations", _fr._fallback_stats.get("text_guard", 0) - _st0 == 2)
 
+# ---- stress_llm (кнопка «Спросить LLM») ----
+import stress_llm as _sl
+_q = {"word": "тона", "reading": "тон+а", "candidates": ["тон+а", "т+она"], "occ": [{"sentence": "искренность его т+она была"}]}
+_r = _sl.judge_moment(_q, "lmstudio", "m", chat=lambda p, m, h: '{"answer": 2, "reason": "родительный падеж"}')
+check("stress_llm: picks the numbered variant", _r["form"] == "т+она" and _r["index"] == 2)
+check("stress_llm: 0 means unsure", _sl.judge_moment(_q, "ollama", "m", chat=lambda p, m, h: '{"answer": 0}')["form"] is None)
+check("stress_llm: out-of-range answer -> unsure", _sl.parse_reply('{"answer": 9}', ["a", "b"])["index"] == 0)
+check("stress_llm: tolerant to noise around JSON", _sl.parse_reply('Ответ: {"answer": "1", "reason": "x"} ок', ["a", "b"])["form"] == "a")
+check("stress_llm: prompt hides marks in the sentence and lists variants", "+" not in _sl.build_prompt(_q).split("Примеры из книги:")[1].split("Варианты:")[0] and "2. т+она" in _sl.build_prompt(_q))
+check("stress_llm: builtin backend needs no model name", _sl.judge_moment(_q, "builtin", "", chat=lambda p, m, h: '{"answer": 1}')["form"] == "тон+а")
+check("stress_llm: builtin is the first/default backend", list(_sl.BACKENDS)[0] == "Встроенная" and _sl.BACKENDS["Встроенная"] == "builtin")
+
 print(f"\n{PASSES} passed, {len(FAILS)} failed, {len(KNOWN_LIMITATIONS)} known limitation(s)")
 sys.exit(1 if FAILS else 0)

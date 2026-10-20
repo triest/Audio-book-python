@@ -133,7 +133,7 @@ SETTINGS_FIELDS = [
     "qwen_local_url_var", "qwen_local_start_cmd_var", "qwen_local_auto_stop_var",
     "dialogue_var", "attribution_var", "attribution_provider_var",
     "attribution_api_key_var", "attribution_model_var", "attribution_folder_id_var",
-    "ollama_host_var",
+    "ollama_host_var", "sv_llm_backend_var", "sv_llm_model_var",
     # accentuation pipeline (Oct 2026) + service recycle
     "stress_review_var",
     "strip_mono_var", "recycle_services_var",

@@ -57,6 +57,8 @@ class StressReviewMixin:
         self.sv_choice_var = tk.StringVar(value="")
         self.sv_custom_var = tk.StringVar(value="")
         self.sv_scope_var = tk.StringVar(value="here")
+        self.sv_llm_backend_var = tk.StringVar(value="Встроенная")
+        self.sv_llm_model_var = tk.StringVar(value="")
 
         parent.columnconfigure(0, weight=2, uniform="sv")
         parent.columnconfigure(1, weight=3, uniform="sv")
@@ -141,6 +143,15 @@ class StressReviewMixin:
         ttk.Button(btns, text="Подтвердить (оставить как есть)", command=self._sv_confirm).pack(side="left")
         ttk.Button(btns, text="Исправить", command=self._sv_fix).pack(side="left", padx=6)
         ttk.Button(btns, text="Пропустить", command=lambda: self._sv_next()).pack(side="left")
+        llm = ttk.LabelFrame(right, text="Локальная LLM (необязательно)", padding=6)
+        llm.pack(fill="x", pady=(8, 0))
+        import stress_llm as _sl
+        ttk.Combobox(llm, textvariable=self.sv_llm_backend_var, values=list(_sl.BACKENDS), state="readonly",
+                     width=11).pack(side="left")
+        ttk.Label(llm, text="Модель (LM Studio/Ollama):").pack(side="left", padx=(8, 2))
+        ttk.Entry(llm, textvariable=self.sv_llm_model_var, width=26).pack(side="left")
+        self.sv_llm_btn = ttk.Button(llm, text="Спросить LLM", command=self._sv_ask_llm)
+        self.sv_llm_btn.pack(side="left", padx=8)
         ttk.Label(right, textvariable=self.sv_status_var, foreground="#555", wraplength=540,
                   justify="left").pack(side="bottom", anchor="w", pady=(6, 0))
         import gui_tooltips as _tt
@@ -479,6 +490,47 @@ class StressReviewMixin:
             srv.save_state(self._sv_state)
         except Exception as e:
             self.sv_status_var.set(f"Не удалось сохранить состояние: {e}")
+
+    def _sv_ask_llm(self):
+        """Подсказка локальной LLM (LM Studio / Ollama): выбирает номер варианта; результат подставляется в форму, запись делает пользователь."""
+        q = self._sv_cur
+        if not q:
+            return
+        import stress_llm as sl
+        backend = sl.BACKENDS.get(self.sv_llm_backend_var.get(), "lmstudio")
+        model = self.sv_llm_model_var.get()
+        host = ""
+        try:
+            host = self.ollama_host_var.get().strip()
+        except Exception:
+            pass
+        self.sv_llm_btn.configure(state="disabled")
+        self.sv_progress.start(12)
+        self.sv_status_var.set("Спрашиваю локальную LLM… (первый вопрос: запуск и загрузка модели, до минуты)" if backend == "builtin" else "Спрашиваю локальную LLM…")
+
+        def work():
+            try:
+                r = sl.judge_moment(q, backend, model, host)
+                err = None
+            except Exception as e:
+                r, err = None, f"{type(e).__name__}: {e}"
+
+            def done():
+                self.sv_progress.stop()
+                self.sv_llm_btn.configure(state="normal")
+                if self._sv_cur is not q:
+                    return
+                if err:
+                    self.sv_status_var.set(f"LLM недоступна: {err[:300]} ")
+                elif not r["form"]:
+                    self.sv_status_var.set("LLM не уверена" + (f": {r['reason']}" if r["reason"] else ".") + " Решайте на слух.")
+                else:
+                    self.sv_choice_var.set(r["form"])
+                    same = " (совпадает с текущим чтением)" if r["form"] == q["reading"] else ""
+                    self.sv_status_var.set(f"LLM предлагает «{r['form']}»{same}. {r['reason']} Это подсказка, проверьте на слух.")
+            self._sv_post(done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _sv_confirm(self):
         q = self._sv_cur
