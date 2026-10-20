@@ -868,6 +868,9 @@ class UIBuilderMixin:
         self._build_voices_tab(voices_tab)
         self._build_stress_editor_tab(stress_tab)
         self._build_stress_review_tab(review_tab)
+        import gui_tooltips as _tt
+        _tt.tip_tabs(self.notebook, _tt.MAIN_TAB_TIPS)
+
     def _build_voices_tab(self, tab: ttk.Frame):
         """Отдельная вкладка «Голоса CosyVoice»: список уже сохранённых
         профилей голоса (они хранятся на самом сервисе CosyVoice REST, в

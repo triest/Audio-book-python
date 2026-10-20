@@ -143,6 +143,13 @@ class StressReviewMixin:
         ttk.Button(btns, text="Пропустить", command=lambda: self._sv_next()).pack(side="left")
         ttk.Label(right, textvariable=self.sv_status_var, foreground="#555", wraplength=540,
                   justify="left").pack(side="bottom", anchor="w", pady=(6, 0))
+        import gui_tooltips as _tt
+        _tt.apply_tips(parent, _tt.REVIEW_TIPS)
+        _tt.add_help_button(top, side="right", padx=(0, 8))
+        _tt.add_tip(self.sv_tree, _tt.REVIEW_BLOCK_TIPS["tree"])
+        _tt.add_tip(self.sv_ctx, _tt.REVIEW_BLOCK_TIPS["ctx"])
+        _tt.add_tip(self.sv_cands, _tt.REVIEW_BLOCK_TIPS["cands"])
+        _tt.tip_headings(self.sv_tree, _tt.REVIEW_HEADINGS)
         self._sv_poll()
 
     # ---- main-thread queue ----
