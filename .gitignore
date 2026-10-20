@@ -98,3 +98,8 @@ review_list_paste.txt
 # Книги (авторское право) — не для публичного репозитория.
 *.fb2
 .claude/settings.local.json
+
+# built-in local LLM (install.bat): venv and GGUF weights
+.venv_llm/
+llm_models/
+sample_book/

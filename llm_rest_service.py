@@ -26,7 +26,7 @@ MODEL_FILE = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.environ.get("LLM_MODEL_PATH") or ROOT / "llm_models" / MODEL_FILE)
 GPU_LAYERS = int(os.environ.get("LLM_GPU_LAYERS", "-1"))
-N_CTX = int(os.environ.get("LLM_CTX", "4096"))
+N_CTX = int(os.environ.get("LLM_CTX", "6144"))
 IDLE_SECONDS = float(os.environ.get("LLM_IDLE_SECONDS", "120"))
 
 _llm = None

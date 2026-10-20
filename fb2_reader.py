@@ -684,6 +684,14 @@ ATTRIBUTION_PROVIDERS = {
                      "иностранная карта — из России оплатить напрямую обычно нельзя).",
     },
 }
+# Встроенная локальная LLM (llm_rest_service.py в .venv_llm, ставит install.bat): работает полностью локально, поэтому
+# разрешена и при LLM_FEATURES_ENABLED=0 (см. _llm_provider_allowed). Нужна для --smart-emotion --attribution-provider builtin.
+ATTRIBUTION_PROVIDERS["builtin"] = {
+    "title": "Встроенная локальная LLM (Qwen2.5-7B, без ключа и облака)",
+    "default_model": "builtin",
+    "key_hint": "Ключ не нужен: сервис llm_rest_service.py стартует сам (install.bat ставит .venv_llm и модель ~4.7 ГБ). "
+                 "Нужна свободная видеопамять (~6 ГБ).",
+}
 DEFAULT_ATTRIBUTION_PROVIDER = "yandexgpt"
 DEFAULT_ATTRIBUTION_MODEL = ATTRIBUTION_PROVIDERS[DEFAULT_ATTRIBUTION_PROVIDER]["default_model"]
 
@@ -1244,12 +1252,32 @@ def ensure_local_llm(backend: str, model: str, host: str = "", log_fn=None, forc
         return False
 
 
+def _llm_provider_allowed(provider) -> bool:
+    """LLM-функции выключены глобально (LLM_FEATURES_ENABLED=0), кроме ВСТРОЕННОЙ локальной модели."""
+    return LLM_FEATURES_ENABLED or provider == "builtin"
+
+
+def _builtin_chat_request(prompt: str, max_tokens: "int | None" = None) -> str:
+    import requests
+    import stress_llm
+    stress_llm.ensure_builtin_service()
+    r = requests.post(stress_llm.BUILTIN_URL + "/v1/chat/completions", timeout=900,
+                      json={"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens or 300,
+                            "temperature": 0.0})
+    if r.status_code >= 400:
+        raise RuntimeError(f"встроенная LLM: HTTP {r.status_code}: {r.text[:300]}")
+    return r.json()["choices"][0]["message"]["content"]
+
+
 def _local_chat_request(prompt: str, model: str, host: str = "", backend: str = "ollama",
                          log_fn=None, max_tokens: "int | None" = None, api_key: str = "") -> str:
     """Единая точка для локальных LLM-серверов: 'ollama' или 'lmstudio'.
     Перед запросом автоматически поднимает сервер/модель (ensure_local_llm);
     при отказе соединения или 'модель не найдена' — один повтор после
     принудительного перезапуска."""
+    if backend == "builtin":
+        return _builtin_chat_request(prompt, max_tokens=max_tokens)
+
     def _once():
         if backend == "lmstudio":
             return _lmstudio_chat_request(prompt, model, host=host, log_fn=log_fn, max_tokens=max_tokens)
@@ -1594,7 +1622,7 @@ def classify_paragraph_emotions_llm(paragraphs, allowed_emotions, api_key, model
                                                        folder_id=folder_id, log_fn=log_fn)
     if provider == "anthropic":
         return classify_paragraph_emotions_anthropic(paragraphs, api_key, model, allowed_emotions, log_fn=log_fn)
-    if provider in ("ollama", "lmstudio"):
+    if provider in ("ollama", "lmstudio", "builtin"):
         return classify_paragraph_emotions_ollama(paragraphs, model, allowed_emotions,
                                                     host=ollama_host, log_fn=log_fn, backend=provider,
                                                     api_key=api_key)
@@ -5661,7 +5689,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         run_stress_review_for_chapter(text, stress_dict, title)
 
         _chapter_para_prosody = {}
-        if smart_emotion and LLM_FEATURES_ENABLED:
+        if smart_emotion and _llm_provider_allowed(((emotion_attribution if emotion_attribution is not None else attribution) or {}).get("provider")):
             chapter_paras = [p for p in text.split("\n") if p.strip()]
             _emo_creds = emotion_attribution if emotion_attribution is not None else attribution
             try:
@@ -6831,7 +6859,7 @@ def main():
         "api_key": attribution_api_key, "model": attribution_model,
         "provider": attribution_provider, "folder_id": attribution_folder_id,
         "ollama_host": args.ollama_host,
-    } if (attribution_api_key or attribution_provider in ("ollama", "lmstudio")) else None
+    } if (attribution_api_key or attribution_provider in ("ollama", "lmstudio", "builtin")) else None
 
     if args.mode == "online":
         run_online(chapters, args.outdir, args.play, args.start, voice_lang="ru",

@@ -595,6 +595,14 @@ check("stress_llm: tolerant to noise around JSON", _sl.parse_reply('Ответ: 
 check("stress_llm: prompt hides marks in the sentence and lists variants", "+" not in _sl.build_prompt(_q).split("Примеры из книги:")[1].split("Варианты:")[0] and "2. т+она" in _sl.build_prompt(_q))
 check("stress_llm: builtin backend needs no model name", _sl.judge_moment(_q, "builtin", "", chat=lambda p, m, h: '{"answer": 1}')["form"] == "тон+а")
 check("stress_llm: builtin is the first/default backend", list(_sl.BACKENDS)[0] == "Встроенная" and _sl.BACKENDS["Встроенная"] == "builtin")
+# ---- встроенная LLM как провайдер умной эмоции (--smart-emotion --attribution-provider builtin) ----
+_orig_b = _fr._builtin_chat_request
+_fr._builtin_chat_request = lambda prompt, max_tokens=None: '{"1": "joy", "2": "sadness", "3": "neutral"}'
+_emo = _fr.classify_paragraph_emotions_llm(["a", "b", "c"], list(_fr.SILERO_EMOTION_PROSODY), "", model="builtin", provider="builtin")
+_fr._builtin_chat_request = _orig_b
+check("builtin LLM: smart-emotion labels via the built-in provider", _emo == ["joy", "sadness", "neutral"], str(_emo))
+check("builtin LLM: allowed even when LLM features are globally off", _fr._llm_provider_allowed("builtin") and (_fr.LLM_FEATURES_ENABLED or not _fr._llm_provider_allowed("anthropic")))
+check("builtin LLM: provider is registered with a default model", _fr.ATTRIBUTION_PROVIDERS["builtin"]["default_model"] == "builtin")
 
 print(f"\n{PASSES} passed, {len(FAILS)} failed, {len(KNOWN_LIMITATIONS)} known limitation(s)")
 sys.exit(1 if FAILS else 0)
