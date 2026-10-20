@@ -604,5 +604,15 @@ check("builtin LLM: smart-emotion labels via the built-in provider", _emo == ["j
 check("builtin LLM: allowed even when LLM features are globally off", _fr._llm_provider_allowed("builtin") and (_fr.LLM_FEATURES_ENABLED or not _fr._llm_provider_allowed("anthropic")))
 check("builtin LLM: provider is registered with a default model", _fr.ATTRIBUTION_PROVIDERS["builtin"]["default_model"] == "builtin")
 
+# ---- предпроход с ранжированием (stress_prepass) ----
+import stress_prepass as _sp
+check("prepass: stressed_vowel_index", _sp.stressed_vowel_index("з+амок") == 0 and _sp.stressed_vowel_index("зам+ок") == 1 and _sp.stressed_vowel_index("вс+ё") == 0 and _sp.stressed_vowel_index("замок") is None)
+check("prepass: lowconf weight is zero for confident words, strongest below 0.5", _sp.lowconf_weight(0.99) == 0 and _sp.lowconf_weight(0.95) == 0 and 0 < _sp.lowconf_weight(0.7) < _sp.lowconf_weight(0.3))
+check("prepass: more signals and more occurrences rank higher", _sp.score_word({"conflict": True, "name": True}, 1) > _sp.score_word({"conflict": True}, 1) and _sp.score_word({"conflict": True}, 9) > _sp.score_word({"conflict": True}, 1))
+_conf = _sp.word_confidence(["замок", "кряжей", "рассказал"])
+check("prepass: word_confidence returns probability and vowel index per word", all(0.0 <= v[0] <= 1.0 for v in _conf.values()) and set(_conf) == {"замок", "кряжей", "рассказал"})
+_pm = _sp.scan_prepass([("t", "Мы видели Робардса. Робардс молчал. Он взял замок и пошёл к реке.")], min_score=0.01)
+check("prepass: moments are sorted by score and carry signals", all(_pm[i]["score"] >= _pm[i + 1]["score"] for i in range(len(_pm) - 1)) and all(m["kind"] == "prepass" and m["signals"] and m["candidates"] for m in _pm))
+
 print(f"\n{PASSES} passed, {len(FAILS)} failed, {len(KNOWN_LIMITATIONS)} known limitation(s)")
 sys.exit(1 if FAILS else 0)

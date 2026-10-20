@@ -49,6 +49,7 @@ class StressReviewMixin:
         self.sv_status_var = tk.StringVar(value="Загрузите книгу на вкладке «Озвучка», отметьте, что искать, и нажмите «Найти».")
         self.sv_chapters_var = tk.StringVar(value="")
         self.sv_words_var = tk.StringVar(value="")
+        self.sv_prepass_var = tk.BooleanVar(value=True)
         self.sv_corpus_var = tk.BooleanVar(value=True)
         self.sv_names_var = tk.BooleanVar(value=True)
         self.sv_terms_var = tk.BooleanVar(value=True)
@@ -67,7 +68,7 @@ class StressReviewMixin:
         top = ttk.Frame(parent)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
         ttk.Label(top, text="Искать:").pack(side="left")
-        for text, var in (("имена", self.sv_names_var), ("термины", self.sv_terms_var),
+        for text, var in (("ранжирование по признакам", self.sv_prepass_var), ("имена", self.sv_names_var), ("термины", self.sv_terms_var),
                           ("нестабильные слова", self.sv_unstable_var), ("расхождения с корпусом", self.sv_corpus_var)):
             ttk.Checkbutton(top, text=text, variable=var).pack(side="left", padx=(8, 0))
         self.sv_progress = ttk.Progressbar(top, mode="indeterminate", length=90)
@@ -86,8 +87,8 @@ class StressReviewMixin:
 
         left = ttk.Frame(parent)
         left.grid(row=2, column=0, sticky="nsew", padx=(8, 4), pady=8)
-        self.sv_tree = ttk.Treeview(left, columns=("word", "reading", "kind", "count"), show="headings", selectmode="browse")
-        for col, text, w, anchor, stretch in (("word", "Слово", 110, "w", True), ("reading", "Сейчас", 110, "w", True),
+        self.sv_tree = ttk.Treeview(left, columns=("score", "word", "reading", "kind", "count"), show="headings", selectmode="browse")
+        for col, text, w, anchor, stretch in (("score", "Балл", 44, "center", False), ("word", "Слово", 110, "w", True), ("reading", "Сейчас", 110, "w", True),
                                               ("kind", "Тип", 90, "w", False), ("count", "Раз", 44, "center", False)):
             self.sv_tree.heading(col, text=text)
             self.sv_tree.column(col, width=w, anchor=anchor, stretch=stretch)
@@ -208,9 +209,10 @@ class StressReviewMixin:
             return
         words = [w for w in re.split(r"[,;\s]+", self.sv_words_var.get()) if w]
         use_corpus = bool(self.sv_corpus_var.get())
+        use_prepass = bool(self.sv_prepass_var.get())
         want_q = {k for k, v in (("name", self.sv_names_var), ("unknown", self.sv_terms_var),
                                  ("inconsistent", self.sv_unstable_var)) if v.get()}
-        if not words and not use_corpus and not want_q:
+        if not words and not use_corpus and not want_q and not use_prepass:
             messagebox.showinfo("Проверка ударений", "Отметьте, что искать, или введите свои слова.")
             return
         skip = {k for k, v in self._sv_state.items() if v.get("status") in ("ok", "fixed")}
@@ -233,9 +235,15 @@ class StressReviewMixin:
             try:
                 prog = lambda m: self._sv_post(lambda m=m: self.sv_status_var.set(m))
                 ms = []
+                if use_prepass:
+                    import stress_prepass as sp
+                    ms += sp.scan_prepass(chapters, only_chapters=only, skip_keys=skip, skip_words=__import__('stress_questions').load_ok_words(), book_overrides_path=book_over,
+                                          cancel=cancel, progress_cb=prog)
                 if use_corpus or words:
-                    ms += srv.scan_moments(chapters, only_chapters=only, manual_words=words, use_corpus=use_corpus, skip_keys=skip,
-                                           book_overrides_path=book_over, cancel=cancel, progress_cb=prog)
+                    seen = {w for m in ms for w in m["group"]}
+                    ms += [m for m in srv.scan_moments(chapters, only_chapters=only, manual_words=words, use_corpus=use_corpus, skip_keys=skip,
+                                                       book_overrides_path=book_over, cancel=cancel, progress_cb=prog)
+                           if m["word"] not in seen or m["kind"] == "manual"]
                 if want_q:
                     import stress_questions as sq
                     idxs = sorted(only) if only is not None else list(range(len(chapters)))
@@ -243,6 +251,8 @@ class StressReviewMixin:
                     for q in qs:
                         if q["kind"] not in want_q:
                             continue
+                        if any(w in {x for pm in ms for x in pm["group"]} for w in q["group"]):
+                            continue                    # уже в списке предпрохода (с баллом)
                         m = srv.from_question(q)
                         for o in m["occ"]:              # question contexts count from the first scanned chapter: back to book indexes
                             o["chapter"] = idxs[o["chapter"]] if 0 <= o["chapter"] < len(idxs) else o["chapter"]
@@ -292,7 +302,7 @@ class StressReviewMixin:
             st = self._sv_state_of(q)
             if self.sv_hide_done_var.get() and st:
                 continue
-            iid = self.sv_tree.insert("", "end", values=(q["word"], q["reading"], srv.KIND_TITLES.get(q["kind"], q["kind"]), q["count"]), tags=(st,) if st else ())
+            iid = self.sv_tree.insert("", "end", values=(q.get("score", ""), q["word"], q["reading"], srv.KIND_TITLES.get(q["kind"], q["kind"]), q["count"]), tags=(st,) if st else ())
             self._sv_rows[iid] = q
             if keep == q["id"]:
                 self.sv_tree.selection_set(iid)
@@ -309,6 +319,9 @@ class StressReviewMixin:
         corp = ", ".join(q["corpus"]) or "слова нет в корпусе"
         forms = ", ".join(q["group"][1:6])
         warn = "  ВНИМАНИЕ: слово встречается с разными ударениями (возможно, омограф)." if q["kind"] == "inconsistent" else ""
+        if q.get("signals"):
+            import stress_prepass as _sp
+            warn += f"  Признаки: {_sp.describe_signals(q['signals'])}; балл {q['score']}."
         self.sv_sub.configure(text=f"{srv.KIND_TITLES.get(q['kind'], q['kind'])}; корпус: {corp}; вхождений: {q['count']}; "
                                    f"главы: {', '.join(map(str, q['chapters'][:12]))}" + (f"; формы: {forms}" if forms else "") + warn)
         for w in self.sv_cands.winfo_children():

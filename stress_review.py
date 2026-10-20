@@ -134,7 +134,7 @@ def scan_moments(chapters, only_chapters=None, manual_words=(), use_corpus=True,
     return out
 
 
-KIND_TITLES = {"name": "имя", "unknown": "термин", "inconsistent": "нестабильное", "diff": "расхождение", "manual": "своё слово"}
+KIND_TITLES = {"name": "имя", "unknown": "термин", "inconsistent": "нестабильное", "diff": "расхождение", "manual": "своё слово", "prepass": "по признакам"}
 
 
 def from_question(q: dict) -> dict:
