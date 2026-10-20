@@ -175,6 +175,21 @@ def _strip_monosyllable_stress(text: str) -> str:
             return w
         if plain.lower() in _MONO_KEEP_STRESS:
             return w
+        # метка в дефисном слове с единственной «+» («Сен-Ж+юст»): «ж+юст» не односложное слово; «в+о-втор+ых», «п+о-насто+ящему» метку теряют, как раньше
+        s, e = m.start(), m.end()
+        full = m.string
+        while s > 1 and full[s - 1] == "-" and (full[s - 2].isalpha() or full[s - 2] == "+"):
+            s -= 1
+            while s > 0 and (full[s - 1].isalpha() or full[s - 1] == "+"):
+                s -= 1
+        while e < len(full) - 1 and full[e] == "-" and (full[e + 1].isalpha() or full[e + 1] == "+"):
+            e += 1
+            while e < len(full) and (full[e].isalpha() or full[e] == "+"):
+                e += 1
+        compound_raw = full[s:e]
+        compound = compound_raw.replace("+", "")
+        if compound_raw.count("+") == 1 and len(re.findall(r"[аеёиоуыэюяАЕЁИОУЫЭЮЯ]", compound)) > 1:
+            return w
         if len(re.findall(r"[аеёиоуыэюяАЕЁИОУЫЭЮЯ]", plain)) <= 1:
             return plain
         return w
