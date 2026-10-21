@@ -1178,6 +1178,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                 text=f"Глава {chapter_pos}/{chapters_total} · фрагмент {fragment_done}/{fragments_total} "
                      f"· {percent:.0f}%"
             )
+            self.ac_on_synthesis_progress(chapter_pos, chapters_total, fragment_done, fragments_total)
 
         self.after(0, update)
 

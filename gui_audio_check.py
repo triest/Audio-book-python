@@ -299,7 +299,52 @@ class AudioCheckMixin:
         self._on_chapters_selection_change()
         self.log(f"Проверка звука: пересинтез глав {indices} с автопочинкой.")
         self.notebook.select(0)
+        self._ac_resynth_chapters = list(indices)
+        self._ac_resynth_t0 = time.monotonic()
+        self._ac_resynth_on = True
+        self._ac_bar.stop()
+        self._ac_bar.configure(mode="determinate", maximum=1000, value=0)
+        self._ac_progress.set(f"Пересинтез глав: {', '.join(map(str, indices[:12]))}{'…' if len(indices) > 12 else ''}")
+        self._ac_stats.set("подготовка…")
         self.start_synthesis()
+        self.after(1000, self._ac_resynth_watch)
+
+    def ac_on_synthesis_progress(self, chapter_pos, chapters_total, fragment_done, fragments_total):
+        """Called (main thread) by the synthesis progress callback: mirrors it into the sound-check window during a resynthesis."""
+        if not getattr(self, "_ac_resynth_on", False):
+            return
+        try:
+            if not self._ac_win.winfo_exists():
+                return
+            chapters_total, fragments_total = max(1, chapters_total), max(1, fragments_total)
+            fraction = min(1.0, max(0.0, ((chapter_pos - 1) + fragment_done / fragments_total) / chapters_total))
+            el = time.monotonic() - self._ac_resynth_t0
+            eta = f", осталось ~{format_time(el / fraction * (1 - fraction))}" if fraction > 0.02 else ""
+            done = chapter_pos - 1
+            self._ac_bar.configure(value=fraction * 1000)
+            self._ac_stats.set(f"глава {chapter_pos}/{chapters_total} · фрагмент {fragment_done}/{fragments_total} · "
+                               f"{fraction * 100:.0f}% · прошло {format_time(el)}{eta}")
+            self._ac_progress.set(f"Пересинтез: глава {chapter_pos} из {chapters_total} "
+                                  f"(готово глав: {done}). Прогресс виден и на вкладке «Озвучка».")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ac_resynth_watch(self):
+        """Ends the resynthesis display when the synthesis thread has finished."""
+        if not getattr(self, "_ac_resynth_on", False):
+            return
+        if getattr(self, "_worker", None) and self._worker.is_alive():
+            self.after(1000, self._ac_resynth_watch)
+            return
+        self._ac_resynth_on = False
+        try:
+            if self._ac_win.winfo_exists():
+                el = time.monotonic() - self._ac_resynth_t0
+                self._ac_bar.configure(value=1000)
+                self._ac_stats.set(f"пересинтез завершён за {format_time(el)}")
+                self._ac_progress.set("Пересинтез завершён. Нажмите «Проверить», чтобы убедиться, что дефекты ушли.")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _ac_export(self):
         if not self._ac_rows:
