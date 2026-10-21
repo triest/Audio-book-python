@@ -5411,6 +5411,25 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
     return chunks or [text]
 
 
+def _prosody_for_line(line: str, prosody_by_para: dict):
+    """Эмоция для строки куска. Абзац длиннее max_len режется по предложениям
+    (_split_paragraphs_for_ssml), и строка куска — лишь часть абзаца, ключа
+    prosody_by_para (полный текст абзаца) в таком виде нет: ищем абзац,
+    содержащий строку (с точностью до пробелов)."""
+    if not prosody_by_para:
+        return None
+    hit = prosody_by_para.get(line)
+    if hit is not None or line in prosody_by_para:
+        return hit
+    norm = " ".join(line.split())
+    if not norm:
+        return None
+    for para, pr in prosody_by_para.items():
+        if len(para) > len(line) and norm in " ".join(para.split()):
+            return pr
+    return None
+
+
 def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rate: int,
                      play: bool, rest_url: str, sentence_break_ms: int, paragraph_break_ms: int,
                      comma_break_ms: int, emphasize: bool = True, max_len: int = 700,
@@ -5582,7 +5601,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         para_prosody_list = None
         if _chapter_para_prosody:
             plain_paras = [p for p in plain_text_chunk.split("\n") if p.strip()]
-            para_prosody_list = [_chapter_para_prosody.get(p) for p in plain_paras]
+            para_prosody_list = [_prosody_for_line(p, _chapter_para_prosody) for p in plain_paras]
         ssml = text_to_ssml(
             _accented_text_for_rest(plain_text_chunk),
             sentence_break_ms=sentence_break_ms,

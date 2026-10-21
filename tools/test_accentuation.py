@@ -584,6 +584,20 @@ check("text guard: lost word -> layer input kept", _fr._text_guard("замок �
 check("text guard: changed letters -> layer input kept", _fr._text_guard("замок", "зам+ука", "t") == "замок")
 check("text guard: counter counts only violations", _fr._fallback_stats.get("text_guard", 0) - _st0 == 2)
 
+# --- smart-emotion: a piece of a long paragraph (split by _split_paragraphs_for_ssml) keeps the paragraph's emotion ---
+_long_para = " ".join(f"Предложение номер {i} рассказывает о грустном вечере." for i in range(40))
+_short_para = "Короткий абзац."
+_pm = {_long_para: {"rate": "90%", "pitch": "-5%"}, _short_para: {"rate": "110%", "pitch": "+5%"}}
+_pieces = _fr._split_paragraphs_for_ssml(_long_para + "\n" + _short_para, 700)
+check("emotion: long paragraph really is split", len(_pieces) > 1)
+_lines = [ln for pc in _pieces for ln in pc.split("\n") if ln.strip()]
+_got = [_fr._prosody_for_line(ln, _pm) for ln in _lines]
+check("emotion: every piece of the long paragraph gets its emotion",
+      all(g == _pm[_long_para] for g in _got[:-1]) and _got[-1] == _pm[_short_para], str(_got))
+check("emotion: exact paragraph still matches", _fr._prosody_for_line(_short_para, _pm) == _pm[_short_para])
+check("emotion: unknown text -> None", _fr._prosody_for_line("Совсем другой текст", _pm) is None)
+check("emotion: empty map -> None", _fr._prosody_for_line(_short_para, {}) is None)
+
 # ---- stress_llm (кнопка «Спросить LLM») ----
 import stress_llm as _sl
 _q = {"word": "тона", "reading": "тон+а", "candidates": ["тон+а", "т+она"], "occ": [{"sentence": "искренность его т+она была"}]}
