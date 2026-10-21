@@ -91,11 +91,13 @@ kseniya (жен.), xenia (жен.), eugene (муж.), random (только v4_ru
 """
 
 import argparse
+import collections
 import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import zipfile
 from pathlib import Path
 
@@ -418,16 +420,112 @@ except ImportError:
 _NUMBER_RE = re.compile(r"(?P<neg>(?<![\w-])-)?(?P<num>\d+(?:[.,]\d+)?)(?P<hy>-(?=[^\W\d_]))?")
 
 
+# Порядковые числительные цифрами с суффиксом: "5-го", "1909-й", "5019-м батальоном". Без этого после замены числа суффикс оставался
+# отдельными буквами ("пять го", "…девятнадцать м") и Silero читал их как буквы ("пять ве", "…девятнадцать эм").
+# stem -> (основа порядкового, тип): "oy" — ударение на окончании (второй, шестой), "soft" — третий, иначе "ый".
+_ORD_STEMS_RU = {
+    "один": ("перв", "yi"), "одна": ("перв", "yi"), "одно": ("перв", "yi"), "одну": ("перв", "yi"),
+    "два": ("втор", "oy"), "две": ("втор", "oy"), "три": ("трет", "soft"), "четыре": ("четвёрт", "yi"),
+    "пять": ("пят", "yi"), "шесть": ("шест", "oy"), "семь": ("седьм", "oy"), "восемь": ("восьм", "oy"),
+    "девять": ("девят", "yi"), "десять": ("десят", "yi"), "одиннадцать": ("одиннадцат", "yi"),
+    "двенадцать": ("двенадцат", "yi"), "тринадцать": ("тринадцат", "yi"), "четырнадцать": ("четырнадцат", "yi"),
+    "пятнадцать": ("пятнадцат", "yi"), "шестнадцать": ("шестнадцат", "yi"), "семнадцать": ("семнадцат", "yi"),
+    "восемнадцать": ("восемнадцат", "yi"), "девятнадцать": ("девятнадцат", "yi"), "двадцать": ("двадцат", "yi"),
+    "тридцать": ("тридцат", "yi"), "сорок": ("сороков", "oy"), "пятьдесят": ("пятидесят", "yi"),
+    "шестьдесят": ("шестидесят", "yi"), "семьдесят": ("семидесят", "yi"), "восемьдесят": ("восьмидесят", "yi"),
+    "девяносто": ("девяност", "yi"), "сто": ("сот", "yi"), "двести": ("двухсот", "yi"), "триста": ("трёхсот", "yi"),
+    "четыреста": ("четырёхсот", "yi"), "пятьсот": ("пятисот", "yi"), "шестьсот": ("шестисот", "yi"),
+    "семьсот": ("семисот", "yi"), "восемьсот": ("восьмисот", "yi"), "девятьсот": ("девятисот", "yi"),
+}
+# падеж по суффиксу -> (hard, soft "третий"); "м" разбирается отдельно (творительный -ым / предложный -ом)
+_ORD_ENDINGS_RU = {
+    "nom_m": ("ый", "ий"), "nom_f": ("ая", "ья"), "nom_n": ("ое", "ье"), "nom_pl": ("ые", "ьи"),
+    "gen": ("ого", "ьего"), "dat": ("ому", "ьему"), "instr": ("ым", "ьим"), "prep": ("ом", "ьем"),
+    "acc_f": ("ую", "ью"), "obl_f": ("ой", "ьей"), "gen_pl": ("ых", "ьих"), "instr_pl": ("ыми", "ьими"),
+}
+_ORD_SUFFIX_CLASS_RU = {
+    "й": "nom_m", "ый": "nom_m", "ий": "nom_m", "я": "nom_f", "ая": "nom_f", "яя": "nom_f",
+    "е": "nom_n", "ое": "nom_n", "ее": "nom_n", "ые": "nom_pl", "ие": "nom_pl",
+    "го": "gen", "ого": "gen", "его": "gen", "му": "dat", "ому": "dat", "ему": "dat",
+    "ым": "instr", "им": "instr", "ом": "prep", "ем": "prep", "ю": "acc_f", "ую": "acc_f", "юю": "acc_f",
+    "ой": "obl_f", "ей": "obl_f", "х": "gen_pl", "ых": "gen_pl", "их": "gen_pl",
+    "ми": "instr_pl", "ыми": "instr_pl", "ими": "instr_pl", "м": "m_ambiguous",
+}
+_ORD_NUMBER_RE = re.compile(
+    r"(?<![\w,.\-])(\d+)-(" + "|".join(sorted(_ORD_SUFFIX_CLASS_RU, key=len, reverse=True)) + r")(?![\w\-])")
+_ORD_THOUSANDS_PREFIX_RU = {1: "одно", 2: "двух", 3: "трёх", 4: "четырёх", 5: "пяти", 6: "шести", 7: "семи", 8: "восьми",
+                            9: "девяти", 10: "десяти", 20: "двадцати", 30: "тридцати", 40: "сорока", 50: "пятидесяти"}
+_PREPOSITIONS_PREP_RU = {"в", "во", "на", "о", "об", "обо", "при", "по"}
+
+
+def _ordinal_words_ru(number: int, suffix: str, prev_word: str = "", next_word: str = "") -> "str | None":
+    """5, 'го' -> 'пятого'; 1909, 'й' -> 'одна тысяча девятьсот девятый'; 5019, 'м' (+ 'батальоном') -> 'пять тысяч девятнадцатым'.
+    None, если форму построить нельзя (тогда остаётся прежнее поведение)."""
+    cls = _ORD_SUFFIX_CLASS_RU.get(suffix)
+    if cls is None or number <= 0 or num2words is None:
+        return None
+    if cls == "m_ambiguous":
+        nw = next_word.lower()
+        if nw.endswith(("ом", "ем", "ём", "ым", "им")):
+            cls = "instr"
+        elif prev_word.lower() in _PREPOSITIONS_PREP_RU or nw.endswith("е"):
+            cls = "prep"
+        else:
+            cls = "instr"
+    if suffix == "е" and next_word.lower().endswith(("ы", "и")):
+        cls = "nom_pl"            # "в 1990-е годы" -> девяностые, "5-е сутки" is rare; a bare "-е" is neuter otherwise
+    try:
+        words = num2words(number, lang="ru").split()
+    except Exception:
+        return None
+    if number % 1000 == 0 and number < 1_000_000:
+        prefix = _ORD_THOUSANDS_PREFIX_RU.get(number // 1000)
+        if prefix is None:
+            return None
+        stem, kind, head = prefix + "тысячн", "yi", []
+    else:
+        info = _ORD_STEMS_RU.get(words[-1])
+        if info is None:
+            return None
+        (stem, kind), head = info, words[:-1]
+    hard, soft = _ORD_ENDINGS_RU[cls]
+    if kind == "soft":
+        ending = soft
+    elif kind == "oy" and cls == "nom_m":
+        ending = "ой"
+    else:
+        ending = hard
+    return " ".join(head + [stem + ending])
+
+
+def _ordinals_with_suffix_ru(text: str) -> str:
+    def _repl(m: "re.Match") -> str:
+        s, a, b = m.string, m.start(), m.end()
+        prev_m = re.search(r"([^\W\d_]+)\W*$", s[:a])
+        next_m = re.match(r"\W*([^\W\d_]+)", s[b:])
+        words = _ordinal_words_ru(int(m.group(1)), m.group(2), prev_m.group(1) if prev_m else "",
+                                  next_m.group(1) if next_m else "")
+        if words is None:
+            return m.group(0)
+        left = " " if a > 0 and re.match(r"\w", s[a - 1]) else ""
+        right = " " if b < len(s) and re.match(r"\w", s[b]) else ""
+        return left + words + right
+    return _ORD_NUMBER_RE.sub(_repl, text)
+
+
 def numbers_to_words_ru(text: str) -> str:
     """Заменяет числа словами (например "2026" -> "две тысячи двадцать
     шесть"). Без этого TTS-движки, у которых нет собственной нормализации
     чисел (локальный Silero, CosyVoice/F5-TTS/XTTS), либо молча пропускают
     цифры, либо читают их как попало по одной цифре. Ловит и числа,
     слипшиеся с буквами/знаками ("20-летие", "5%", "3,5") — заменяется
-    только цифровая часть, остальное остаётся как было. Если пакет
+    только цифровая часть, остальное остаётся как было. Порядковые с
+    суффиксом ("5-го", "1909-й", "5019-м батальоном") превращаются в
+    порядковые слова ("пятого", "…девятый", "…девятнадцатым"). Если пакет
     num2words не установлен — возвращает текст без изменений (не падает)."""
     if num2words is None or not text:
         return text
+    text = _ordinals_with_suffix_ru(text)
 
     def _repl(m: "re.Match") -> str:
         raw = m.group("num")
@@ -5411,6 +5509,14 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
     return chunks or [text]
 
 
+class _AsrPending:
+    """A synthesised chunk whose ASR check/repair runs in the background (see run_silero_rest, asr_autorepair.AsrRepair.submit)."""
+    __slots__ = ("future", "wav", "args")
+
+    def __init__(self, future, wav: bytes, args: tuple):
+        self.future, self.wav, self.args = future, wav, args
+
+
 def _prosody_for_line(line: str, prosody_by_para: dict):
     """Эмоция для строки куска. Абзац длиннее max_len режется по предложениям
     (_split_paragraphs_for_ssml), и строка куска — лишь часть абзаца, ключа
@@ -5593,6 +5699,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     # ASR-автопочинка (asr_autorepair.py): гул/растяжка/проглоченный кусок -> пересинтез кусков
     # с другими паузами. Любой сбой ASR оставляет озвучку как есть.
     _asr_fixer = None
+    _silero_lock = threading.Lock()   # one request at a time to the service: the repair thread and the main synthesis share it
     if asr_repair:
         try:
             from asr_autorepair import AsrRepair
@@ -5628,14 +5735,15 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             ssml = ssml_tweak(ssml)
 
         def request_ssml(one_ssml: str) -> bytes:
-            resp = _get_with_retry(ssml_endpoint, {
-                "text_to_speech": one_ssml,
-                "speaker": chunk_speaker,
-                "sample_rate": sample_rate,
-                "raw_ssml": "true",
-                "strip_mono": "true" if strip_monosyllables else "false",
-                "server_accent": "false" if _client_layers else "true",
-            })
+            with _silero_lock:
+                resp = _get_with_retry(ssml_endpoint, {
+                    "text_to_speech": one_ssml,
+                    "speaker": chunk_speaker,
+                    "sample_rate": sample_rate,
+                    "raw_ssml": "true",
+                    "strip_mono": "true" if strip_monosyllables else "false",
+                    "server_accent": "false" if _client_layers else "true",
+                })
             level = resp.headers.get("X-Synthesis-Level", "as-is")
             if level != "as-is":
                 log(f"сервис использовал упрощённый вариант синтеза: {level}")
@@ -5668,10 +5776,11 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         try:
             wav_bytes = synth_via_ssml(plain_text_chunk, chunk_speaker)
             if _asr_fixer is not None:
-                wav_bytes = _asr_fixer.check_and_fix(
+                fut = _asr_fixer.submit(
                     plain_text_chunk, wav_bytes,
                     lambda tweak: synth_via_ssml(plain_text_chunk, chunk_speaker, tweak),
                     tag=f"гл.{idx} фрагм.{chunk_no}", first_chunk=(chunk_no == 1))
+                return _AsrPending(fut, wav_bytes, (plain_text_chunk, chunk_no, idx, title))
         except Exception as e_ssml:
             log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] SSML-синтез не удался "
                 f"({_error_detail(e_ssml)}), пробую обычный текст без SSML...")
@@ -5688,6 +5797,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                 silence_seconds = max(1.0, min(8.0, len(plain_text_chunk) / 15))
                 return np.zeros(int(sample_rate * silence_seconds), dtype=np.float32)
 
+        return finish_wav(wav_bytes, plain_text_chunk, chunk_no, idx, title)
+
+    def finish_wav(wav_bytes: bytes, plain_text_chunk: str, chunk_no: int, idx: int, title: str) -> "np.ndarray":
         with wave_mod.open(io.BytesIO(wav_bytes), "rb") as wf:
             n = wf.getnframes()
             pcm = wf.readframes(n)
@@ -5699,6 +5811,17 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                     f"нашёл речи во фрагменте {plain_text_chunk[:80]!r} — похоже на пропуск, "
                     f"проверьте результат на слух.")
         return apply_fade(audio, sample_rate)
+
+    def finish_pending(x):
+        """A chunk whose ASR check runs in the background -> its audio (the original wav if the check itself failed)."""
+        if not isinstance(x, _AsrPending):
+            return x
+        try:
+            wav = x.future.result()
+        except Exception as e_chk:  # noqa: BLE001
+            log(f"asr_repair: проверка куска упала ({e_chk}) — оставляю как есть")
+            wav = x.wav
+        return finish_wav(wav, *x.args)
 
     selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
                                   char_ranges=char_ranges)
@@ -5771,6 +5894,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
 
         pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
         audio_parts = []
+        pending_pos = collections.deque()   # positions in audio_parts of chunks still being checked by ASR
         chunks_total = len(chunks) or 1
         if on_progress:
             on_progress(pos, total, 0, chunks_total)
@@ -5785,10 +5909,18 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             audio = synth_chunk(chunk, chunk_no, idx, title, chunk_voice)
             _stall_guard_stop(_sg)
             audio_parts.append(audio)
+            if isinstance(audio, _AsrPending):
+                pending_pos.append(len(audio_parts) - 1)
             audio_parts.append(pause)
+            while _asr_fixer is not None and len(pending_pos) > _asr_fixer.parallelism:
+                i = pending_pos.popleft()
+                audio_parts[i] = finish_pending(audio_parts[i])
             if on_progress:
                 on_progress(pos, total, chunk_no, chunks_total)
 
+        while pending_pos:
+            i = pending_pos.popleft()
+            audio_parts[i] = finish_pending(audio_parts[i])
         _stall_guard_stop(_sg)
         if not audio_parts:
             continue

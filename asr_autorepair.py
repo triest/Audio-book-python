@@ -102,7 +102,49 @@ def source_boundaries(text: str):
     return words, kinds
 
 
+_ORD_STEMS = ("перв|втор|трет|четвёрт|четверт|пят|шест|седьм|восьм|девят|десят|одиннадцат|двенадцат|тринадцат|четырнадцат|пятнадцат|"
+              "шестнадцат|семнадцат|восемнадцат|девятнадцат|двадцат|тридцат|сороков|сотн|сот|тысячн|миллионн|пятидесят|шестидесят|"
+              "семидесят|восьмидесят|девяност")
+_NUMERAL_RE = re.compile(
+    rf"^(?:(?:{_ORD_STEMS})(?:ый|ий|ой|ого|ому|ым|ом|ая|ей|ую|ое|ые|ых|ыми|ье|ья|ьего|ьему|ьим|ьем)|"
+    r"один|одна|одно|одну|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|одиннадцать|двенадцать|тринадцать|"
+    r"четырнадцать|пятнадцать|шестнадцать|семнадцать|восемнадцать|девятнадцать|двадцать|тридцать|сорок|пятьдесят|шестьдесят|"
+    r"семьдесят|восемьдесят|девяносто|сто|двести|триста|четыреста|пятьсот|шестьсот|семьсот|восемьсот|девятьсот|"
+    r"тысяча|тысячи|тысяч|миллион|миллиона|миллионов|целых|целая|десятых|сотых|тысячных)$")
+
+
+def _asr_without_numbers(words: list) -> list:
+    """Whisper writes numbers as digits ("с 8 -м флотом", "23 минуты"), the source has them as words (and the cut-down "-м" would look
+    like a hum): numerals are not compared at all - digit tokens, their "-м/-го" suffixes and numeral words are dropped on the ASR side
+    (and numeral words on the source side, see chunk_defects). The sound of numerals is checked by ear, not by this detector."""
+    out, dropped_digit = [], False
+    for x in words:
+        w = x["w"]
+        if re.search(r"\d", w):
+            dropped_digit = True
+            continue
+        if dropped_digit and w.startswith("-"):
+            continue
+        dropped_digit = False
+        if _NUMERAL_RE.match(norm(w)):
+            continue
+        out.append(x)
+    return out
+
+
 def chunk_defects(src: list, words: list, lead_ok: bool = False, kinds: "list | None" = None) -> list:
+    """Numerals are excluded from the comparison (see _asr_without_numbers); src_index always refers to the full `src`."""
+    keep = [i for i, w in enumerate(src) if not _NUMERAL_RE.match(w)]
+    if len(keep) == len(src):
+        return _chunk_defects(src, _asr_without_numbers(words), lead_ok, kinds)
+    kinds_f = [kinds[i] for i in keep] if kinds is not None and len(kinds) == len(src) else None
+    out = _chunk_defects([src[i] for i in keep], _asr_without_numbers(words), lead_ok, kinds_f, keep)
+    for d in out:
+        d["src_index"] = keep[min(d["src_index"], len(keep) - 1)] if keep else d["src_index"]
+    return out
+
+
+def _chunk_defects(src: list, words: list, lead_ok: bool = False, kinds: "list | None" = None, keep: "list | None" = None) -> list:
     """src — normalised source words, words — ASR items {"w","s","e"}. -> [{"kind","src_index","text"}]
     lead_ok — first chunk of a chapter: its first words (the title) are followed by a long pause that Whisper
     glues to the word ("ладно (3.3s)"), so a stretch there is not a defect.
@@ -119,8 +161,10 @@ def chunk_defects(src: list, words: list, lead_ok: bool = False, kinds: "list | 
                 to_src[j1 + d] = i1 + d
             continue
         src_hum = any(_HUM_RE.match(s) for s in src[i1:i2])
+        # a lone "м" in place of a word that ends in "м" ("Восьмым флотом" -> "м флотом") is Whisper cutting the word short, not a hum
+        clipped = any(len(s) >= 4 and s.endswith("м") for s in src[i1:i2])
         for j in range(j1, j2):
-            if _HUM_RE.match(asr[j]) and not src_hum:
+            if _HUM_RE.match(asr[j]) and not src_hum and not (asr[j] == "м" and clipped):
                 out.append({"kind": "hum", "src_index": min(i1, len(src) - 1), "text": " ".join(asr[max(j1 - 1, 0):j2 + 1]),
                             "t0": kept[j][1]["s"], "t1": kept[j][1]["e"]})
                 break
@@ -133,9 +177,13 @@ def chunk_defects(src: list, words: list, lead_ok: bool = False, kinds: "list | 
     if kinds is not None and len(kinds) == len(src):
         for j in range(len(kept) - 1):
             if j in to_src and j + 1 in to_src and to_src[j + 1] == to_src[j] + 1:
+                if keep is not None and keep[to_src[j + 1]] != keep[to_src[j]] + 1:
+                    continue          # a numeral stood between these two words: the pause would include the spoken number
                 a, b = kept[j][1], kept[j + 1][1]
                 gap = b["s"] - a["e"]
                 kind = kinds[to_src[j]]
+                if lead_ok and a["e"] < TITLE_ZONE_S:      # the title lines of a chapter are followed by long pauses by design
+                    continue
                 if gap > GAP_LIMIT_S[kind]:
                     out.append({"kind": "gap", "src_index": to_src[j + 1], "text": f"{kept[j][0]} ({gap:.1f}s) {kept[j + 1][0]}",
                                 "t0": a["e"], "t1": b["s"], "typical": GAP_TYPICAL_S[kind]})
@@ -421,22 +469,59 @@ class AsrWorker:
                 self.proc.kill()
 
 
+ASR_WORKERS = max(1, int(os.environ.get("AUDIOBOOK_ASR_WORKERS", "2")))   # measured: 1 worker 5.4 s/chunk, 2 workers 4.3 s/chunk effective
+
+
 class AsrRepair:
-    def __init__(self, outdir: Path, log=print, max_attempts: int = 7):
+    """Checks chunks with ASR and re-synthesises the damaged ones. Several workers (processes) and a thread pool let the check of chunk N run
+    while chunk N+1 is being synthesised (submit()); check_and_fix() is the same thing done synchronously."""
+
+    def __init__(self, outdir: Path, log=print, max_attempts: int = 4, workers: int = ASR_WORKERS):
+        from concurrent.futures import ThreadPoolExecutor
         self.log = log
         self.max_attempts = max_attempts
         self.report = Path(outdir) / "asr_repairs.jsonl"
-        self.worker = AsrWorker(log=log)
         self.stats = {"checked": 0, "defective": 0, "fixed": 0, "kept_defect": 0}
-        self.ok = self.worker.start()
+        self._lock = threading.Lock()
+        found: list = []
+
+        def boot(_):
+            w = AsrWorker(log=log)
+            if w.start():
+                found.append(w)
+        threads = [threading.Thread(target=boot, args=(i,)) for i in range(max(workers, 1))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.workers = found
+        self.ok = bool(found)
+        self._free: "queue.Queue[AsrWorker]" = queue.Queue()
+        for w in found:
+            self._free.put(w)
+        self._pool = ThreadPoolExecutor(max_workers=max(len(found), 1)) if found else None
+
+    @property
+    def parallelism(self) -> int:
+        return len(self.workers)
+
+    def submit(self, plain_chunk: str, wav_bytes: bytes, resynth, tag: str = "", first_chunk: bool = False):
+        """Starts check_and_fix in the background -> Future of the (possibly repaired) wav bytes; it never raises."""
+        return self._pool.submit(self.check_and_fix, plain_chunk, wav_bytes, resynth, tag, first_chunk)
+
+    def _bump(self, key: str, n: int = 1):
+        with self._lock:
+            self.stats[key] += n
 
     def _defects(self, src, kinds, wav_bytes, lead_ok: bool = False) -> list:
         fd, tmp = tempfile.mkstemp(suffix=".wav")
+        worker = self._free.get()
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(wav_bytes)
-            return chunk_defects(src, self.worker.transcribe(tmp), lead_ok=lead_ok, kinds=kinds)
+            return chunk_defects(src, worker.transcribe(tmp), lead_ok=lead_ok, kinds=kinds)
         finally:
+            self._free.put(worker)
             try:
                 os.remove(tmp)
             except OSError:
@@ -450,11 +535,11 @@ class AsrRepair:
             src, kinds = source_boundaries(plain_chunk)
             if len(src) < 3:
                 return wav_bytes
-            self.stats["checked"] += 1
+            self._bump("checked")
             base = self._defects(src, kinds, wav_bytes, first_chunk)
             if not base:
                 return wav_bytes
-            self.stats["defective"] += 1
+            self._bump("defective")
             best, best_defects, tried, seen = wav_bytes, base, [], {}
             for name, fn in tweaks_for(base, src)[: self.max_attempts]:
                 def capture(ssml, fn=fn):
@@ -488,10 +573,10 @@ class AsrRepair:
                         best, best_defects = cut, dc
                 except Exception as e:  # noqa: BLE001
                     self.log(f"asr_repair {tag}: вырезание гула не удалось ({e})")
-            self.stats["fixed" if len(best_defects) < len(base) else "kept_defect"] += 1
+            self._bump("fixed" if len(best_defects) < len(base) else "kept_defect")
             what = "; ".join(d["kind"] + ": " + d["text"] for d in base[:3])
             self.log(f"asr_repair {tag}: дефектов {len(base)} -> {len(best_defects)} ({what})")
-            with open(self.report, "a", encoding="utf-8") as fh:
+            with self._lock, open(self.report, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"tag": tag, "before": base, "after": best_defects, "tried": tried,
                                      "text": plain_chunk[:120], "ssml": seen.get("ssml", "")}, ensure_ascii=False) + "\n")
             return best
@@ -511,7 +596,10 @@ class AsrRepair:
         return line
 
     def close(self):
-        self.worker.close()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+        for w in self.workers:
+            w.close()
         if self.ok:
             self.log(f"asr_repair: проверено {self.stats['checked']}, с дефектом {self.stats['defective']}, "
                      f"исправлено {self.stats['fixed']}, осталось с дефектом {self.stats['kept_defect']}.")

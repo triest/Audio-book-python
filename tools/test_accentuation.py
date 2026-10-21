@@ -647,6 +647,33 @@ _j = _ar.join_wavs([_buf.getvalue(), _buf.getvalue()], 500)
 with _wave.open(_io.BytesIO(_j), "rb") as _w:
     _jd = _w.getnframes() / _w.getframerate()
 check("asr repair: join_wavs = parts + the gap", abs(_jd - 2.5) < 0.01, str(_jd))
+_ORD_CASES = {
+    "5-го": "пятого", "1909-й": "одна тысяча девятьсот девятый", "1901-го": "одна тысяча девятьсот первого",
+    "5019-м батальоном": "пять тысяч девятнадцатым батальоном", "в 8-м флоте": "в восьмом флоте",
+    "на 26-м уровне": "на двадцать шестом уровне", "3-я": "третья", "3-му": "третьему", "3-й": "третий", "2-й": "второй",
+    "7-е": "седьмое", "100-й": "сотый", "2000-й год": "двухтысячный год", "21-го числа": "двадцать первого числа",
+    "в 90-х годах": "в девяностых годах", "в 1990-е годы": "в одна тысяча девятьсот девяностые годы",
+    "Шестьдесят 2-м дивизионом": "Шестьдесят вторым дивизионом",
+    "20-летие": "двадцать летие", "10 лет": "десять лет", "3,5-й": "три целых пять десятых й",   # untouched behaviour
+}
+for _src_t, _want in _ORD_CASES.items():
+    _got = _fr.numbers_to_words_ru(_src_t)
+    check(f"ordinal digits: {_src_t!r} -> {_want!r}", _got == _want, repr(_got))
+_nsrc = "командующий восьмым флотом сообщил что пятьдесят кораблей уцелели".split()
+_nw = lambda ws: [{"w": w, "s": i * 0.4, "e": i * 0.4 + 0.3} for i, w in enumerate(ws.split())]
+check("asr repair: Whisper's digits and '-м' suffix for a numeral are not a defect (8 -м флотом)",
+      _ar.chunk_defects(_nsrc, _nw("командующий 8 -м флотом сообщил что 50 кораблей уцелели")) == [])
+check("asr repair: numerals written as words in the transcript are not a defect either",
+      _ar.chunk_defects(_nsrc, _nw("командующий восьмым флотом сообщил что пятьдесят кораблей уцелели")) == [])
+_nk = ["", "", "", "", "", "", ""]
+_nwt = [{"w": "командующий", "s": 0.0, "e": 0.5}, {"w": "8", "s": 0.5, "e": 0.8}, {"w": "-м", "s": 0.8, "e": 1.0},
+        {"w": "флотом", "s": 1.0, "e": 1.5}, {"w": "сообщил", "s": 1.5, "e": 2.0}, {"w": "что", "s": 2.0, "e": 2.2},
+        {"w": "50", "s": 2.2, "e": 2.9}, {"w": "кораблей", "s": 2.9, "e": 3.4}, {"w": "уцелели", "s": 3.4, "e": 3.9}]
+check("asr repair: the pause around a dropped numeral (its own spoken duration) is not a gap",
+      [d for d in _ar.chunk_defects(_nsrc, _nwt, kinds=_nk) if d["kind"] == "gap"] == [])
+_nh = _ar.chunk_defects(_nsrc, _nw("командующий 8 -м флотом сообщил ммм что 50 кораблей уцелели"))
+check("asr repair: a hum next to numerals is still found and src_index points into the full source",
+      [d["kind"] for d in _nh] == ["hum"] and _nsrc[_nh[0]["src_index"]] == "что", str(_nh))
 _gsrc = "он сказал это на то чтобы уйти".split()
 _gk = ["", "", "s", "", "c", "", ""]
 _gw = [{"w": w, "s": i * 0.5, "e": i * 0.5 + 0.3} for i, w in enumerate(_gsrc)]
@@ -657,6 +684,10 @@ for x in _gw2[3:]:
 _gd = [d for d in _ar.chunk_defects(_gsrc, _gw2, kinds=_gk) if d["kind"] == "gap"]
 check("asr repair: an unexplained long pause after a sentence is a gap at the next word",
       len(_gd) == 1 and _gsrc[_gd[0]["src_index"]] == "на" and _gd[0]["t1"] > _gd[0]["t0"], str(_gd))
+_gw3 = [dict(x, s=x["s"] - 14.5, e=x["e"] - 14.5) for x in _gw2]      # the same unexplained pause, but at the very start of a chapter
+check("asr repair: a long pause inside the title zone of the first chunk is not a gap, elsewhere it is",
+      [d for d in _ar.chunk_defects(_gsrc, _gw3, lead_ok=True, kinds=_gk) if d["kind"] == "gap"] == []
+      and len([d for d in _ar.chunk_defects(_gsrc, _gw3, kinds=_gk) if d["kind"] == "gap"]) == 1)
 check("asr repair: no kinds -> no gap check", [d for d in _ar.chunk_defects(_gsrc, _gw2) if d["kind"] == "gap"] == [])
 _wb, _kd = _ar.source_boundaries("Он пришёл, увидел.\nНа том — всё.")
 check("asr repair: source_boundaries kinds (comma / sentence / paragraph / dash)",
