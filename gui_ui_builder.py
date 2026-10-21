@@ -831,6 +831,9 @@ class UIBuilderMixin:
         ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
+        self._build_audio_check_row(intonation, irow)
+
+        irow += 1
         self.optimal_settings_button = ttk.Button(
             intonation, text="Set Optimal Settings", command=self._set_optimal_settings,
         )

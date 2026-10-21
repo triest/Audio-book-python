@@ -673,6 +673,43 @@ with _wave.open(_bw, "wb") as _w:
 _vs = _ar.voiced_spans(_bw.getvalue(), 0.3, 1.7)
 check("asr repair: voiced_spans finds the hum inside the pause only",
       len(_vs) == 1 and abs(_vs[0][0] - 1.0) < 0.05 and abs(_vs[0][1] - 1.4) < 0.05, str(_vs))
+import gui_audio_check as _gac
+_words40 = [f"слово{chr(1072 + i % 26)}{chr(1072 + (i * 7) % 26)}" for i in range(40)]
+_txt40 = " ".join(_words40) + "."
+_asr40 = [{"w": w, "s": 15 + i * 0.4, "e": 15 + i * 0.4 + 0.3} for i, w in enumerate(_words40)]
+_clean40 = [dict(a) for a in _asr40]
+_asr40.insert(20, {"w": "Ммм,", "s": 15 + 20 * 0.4, "e": 15 + 20 * 0.4 + 0.3})
+for _k in range(21, len(_asr40)):
+    _asr40[_k]["s"] += 0.4; _asr40[_k]["e"] += 0.4
+class _FakeWorker:
+    def __init__(self, words): self.words = words
+    def transcribe(self, path, timeout=0): return self.words
+_sc = _ar.scan_chapter(_FakeWorker(_asr40), "x.wav", _txt40)
+check("sound check: scan_chapter finds the hum of a finished chapter", [d["kind"] for d in _sc] == ["hum"] and _sc[0]["t"] > 14, str(_sc))
+check("sound check: scan_chapter on a clean chapter -> nothing",
+      _ar.scan_chapter(_FakeWorker(_clean40), "x.wav", _txt40) == [])
+_early = [dict(a, s=a["s"] - 14, e=a["e"] - 14) for a in _clean40]
+_early[3]["e"] = _early[3]["s"] + 3.5
+check("sound check: a stretched word inside the title zone is not reported", _ar.scan_chapter(_FakeWorker(_early), "x.wav", _txt40) == [])
+check("sound check: format_time", _gac.format_time(235.4) == "3:55" and _gac.format_time(5) == "0:05")
+import tempfile as _tf
+with _tf.TemporaryDirectory() as _td:
+    _chs = [("Глава 1", "a"), ("Глава 2", "b"), ("Глава 3", "c")]
+    (Path(_td) / "002_Глава 2.wav").write_bytes(b"x")
+    check("sound check: build_jobs lists only chapters that have a finished wav",
+          [j[0] for j in _gac.build_jobs(_chs, _td)] == [2] and [j[0] for j in _gac.build_jobs(_chs, _td, [1, 2])] == [2])
+    _csvp = Path(_td) / "o.csv"
+    _gac.rows_to_csv([(2, "Глава 2", Path("x"), {"kind": "hum", "text": "лучше ммм на", "t": 235.0})], _csvp)
+    check("sound check: CSV has the row", "3:55" in _csvp.read_text(encoding="utf-8-sig") and "гул" in _csvp.read_text(encoding="utf-8-sig"))
+    with _wave.open(str(Path(_td) / "c.wav"), "wb") as _w:
+        _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(8000); _w.writeframes(bytes(2 * 8000 * 20))
+    _clip = _ar.cut_clip(Path(_td) / "c.wav", 10.0, 3.0, 4.0)
+    with _wave.open(_clip, "rb") as _w:
+        _cd = _w.getnframes() / _w.getframerate()
+    check("sound check: cut_clip = before + after seconds around the place", abs(_cd - 7.0) < 0.01, str(_cd))
+    __import__('os').remove(_clip)
+_st = _ar.asr_status()
+check("sound check: asr_status returns a known state and a text", _st[0] in ("ok", "degraded", "off") and len(_st[1]) > 10, str(_st))
 _title = _asr("глава ладно уж оскар сказал он вернулся домой поздно вечером")
 _title[1]["e"] = _title[1]["s"] + 3.3
 _src_t = "глава ладно уж оскар сказал он вернулся домой поздно вечером".split()

@@ -383,6 +383,10 @@ if errorlevel 1 (
     "%CV_PY%" -m pip install openai-whisper
     if errorlevel 1 echo WARNING: openai-whisper failed to install.
 )
+rem The medium whisper model (1.4 GB) is what the auto-repair / chapter sound check (asr_autorepair.py) uses; resumable, SHA-256 verified.
+rem If the download fails the check falls back to the small model (see tools\asr_worker.py), so this is not fatal.
+"%CV_PY%" tools\fetch_whisper_model.py medium
+if errorlevel 1 echo WARNING: whisper medium model was not downloaded - the sound check will use the weaker small model. Run install.bat again to retry.
 "%CV_PY%" -m pip install transformers==4.51.3
 if errorlevel 1 (
     "%CV_PY%" -m pip install transformers

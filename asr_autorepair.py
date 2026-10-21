@@ -19,7 +19,35 @@ import threading
 import wave
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+import app_paths
+
+ROOT = app_paths.app_dir()   # next to the .py files, or next to the .exe when frozen
+ASR_MODEL = os.environ.get("AUDIOBOOK_ASR_MODEL", "medium")
+MODEL_URLS_SHA256 = {"medium": "345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1"}
+
+
+def asr_python() -> Path:
+    return Path(os.environ.get("AUDIOBOOK_ASR_PYTHON") or ROOT / ".venv_cosyvoice3" / "Scripts" / "python.exe")
+
+
+def asr_worker_script() -> Path:
+    return app_paths.resolve_asset("tools/asr_worker.py")
+
+
+def whisper_cache_file(model: str) -> Path:
+    return Path.home() / ".cache" / "whisper" / f"{model}.pt"
+
+
+def asr_status() -> tuple:
+    """-> (state, text) for the GUI: 'ok' (medium), 'degraded' (small only), 'off' (no ASR environment)."""
+    if not asr_python().exists() or not asr_worker_script().exists():
+        return "off", "Проверка ASR недоступна: нет окружения .venv_cosyvoice3 (запустите install.bat)"
+    if ASR_MODEL != "small" and whisper_cache_file(ASR_MODEL).exists():
+        return "ok", f"Проверка ASR готова: модель {ASR_MODEL}"
+    if whisper_cache_file("small").exists():
+        return "degraded", (f"Проверка ASR: нет модели {ASR_MODEL}, будет small (слабее; "
+                            f"tools\\fetch_whisper_model.py {ASR_MODEL} или install.bat)")
+    return "off", "Проверка ASR недоступна: нет моделей whisper (запустите install.bat)"
 STRETCH_S = 2.5          # one word longer than this (Whisper may also stretch a word over a pause: only a trigger for a retry)
 MISSING_WORDS = 8        # swallowed run of source words
 _HUM_RE = re.compile(r"^(м+|э+м*|хм+|ам+|ы+|а{4,}|у{4,}|о{4,})$")
@@ -97,10 +125,11 @@ def chunk_defects(src: list, words: list, lead_ok: bool = False, kinds: "list | 
                             "t0": kept[j][1]["s"], "t1": kept[j][1]["e"]})
                 break
         if tag in ("delete", "replace") and i2 - i1 >= MISSING_WORDS and j2 - j1 < (i2 - i1) / 2:
-            out.append({"kind": "missing", "src_index": i1, "text": " ".join(src[i1:i2])[:100]})
+            out.append({"kind": "missing", "src_index": i1, "text": " ".join(src[i1:i2])[:100],
+                        "t": kept[min(j1, len(kept) - 1)][1]["s"] if kept else 0.0})
     for j, (w, x) in enumerate(kept):
         if x["e"] - x["s"] > STRETCH_S and len(w) <= 14 and j in to_src and not (lead_ok and j < 4):
-            out.append({"kind": "stretch", "src_index": to_src[j], "text": f"{w} ({x['e'] - x['s']:.1f}s)"})
+            out.append({"kind": "stretch", "src_index": to_src[j], "text": f"{w} ({x['e'] - x['s']:.1f}s)", "t": x["s"]})
     if kinds is not None and len(kinds) == len(src):
         for j in range(len(kept) - 1):
             if j in to_src and j + 1 in to_src and to_src[j + 1] == to_src[j] + 1:
@@ -110,6 +139,8 @@ def chunk_defects(src: list, words: list, lead_ok: bool = False, kinds: "list | 
                 if gap > GAP_LIMIT_S[kind]:
                     out.append({"kind": "gap", "src_index": to_src[j + 1], "text": f"{kept[j][0]} ({gap:.1f}s) {kept[j + 1][0]}",
                                 "t0": a["e"], "t1": b["s"], "typical": GAP_TYPICAL_S[kind]})
+    for d in out:
+        d.setdefault("t", d.get("t0", 0.0))      # where in the audio (seconds) the GUI should take the listener
     return out
 
 
@@ -296,22 +327,57 @@ def tweaks_for(defects: list, src: list):
             ("speaking rate +5", lambda t: nudge_rate(t, 5))]
 
 
+TITLE_ZONE_S = 14.0   # the chapter title at the start of a chapter is read once but stands twice in the text: no verdicts there
+
+
+CHAPTER_SCAN_MODEL = "small"   # whole-chapter transcripts: small is stable on 25-minute files and is what GAP_LIMIT_S was calibrated on;
+                               # medium skips pieces of text there (27 false "missing" runs in one chapter). Per-chunk checks use medium.
+
+
+def scan_chapter(worker, wav_path, text: str) -> list:
+    """Whole-chapter ASR check of a finished chapter file: -> defects (see chunk_defects) with "t" = seconds from the start.
+    The chapter-level transcript records a hum as a word much more reliably than the transcript of a single chunk."""
+    src, kinds = source_boundaries(text)
+    defects = chunk_defects(src, worker.transcribe(str(wav_path)), lead_ok=True, kinds=kinds)
+    return [d for d in defects if d.get("t", 0.0) > TITLE_ZONE_S or d["kind"] == "hum"]
+
+
+def cut_clip(wav_path, t: float, before: float = 3.0, after: float = 4.0, dst: "str | None" = None) -> str:
+    """A short wav around the second t of a chapter file (for «listen to this place»); returns the path."""
+    with wave.open(str(wav_path), "rb") as w:
+        sr = w.getframerate()
+        w.setpos(max(int((t - before) * sr), 0))
+        frames = w.readframes(int((before + after) * sr))
+        params = w.getparams()
+    if dst is None:
+        fd, dst = tempfile.mkstemp(suffix=".wav", prefix="asr_clip_")
+        os.close(fd)
+    with wave.open(dst, "wb") as o:
+        o.setparams(params)
+        o.writeframes(frames)
+    return dst
+
+
 class AsrWorker:
-    def __init__(self, log=print, python: "str | None" = None):
+    def __init__(self, log=print, python: "str | None" = None, model: "str | None" = None):
         self.log = log
+        self.model = model        # None -> AUDIOBOOK_ASR_MODEL / medium (tools/asr_worker.py decides, falls back to small)
         self.proc = None
         self._q: "queue.Queue[str]" = queue.Queue()
-        self._python = python or os.environ.get("AUDIOBOOK_ASR_PYTHON") or str(ROOT / ".venv_cosyvoice3" / "Scripts" / "python.exe")
+        self._python = python or str(asr_python())
         self.ok = False
 
     def start(self, timeout: float = 300.0) -> bool:
-        worker = ROOT / "tools" / "asr_worker.py"
+        worker = asr_worker_script()
         if not Path(self._python).exists() or not worker.exists():
             self.log(f"asr_repair: ASR-окружение не найдено ({self._python}) — автопочинка отключена.")
             return False
         try:
+            env = dict(os.environ)
+            if self.model:
+                env["AUDIOBOOK_ASR_MODEL"] = self.model
             self.proc = subprocess.Popen([self._python, str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+                                         stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
                                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as e:
             self.log(f"asr_repair: не удалось запустить ASR ({e}) — автопочинка отключена.")
@@ -432,6 +498,17 @@ class AsrRepair:
         except Exception as e:  # noqa: BLE001
             self.log(f"asr_repair {tag}: проверка пропущена ({e})")
             return wav_bytes
+
+    def chapter_done(self, idx) -> str:
+        """One-line summary of what the check did in the chapter that has just been written (also written to the log)."""
+        cur = dict(self.stats)
+        prev = getattr(self, "_chapter_prev", {k: 0 for k in cur})
+        self._chapter_prev = cur
+        d = {k: cur[k] - prev.get(k, 0) for k in cur}
+        line = (f"ASR-проверка гл.{idx}: кусков {d['checked']}, с дефектом {d['defective']}, "
+                f"исправлено {d['fixed']}, осталось {d['kept_defect']}")
+        self.log(line)
+        return line
 
     def close(self):
         self.worker.close()

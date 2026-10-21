@@ -5802,6 +5802,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             wf.writeframes(pcm)
 
         _save_fingerprint(out_path, fingerprint)
+        if _asr_fixer is not None:
+            _asr_fixer.chapter_done(idx)
 
         if play:
             print("  Проигрывание...")
