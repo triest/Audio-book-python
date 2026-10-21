@@ -13,7 +13,12 @@ from asr_cache_cuda import load_16k  # noqa: E402
 def main():
     import torch
     import whisper
-    model_name = os.environ.get("AUDIOBOOK_ASR_MODEL", "small")
+    model_name = os.environ.get("AUDIOBOOK_ASR_MODEL", "medium")
+    cache = os.path.join(os.path.expanduser("~"), ".cache", "whisper", model_name + ".pt")
+    if model_name != "small" and not os.path.exists(cache):
+        # a model that is not cached would be downloaded (hours on a slow link): fall back to the always-installed small
+        sys.stderr.write(f"asr_worker: {cache} not found, using small\n")
+        model_name = "small"
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = whisper.load_model(model_name, device=dev)
     real_out = sys.stdout

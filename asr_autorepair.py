@@ -41,7 +41,7 @@ def source_words(text: str) -> list:
 # Longest normal pause between two neighbouring words inside a chunk, by what the source has after the first word
 # (99.9th percentile over the 50 chapters of the sample book: '' 0.16, ',' 0.64, '.' 0.98, paragraph 1.6 s).
 # A longer silence-or-sound that Whisper did not write down is a hum / stretched onset ("Ммм" before "на").
-GAP_LIMIT_S = {"": 0.35, "c": 0.75, "s": 0.95, "p": 1.6}
+GAP_LIMIT_S = {"": 0.35, "c": 0.75, "s": 0.95, "p": 1.35}   # 'p': ~99.7th percentile (p99.9 is 1.6, but a hum before "На" was 1.6 s)
 GAP_TYPICAL_S = {"": 0.0, "c": 0.26, "s": 0.42, "p": 0.82}   # median pause by boundary type: what a cut leaves behind
 
 
