@@ -136,7 +136,7 @@ SETTINGS_FIELDS = [
     "ollama_host_var", "sv_llm_backend_var", "sv_llm_model_var",
     # accentuation pipeline (Oct 2026) + service recycle
     "stress_review_var",
-    "strip_mono_var", "recycle_services_var",
+    "strip_mono_var", "recycle_services_var", "asr_repair_var",
 ]
 
 
@@ -1418,6 +1418,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         emotion_attribution=self._selected_attribution(ignore_checkbox=True),
                         strip_monosyllables=self.strip_mono_var.get(),
                         stress_review=self.stress_review_var.get(),
+                        asr_repair=self.asr_repair_var.get(),
                     )
                 elif mode == "yandex":
                     run_yandex(

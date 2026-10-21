@@ -823,6 +823,14 @@ class UIBuilderMixin:
         ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
+        self.asr_repair_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            intonation,
+            text='Автопочинка по распознаванию (Silero REST): гул/растяжка/проглоченный текст — пересинтез куска',
+            variable=self.asr_repair_var,
+        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+
+        irow += 1
         self.optimal_settings_button = ttk.Button(
             intonation, text="Set Optimal Settings", command=self._set_optimal_settings,
         )
