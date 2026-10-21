@@ -598,6 +598,29 @@ check("emotion: exact paragraph still matches", _fr._prosody_for_line(_short_par
 check("emotion: unknown text -> None", _fr._prosody_for_line("Совсем другой текст", _pm) is None)
 check("emotion: empty map -> None", _fr._prosody_for_line(_short_para, {}) is None)
 
+# --- ASR auto-repair: defect detection and SSML tweaks (asr_autorepair.py), data from the real "курортом, но там" repro ---
+import asr_autorepair as _ar
+_src = "планету со столь сильным тяготением едва ли можно назвать курортом но там по крайней мере хватало места".split()
+_asr = lambda ws: [{"w": w, "s": i * 0.3, "e": i * 0.3 + 0.25} for i, w in enumerate(ws.split())]
+_hum = _ar.chunk_defects(_src, _asr("планету со столь сильным тяготением едва ли можно назвать курортом? Ммм, на том. По крайней мере, хватало места."))
+check("asr repair: hum instead of «но» is found", [d["kind"] for d in _hum] == ["hum"] and _src[_hum[0]["src_index"]] == "но", str(_hum))
+check("asr repair: clean transcript -> no defects",
+      _ar.chunk_defects(_src, _asr("планету со столь сильным тяготением едва ли можно назвать курортом, но там, по крайней мере, хватало места.")) == [])
+check("asr repair: a misheard word is not a defect",
+      _ar.chunk_defects(_src, _asr("планету со столь сильным тяготением едва ли можно назвать курортом но там по крайней мере хватало лета")) == [])
+check("asr repair: a hum that the text really has is not a defect",
+      _ar.chunk_defects(["ммм", "ладно"], _asr("ммм ладно")) == [])
+_long = _asr("планету со столь сильным тяготением едва ли можно назвать курортом но там по крайней мере хватало места")
+_long[5]["e"] = _long[5]["s"] + 3.0
+check("asr repair: stretched word is found", [d["kind"] for d in _ar.chunk_defects(_src, _long)] == ["stretch"])
+check("asr repair: swallowed run of 8+ words is found",
+      [d["kind"] for d in _ar.chunk_defects(_src, _asr("планету со столь сильным тяготением едва ли"))] == ["missing"])
+_ssml = '<s>назв+ать кур+ортом,<break time="120ms"/> но там,<break time="120ms"/> по кр+айней м+ере</s>'
+_tw = dict(_ar.tweaks_for(_hum, _src))
+check("asr repair: tweak 1 drops only the pause before the damaged word",
+      _tw["drop pause before the damaged word"](_ssml) == '<s>назв+ать кур+ортом, но там,<break time="120ms"/> по кр+айней м+ере</s>')
+check("asr repair: tweak 2 drops every comma pause", "<break" not in _tw["drop all comma pauses"](_ssml))
+
 # ---- stress_llm (кнопка «Спросить LLM») ----
 import stress_llm as _sl
 _q = {"word": "тона", "reading": "тон+а", "candidates": ["тон+а", "т+она"], "occ": [{"sentence": "искренность его т+она была"}]}

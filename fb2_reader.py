@@ -5442,7 +5442,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                      stress_engine: str = "silero",
                      smart_emotion: bool = False, emotion_attribution=None,
                      strip_monosyllables: bool = True,
-                     stress_review: "bool | None" = None):
+                     stress_review: "bool | None" = None,
+                     asr_repair: bool = False):
     """Озвучка через Silero-REST-Service (см. https://github.com/Flokss/Silero-REST-Service).
 
     Текст каждой главы автоматически превращается в SSML с интонационными
@@ -5589,7 +5590,20 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     # {абзац_исходного_текста: {"rate":..,"pitch":..}} по классификации LLM.
     _chapter_para_prosody: dict = {}
 
-    def synth_via_ssml(plain_text_chunk: str, chunk_speaker: str) -> bytes:
+    # ASR-автопочинка (asr_autorepair.py): гул/растяжка/проглоченный кусок -> пересинтез кусков
+    # с другими паузами. Любой сбой ASR оставляет озвучку как есть.
+    _asr_fixer = None
+    if asr_repair:
+        try:
+            from asr_autorepair import AsrRepair
+            _asr_fixer = AsrRepair(outdir, log=log)
+            if not _asr_fixer.ok:
+                _asr_fixer = None
+        except Exception as e_asr:
+            log(f"asr_repair недоступен ({e_asr}) — озвучка без автопочинки.")
+            _asr_fixer = None
+
+    def synth_via_ssml(plain_text_chunk: str, chunk_speaker: str, ssml_tweak=None) -> bytes:
         enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
                                          enabled=use_stress_online)
         # paragraph_prosody передаётся ПО ПОЗИЦИИ абзаца (не по тексту) —
@@ -5610,6 +5624,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             emphasize=emphasize,
             paragraph_prosody=para_prosody_list,
         )
+        if ssml_tweak is not None:
+            ssml = ssml_tweak(ssml)
         resp = _get_with_retry(ssml_endpoint, {
             "text_to_speech": ssml,
             "speaker": chunk_speaker,
@@ -5643,6 +5659,11 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             return np.zeros(int(sample_rate * 0.4), dtype=np.float32)
         try:
             wav_bytes = synth_via_ssml(plain_text_chunk, chunk_speaker)
+            if _asr_fixer is not None:
+                wav_bytes = _asr_fixer.check_and_fix(
+                    plain_text_chunk, wav_bytes,
+                    lambda tweak: synth_via_ssml(plain_text_chunk, chunk_speaker, tweak),
+                    tag=f"гл.{idx} фрагм.{chunk_no}")
         except Exception as e_ssml:
             log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] SSML-синтез не удался "
                 f"({_error_detail(e_ssml)}), пробую обычный текст без SSML...")
@@ -5778,6 +5799,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             print("  Проигрывание...")
             (play_fn or play_file)(out_path)
 
+    if _asr_fixer is not None:
+        _asr_fixer.close()
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
     print(f"Подробный лог ошибок (если были): {log_path.resolve()}")
 
@@ -6694,6 +6717,9 @@ def main():
                           "(dictionary -> silero-stress -> grammar gate) and exit")
     ap.add_argument("--keep-monosyllable-stress", action="store_true",
                      help="do not strip the '+' mark from one-vowel words")
+    ap.add_argument("--asr-repair", action="store_true",
+                    help="silero_rest: проверять каждый кусок распознаванием (whisper в .venv_cosyvoice3) и пересинтезировать "
+                         "куски с гулом/растяжкой/проглоченным текстом с другими паузами (см. asr_autorepair.py)")
     ap.add_argument("--no-stress-review", action="store_true",
                      help="do not write the per-chapter review list "
                           "review_list.json (same as AUDIOBOOK_STRESS_REVIEW=0)")
@@ -6910,7 +6936,8 @@ def main():
                          book_stress_overrides_path=book_manual_stress_overrides_path(args.book),
                          stress_engine=args.stress_engine,
                          smart_emotion=args.smart_emotion,
-                         strip_monosyllables=not args.keep_monosyllable_stress)
+                         strip_monosyllables=not args.keep_monosyllable_stress,
+                         asr_repair=args.asr_repair)
     elif args.mode == "cosyvoice":
         cosyvoice_dialogue_voices = [v.strip() for v in args.cosyvoice_dialogue_voices.split(",") if v.strip()] or None
         run_cosyvoice(chapters, args.outdir, args.start, args.cosyvoice_voice, args.sample_rate, args.play,
