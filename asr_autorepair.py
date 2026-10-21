@@ -387,7 +387,11 @@ def scan_chapter(worker, wav_path, text: str) -> list:
     The chapter-level transcript records a hum as a word much more reliably than the transcript of a single chunk."""
     src, kinds = source_boundaries(text)
     defects = chunk_defects(src, worker.transcribe(str(wav_path)), lead_ok=True, kinds=kinds)
-    return [d for d in defects if d.get("t", 0.0) > TITLE_ZONE_S or d["kind"] == "hum"]
+    def real(d):
+        if d["kind"] == "gap" and kinds[d["src_index"]] == "p" and d["t1"] - d["t0"] < 1.6:
+            return False   # paragraph pause up to the 99.9th percentile (1.6 s) is normal: chunk joins add silence the chunk check never sees
+        return d.get("t", 0.0) > TITLE_ZONE_S or d["kind"] == "hum"
+    return [d for d in defects if real(d)]
 
 
 def cut_clip(wav_path, t: float, before: float = 3.0, after: float = 4.0, dst: "str | None" = None) -> str:
