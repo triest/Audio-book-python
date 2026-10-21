@@ -8,6 +8,7 @@
 import csv
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -96,6 +97,15 @@ class AudioCheckMixin:
         self._ac_progress = tk.StringVar(
             value="Проверяются выбранные главы в списке (если не выбрано — все озвученные в папке вывода).")
         ttk.Label(top, textvariable=self._ac_progress).pack(side="left", padx=10)
+        prog = ttk.Frame(win)
+        prog.pack(fill="x", padx=10, pady=(0, 4))
+        self._ac_bar = ttk.Progressbar(prog, orient="horizontal", mode="determinate", maximum=1, value=0)
+        self._ac_bar.pack(side="left", fill="x", expand=True)
+        self._ac_stats = tk.StringVar(value="")
+        ttk.Label(prog, textvariable=self._ac_stats, width=52, anchor="e").pack(side="left", padx=(10, 0))
+        self._ac_t0 = 0.0
+        self._ac_total = 0
+        self._ac_n_done = 0
 
         mid = ttk.Frame(win)
         mid.pack(fill="both", expand=True, padx=10, pady=4)
@@ -153,6 +163,12 @@ class AudioCheckMixin:
         self._ac_failed = False
         self._ac_scan_btn.configure(text="Остановить")
         self._ac_progress.set(f"Загружаю модель распознавания… (глав: {len(jobs)})")
+        self._ac_t0 = time.monotonic()
+        self._ac_total = len(jobs)
+        self._ac_n_done = 0
+        self._ac_bar.configure(mode="indeterminate")
+        self._ac_bar.start(80)
+        self._ac_update_stats()
         self._ac_thread = threading.Thread(target=self._ac_scan_thread, args=(jobs,), daemon=True)
         self._ac_thread.start()
         self.after(250, self._ac_poll)
@@ -172,11 +188,22 @@ class AudioCheckMixin:
                     defects = ar.scan_chapter(worker, wav, text)
                 except Exception as e:  # noqa: BLE001
                     q.put(("log", f"Проверка звука: глава {idx}: {e}"))
+                    q.put(("rows", idx, title, wav, []))
                     continue
                 q.put(("rows", idx, title, wav, defects))
         finally:
             worker.close()
             q.put(("done",))
+
+    def _ac_update_stats(self):
+        """Counters under the bar: chapters done, places found, elapsed and estimated remaining time."""
+        if not self._ac_scanning() and self._ac_n_done == 0:
+            return
+        el = time.monotonic() - self._ac_t0
+        n, total = self._ac_n_done, self._ac_total
+        found = len(self._ac_rows)
+        eta = f", осталось ~{format_time(el / n * (total - n))}" if n and n < total else ""
+        self._ac_stats.set(f"глав {n}/{total} · мест {found} · прошло {format_time(el)}{eta}")
 
     def _ac_poll(self):
         """Main thread only: the scan thread never touches Tk, it posts to the queue."""
@@ -186,6 +213,9 @@ class AudioCheckMixin:
                 kind = msg[0]
                 if kind == "progress":
                     self._ac_progress.set(msg[1])
+                    if str(self._ac_bar.cget("mode")) == "indeterminate":
+                        self._ac_bar.stop()
+                        self._ac_bar.configure(mode="determinate", maximum=max(self._ac_total, 1), value=self._ac_n_done)
                 elif kind == "log":
                     self.log(msg[1])
                 elif kind == "error":
@@ -198,7 +228,12 @@ class AudioCheckMixin:
                         iid = self._ac_tree.insert("", "end", values=(
                             f"{idx}. {title}", format_time(d.get("t", 0.0)), KIND_TEXT.get(d["kind"], d["kind"]), d["text"]))
                         self._ac_rows[iid] = (idx, title, wav, d)
+                    self._ac_n_done += 1
+                    self._ac_bar.configure(value=self._ac_n_done)
                 elif kind == "done":
+                    self._ac_bar.stop()
+                    self._ac_bar.configure(mode="determinate", maximum=max(self._ac_total, 1), value=self._ac_n_done)
+                    self._ac_update_stats()
                     self._ac_scan_btn.configure(text="Проверить")
                     if self._ac_failed:
                         return
@@ -211,6 +246,7 @@ class AudioCheckMixin:
                     return
         except queue.Empty:
             pass
+        self._ac_update_stats()
         if self._ac_scanning():
             self.after(250, self._ac_poll)
 
