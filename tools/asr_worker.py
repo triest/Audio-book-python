@@ -38,7 +38,7 @@ def main():
             out = {"words": words}
         except Exception as e:  # noqa: BLE001
             out = {"error": f"{type(e).__name__}: {e}"}
-        real_out.write("@@" + json.dumps(out, ensure_ascii=False) + "\n")
+        real_out.write("@@" + json.dumps(out, ensure_ascii=True) + "\n")
         real_out.flush()
 
 

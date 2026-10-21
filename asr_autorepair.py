@@ -425,7 +425,7 @@ class AsrWorker:
             if self.model:
                 env["AUDIOBOOK_ASR_MODEL"] = self.model
             self.proc = subprocess.Popen([self._python, str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
+                                         stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
                                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as e:
             self.log(f"asr_repair: не удалось запустить ASR ({e}) — автопочинка отключена.")
@@ -442,10 +442,14 @@ class AsrWorker:
         return self.ok
 
     def _read(self):
-        for line in self.proc.stdout:
-            if line.startswith("@@"):
-                self._q.put(line.rstrip("\n"))
-        self._q.put("@@eof")
+        try:
+            for line in self.proc.stdout:
+                if line.startswith("@@"):
+                    self._q.put(line.rstrip("\n"))
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._q.put("@@eof")
 
     def transcribe(self, wav_path: str, timeout: float = 180.0) -> list:
         self.proc.stdin.write(json.dumps({"wav": wav_path}) + "\n")
