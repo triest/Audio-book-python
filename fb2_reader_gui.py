@@ -925,13 +925,14 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             messagebox.showerror("Словарь ударений", f"Не удалось открыть файл: {e}")
 
     def _lock_llm_features(self):
-        """Fully local/free mode: speaker attribution and smart emotions (LLM / cloud API) are
-        switched off and their controls greyed out."""
-        for name in ("attribution_var", "smart_emotion_var", "yandex_smart_emotion_var"):
+        """Fully local/free mode: speaker attribution and the cloud smart emotions (Yandex) are
+        switched off and their controls greyed out. The Silero smart emotion stays available: it
+        uses only the built-in local LLM (provider "builtin", see _builtin_emotion_credentials)."""
+        for name in ("attribution_var", "yandex_smart_emotion_var"):
             var = getattr(self, name, None)
             if var is not None:
                 var.set(False)
-        for name in ("attribution_check", "smart_emotion_check", "yandex_smart_emotion_check"):
+        for name in ("attribution_check", "yandex_smart_emotion_check"):
             w = getattr(self, name, None)
             if w is not None:
                 try:
@@ -996,6 +997,12 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         return (self.attribution_folder_id_var.get().strip()
                 or self.yandex_folder_id_var.get().strip()
                 or os.environ.get("YANDEX_FOLDER_ID", "").strip())
+
+    @staticmethod
+    def _builtin_emotion_credentials() -> dict:
+        """Smart emotion of Silero REST in the local/free mode: only the built-in local LLM
+        (llm_rest_service.py, started on demand by stress_llm.ensure_builtin_service)."""
+        return {"api_key": "", "model": "builtin", "provider": "builtin", "folder_id": "", "ollama_host": ""}
 
     def _selected_attribution(self, ignore_checkbox: bool = False):
         """{"api_key":..., "model":..., "provider":..., "folder_id":...,
@@ -1414,8 +1421,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                             if self.book_path else None
                         ),
                         stress_engine=self.stress_engine_var.get(),
-                        smart_emotion=False,
-                        emotion_attribution=self._selected_attribution(ignore_checkbox=True),
+                        smart_emotion=self.smart_emotion_var.get(),
+                        emotion_attribution=(self._builtin_emotion_credentials()
+                                             if self.smart_emotion_var.get() else None),
                         strip_monosyllables=self.strip_mono_var.get(),
                         stress_review=self.stress_review_var.get(),
                         asr_repair=self.asr_repair_var.get(),

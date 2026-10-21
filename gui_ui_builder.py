@@ -853,7 +853,7 @@ class UIBuilderMixin:
         self.smart_emotion_var = tk.BooleanVar(value=False)
         self.smart_emotion_check = ttk.Checkbutton(
             intonation,
-            text="Умная эмоция (LLM) — отключено в локальном режиме",
+            text="Умная эмоция (Silero REST, встроенная локальная LLM; нужно ~8 ГБ видеопамяти)",
             variable=self.smart_emotion_var,
         )
         self.smart_emotion_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
@@ -863,7 +863,7 @@ class UIBuilderMixin:
             intonation,
             text="Абзац озвучивается с подстройкой громкости/высоты голоса (SSML <prosody>)\n"
                  "под его эмоцию — радость, грусть, страх, злость, спокойствие, нейтрально.\n"
-                 "Использует тот же ключ LLM, что и атрибуция говорящих (блок «Диалоги» ниже).",
+                 "Работает на встроенной локальной модели (ставит install.bat), ключ не нужен.",
             foreground="gray", justify="left",
         ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
 
