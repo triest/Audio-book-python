@@ -620,6 +620,64 @@ _tw = dict(_ar.tweaks_for(_hum, _src))
 check("asr repair: tweak 1 drops only the pause before the damaged word",
       _tw["drop pause before the damaged word"](_ssml) == '<s>назв+ать кур+ортом, но там,<break time="120ms"/> по кр+айней м+ере</s>')
 check("asr repair: tweak 2 drops every comma pause", "<break" not in _tw["drop all comma pauses"](_ssml))
+_ssml_p = '<p><prosody rate="95%" pitch="-5%"><s>но там,<break time="120ms"/> по</s></prosody></p>'
+check("asr repair: tweak 3 drops the emotion prosody, keeps the pauses",
+      _tw["drop emotion prosody"](_ssml_p) == '<p><s>но там,<break time="120ms"/> по</s></p>')
+check("asr repair: tweak 4 drops prosody and comma pauses",
+      _tw["drop emotion prosody and all comma pauses"](_ssml_p) == '<p><s>но там, по</s></p>')
+import io as _io, wave as _wave
+_buf = _io.BytesIO()
+with _wave.open(_buf, "wb") as _w:
+    _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(8000); _w.writeframes(bytes([16, 0]) * 8000)   # 1.0 s
+_cut = _ar.cut_spans(_buf.getvalue(), [(0.2, 0.3), (0.6, 0.65)])
+with _wave.open(_io.BytesIO(_cut), "rb") as _w:
+    _cut_dur = _w.getnframes() / _w.getframerate()
+check("asr repair: cut_spans removes the spans (1.0 s - 0.15 s, crossfade keeps the length)", abs(_cut_dur - 0.85) < 0.03, str(_cut_dur))
+check("asr repair: hum defect carries its time span", "t0" in _hum[0] and _hum[0]["t1"] > _hum[0]["t0"])
+check("asr repair: nudge_rate shifts an existing prosody rate", _ar.nudge_rate('<p><prosody rate="95%">x</prosody></p>', 5) == '<p><prosody rate="100%">x</prosody></p>')
+check("asr repair: nudge_rate wraps a paragraph without prosody", '<prosody rate="105%">' in _ar.nudge_rate("<speak><p>x</p></speak>", 5))
+_two = '<speak><p><prosody rate="100%" pitch="+0%"><s>Он сказ+ал это.</s><break time="270ms"/><s>На то,<break time="120ms"/> чт+обы уйт+и,</s></prosody></p></speak>'
+_sp = _ar.split_before_word(_two, "он сказал это на то чтобы уйти".split(), 3)
+check("asr repair: split_before_word cuts at the sentence of the damaged word and re-opens the tags",
+      isinstance(_sp, list) and len(_sp) == 2 and _sp[0].endswith("это.</s></prosody></p></speak>")
+      and _sp[1].startswith('<speak><p><prosody rate="100%" pitch="+0%"><s>На то,') and _sp.gap_ms == 270, str(_sp))
+check("asr repair: split_before_word leaves the first sentence alone",
+      _ar.split_before_word(_two, "он сказал это на то чтобы уйти".split(), 0) == _two)
+_j = _ar.join_wavs([_buf.getvalue(), _buf.getvalue()], 500)
+with _wave.open(_io.BytesIO(_j), "rb") as _w:
+    _jd = _w.getnframes() / _w.getframerate()
+check("asr repair: join_wavs = parts + the gap", abs(_jd - 2.5) < 0.01, str(_jd))
+_gsrc = "он сказал это на то чтобы уйти".split()
+_gk = ["", "", "s", "", "c", "", ""]
+_gw = [{"w": w, "s": i * 0.5, "e": i * 0.5 + 0.3} for i, w in enumerate(_gsrc)]
+check("asr repair: normal pauses are not gaps", [d for d in _ar.chunk_defects(_gsrc, _gw, kinds=_gk) if d["kind"] == "gap"] == [])
+_gw2 = [dict(x) for x in _gw]
+for x in _gw2[3:]:
+    x["s"] += 0.8; x["e"] += 0.8      # 0.2 + 0.8 = 1.0 s after a sentence end: an unexplained sound
+_gd = [d for d in _ar.chunk_defects(_gsrc, _gw2, kinds=_gk) if d["kind"] == "gap"]
+check("asr repair: an unexplained long pause after a sentence is a gap at the next word",
+      len(_gd) == 1 and _gsrc[_gd[0]["src_index"]] == "на" and _gd[0]["t1"] > _gd[0]["t0"], str(_gd))
+check("asr repair: no kinds -> no gap check", [d for d in _ar.chunk_defects(_gsrc, _gw2) if d["kind"] == "gap"] == [])
+_wb, _kd = _ar.source_boundaries("Он пришёл, увидел.\nНа том — всё.")
+check("asr repair: source_boundaries kinds (comma / sentence / paragraph / dash)",
+      _wb == ["он", "пришел", "увидел", "на", "том", "все"] and _kd == ["", "c", "p", "", "c", "s"], str((_wb, _kd)))
+import numpy as _np
+_sr = 16000
+_sig = _np.zeros(_sr * 2, dtype=_np.int16)
+_sig[: int(_sr * 0.3)] = (8000 * _np.sin(_np.arange(int(_sr * 0.3)) * 0.3)).astype(_np.int16)                  # word
+_sig[int(_sr * 1.0): int(_sr * 1.4)] = (8000 * _np.sin(_np.arange(int(_sr * 0.4)) * 0.2)).astype(_np.int16)    # hum in the pause
+_sig[int(_sr * 1.7):] = (8000 * _np.sin(_np.arange(_sr * 2 - int(_sr * 1.7)) * 0.3)).astype(_np.int16)         # next word
+_bw = _io.BytesIO()
+with _wave.open(_bw, "wb") as _w:
+    _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(_sr); _w.writeframes(_sig.tobytes())
+_vs = _ar.voiced_spans(_bw.getvalue(), 0.3, 1.7)
+check("asr repair: voiced_spans finds the hum inside the pause only",
+      len(_vs) == 1 and abs(_vs[0][0] - 1.0) < 0.05 and abs(_vs[0][1] - 1.4) < 0.05, str(_vs))
+_title = _asr("глава ладно уж оскар сказал он вернулся домой поздно вечером")
+_title[1]["e"] = _title[1]["s"] + 3.3
+_src_t = "глава ладно уж оскар сказал он вернулся домой поздно вечером".split()
+check("asr repair: stretch in the title of the first chunk is ignored",
+      _ar.chunk_defects(_src_t, _title, lead_ok=True) == [] and [d["kind"] for d in _ar.chunk_defects(_src_t, _title)] == ["stretch"])
 
 # ---- stress_llm (кнопка «Спросить LLM») ----
 import stress_llm as _sl

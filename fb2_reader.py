@@ -5626,18 +5626,26 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         )
         if ssml_tweak is not None:
             ssml = ssml_tweak(ssml)
-        resp = _get_with_retry(ssml_endpoint, {
-            "text_to_speech": ssml,
-            "speaker": chunk_speaker,
-            "sample_rate": sample_rate,
-            "raw_ssml": "true",
-            "strip_mono": "true" if strip_monosyllables else "false",
-            "server_accent": "false" if _client_layers else "true",
-        })
-        level = resp.headers.get("X-Synthesis-Level", "as-is")
-        if level != "as-is":
-            log(f"сервис использовал упрощённый вариант синтеза: {level}")
-        return resp.content
+
+        def request_ssml(one_ssml: str) -> bytes:
+            resp = _get_with_retry(ssml_endpoint, {
+                "text_to_speech": one_ssml,
+                "speaker": chunk_speaker,
+                "sample_rate": sample_rate,
+                "raw_ssml": "true",
+                "strip_mono": "true" if strip_monosyllables else "false",
+                "server_accent": "false" if _client_layers else "true",
+            })
+            level = resp.headers.get("X-Synthesis-Level", "as-is")
+            if level != "as-is":
+                log(f"сервис использовал упрощённый вариант синтеза: {level}")
+            return resp.content
+
+        if isinstance(ssml, list):
+            # автопочинка (asr_autorepair): кусок разрезан на независимые запросы, звук склеивается
+            from asr_autorepair import join_wavs
+            return join_wavs([request_ssml(part) for part in ssml], getattr(ssml, "gap_ms", 270))
+        return request_ssml(ssml)
 
     def synth_via_plain_text(plain_text_chunk: str, chunk_speaker: str) -> bytes:
         enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
@@ -5663,7 +5671,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                 wav_bytes = _asr_fixer.check_and_fix(
                     plain_text_chunk, wav_bytes,
                     lambda tweak: synth_via_ssml(plain_text_chunk, chunk_speaker, tweak),
-                    tag=f"гл.{idx} фрагм.{chunk_no}")
+                    tag=f"гл.{idx} фрагм.{chunk_no}", first_chunk=(chunk_no == 1))
         except Exception as e_ssml:
             log(f"[Гл.{idx} '{title}', фрагмент {chunk_no}] SSML-синтез не удался "
                 f"({_error_detail(e_ssml)}), пробую обычный текст без SSML...")
