@@ -158,6 +158,7 @@ class AudioCheckMixin:
     def _ac_open(self):
         win = getattr(self, "_ac_win", None)
         if win is not None and win.winfo_exists():
+            win.deiconify()
             win.lift()
             return
         self._ac_win = win = tk.Toplevel(self)
@@ -461,10 +462,10 @@ class AudioCheckMixin:
             pass
 
     def _ac_close_window(self):
+        """The cross hides the window instead of destroying it: a running scan or resynthesis keeps filling the same widgets,
+        and «Проверить звук готовых глав…» brings everything back (table, bar, counters)."""
         self._ac_release_player()
-        if self._ac_scanning():
-            self._ac_cancel.set()
-        self._ac_win.destroy()
+        self._ac_win.withdraw()
 
     def _ac_resynth(self):
         if self._ac_scanning():

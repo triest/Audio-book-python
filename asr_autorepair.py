@@ -439,6 +439,7 @@ class AsrWorker:
             return False
         try:
             env = dict(os.environ)
+            env["AUDIOBOOK_PARENT_PID"] = str(os.getpid())
             if self.model:
                 env["AUDIOBOOK_ASR_MODEL"] = self.model
             self.proc = subprocess.Popen([self._python, str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,

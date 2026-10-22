@@ -10,7 +10,28 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from asr_cache_cuda import load_16k  # noqa: E402
 
 
+def _exit_with_parent():
+    """The GUI closed (cross, crash, kill) while a long chapter is being decoded: stdin EOF would only be noticed after the job,
+    so a watcher thread ends the process as soon as the parent (AUDIOBOOK_PARENT_PID) is gone."""
+    pid = int(os.environ.get("AUDIOBOOK_PARENT_PID") or 0)
+    if not pid or sys.platform != "win32":
+        return
+    import ctypes
+    import threading
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+    if not handle:
+        return
+
+    def watch():
+        k32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def main():
+    _exit_with_parent()
     import torch
     import whisper
     model_name = os.environ.get("AUDIOBOOK_ASR_MODEL", "medium")
