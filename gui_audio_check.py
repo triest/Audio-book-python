@@ -55,6 +55,72 @@ def rows_to_csv(rows, path) -> None:
             w.writerow([idx, title, format_time(d.get("t", 0.0)), KIND_TEXT.get(d["kind"], d["kind"]), d["text"]])
 
 
+class MciPlayer:
+    """Plays a wav through the Windows MCI (winmm, stdlib ctypes - no extra packages): play from a position, pause, seek, stop.
+    One file is open at a time. Windows only; `available` is False elsewhere."""
+    ALIAS = "audiobook_check"
+
+    def __init__(self):
+        self.path = None
+        self._mci = None
+        try:
+            import ctypes
+            self._mci = ctypes.windll.winmm.mciSendStringW
+            self._ctypes = ctypes
+        except Exception:  # noqa: BLE001
+            self._mci = None
+
+    @property
+    def available(self) -> bool:
+        return self._mci is not None
+
+    def _send(self, cmd: str) -> str:
+        buf = self._ctypes.create_unicode_buffer(256)
+        err = self._mci(cmd, buf, 255, 0)
+        if err:
+            raise RuntimeError(f"MCI error {err}: {cmd}")
+        return buf.value
+
+    def open(self, path) -> None:
+        path = str(path)
+        if self.path == path:
+            return
+        self.close()
+        self._send(f'open "{path}" type waveaudio alias {self.ALIAS}')
+        self._send(f"set {self.ALIAS} time format milliseconds")
+        self.path = path
+
+    def length_ms(self) -> int:
+        return int(self._send(f"status {self.ALIAS} length") or 0) if self.path else 0
+
+    def position_ms(self) -> int:
+        return int(self._send(f"status {self.ALIAS} position") or 0) if self.path else 0
+
+    def mode(self) -> str:
+        return self._send(f"status {self.ALIAS} mode") if self.path else "stopped"
+
+    def play_from(self, ms: int) -> None:
+        self._send(f"play {self.ALIAS} from {max(int(ms), 0)}")
+
+    def pause(self) -> None:
+        self._send(f"pause {self.ALIAS}")
+
+    def resume(self) -> None:
+        self._send(f"resume {self.ALIAS}")
+
+    def stop(self) -> None:
+        if self.path:
+            self._send(f"stop {self.ALIAS}")
+
+    def close(self) -> None:
+        if self.path:
+            try:
+                self._send(f"close {self.ALIAS}")
+            except Exception:  # noqa: BLE001
+                pass
+        self.path = None
+
+
 class AudioCheckMixin:
 
     # ---- strip on the «Озвучка» tab ----
@@ -119,6 +185,32 @@ class AudioCheckMixin:
         self._ac_tree.configure(yscrollcommand=sb.set)
         self._ac_tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+
+        pl = ttk.LabelFrame(win, text="Плеер")
+        pl.pack(fill="x", padx=10, pady=(4, 0))
+        self._ac_player = MciPlayer()
+        self._ac_now = tk.StringVar(value="Выберите место в списке и нажмите ▶ (двойной щелчок тоже играет).")
+        ttk.Label(pl, textvariable=self._ac_now).pack(fill="x", padx=8, pady=(4, 0))
+        ctl = ttk.Frame(pl)
+        ctl.pack(fill="x", padx=8, pady=4)
+        self._ac_play_btn = ttk.Button(ctl, text="▶ Играть", width=11, command=self._ac_play)
+        self._ac_play_btn.pack(side="left")
+        ttk.Button(ctl, text="⏹ Стоп", width=8, command=self._ac_stop).pack(side="left", padx=(4, 0))
+        ttk.Button(ctl, text="−5 с", width=6, command=lambda: self._ac_jump(-5000)).pack(side="left", padx=(8, 0))
+        ttk.Button(ctl, text="+5 с", width=6, command=lambda: self._ac_jump(5000)).pack(side="left", padx=(4, 8))
+        self._ac_pos_var = tk.DoubleVar(value=0.0)
+        self._ac_seek = ttk.Scale(ctl, from_=0, to=1, variable=self._ac_pos_var, orient="horizontal")
+        self._ac_seek.pack(side="left", fill="x", expand=True)
+        self._ac_seek.bind("<ButtonPress-1>", lambda _e: setattr(self, "_ac_dragging", True))
+        self._ac_seek.bind("<ButtonRelease-1>", self._ac_seek_release)
+        self._ac_time = tk.StringVar(value="0:00 / 0:00")
+        ttk.Label(ctl, textvariable=self._ac_time, width=14, anchor="e").pack(side="left", padx=(8, 0))
+        self._ac_dragging = False
+        self._ac_paused = False
+        self._ac_key = None
+        self._ac_tick_on = False
+        self._ac_len_ms = 0
+        win.protocol("WM_DELETE_WINDOW", self._ac_close_window)
 
         bot = ttk.Frame(win)
         bot.pack(fill="x", padx=10, pady=(4, 10))
@@ -255,18 +347,117 @@ class AudioCheckMixin:
         return [self._ac_rows[i] for i in sel if i in self._ac_rows]
 
     def _ac_play(self):
+        """Play: a new row starts ~3 s before the place; the same row pauses while playing and resumes when paused."""
+        pl = self._ac_player
+        if not pl.available:
+            messagebox.showinfo("Послушать", "Встроенный плеер работает только в Windows.")
+            return
         rows = self._ac_selected()
-        if not rows:
-            messagebox.showinfo("Послушать", "Выберите место в списке.")
-            return
-        idx, title, wav, d = rows[0]
         try:
-            clip = ar.cut_clip(wav, d.get("t", 0.0))
+            if rows:
+                idx, title, wav, d = rows[0]
+                key = (str(wav), round(d.get("t", 0.0), 2))
+                if key != self._ac_key:
+                    pl.open(wav)
+                    self._ac_len_ms = pl.length_ms()
+                    self._ac_key = key
+                    self._ac_paused = False
+                    self._ac_now.set(f"Глава {idx} «{title}», место {format_time(d.get('t', 0.0))} — {d['text']}")
+                    pl.play_from(int(max(d.get("t", 0.0) - 3.0, 0.0) * 1000))
+                    self._ac_tick()
+                    return
+            elif self._ac_key is None:
+                messagebox.showinfo("Послушать", "Выберите место в списке.")
+                return
+            mode = pl.mode()
+            if mode == "playing":
+                pl.pause()
+                self._ac_paused = True
+            elif self._ac_paused:
+                pl.resume()
+                self._ac_paused = False
+            else:   # finished or stopped: from the same place again
+                pl.play_from(int(max(self._ac_key[1] - 3.0, 0.0) * 1000))
+            self._ac_tick()
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror("Послушать", f"Не удалось вырезать клип: {e}")
+            messagebox.showerror("Послушать", f"Не удалось воспроизвести: {e}")
+
+    def _ac_stop(self):
+        """Stop: silence at once; the slider goes to the beginning of the place, ▶ starts it again."""
+        try:
+            self._ac_player.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self._ac_paused = False
+        self._ac_tick()
+
+    def _ac_jump(self, delta_ms: int):
+        pl = self._ac_player
+        if not pl.path:
             return
-        from fb2_reader import play_file
-        threading.Thread(target=lambda: play_file(Path(clip)), daemon=True).start()
+        try:
+            self._ac_goto(pl.position_ms() + delta_ms)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ac_goto(self, ms: int):
+        pl = self._ac_player
+        ms = min(max(int(ms), 0), max(self._ac_len_ms - 50, 0))
+        was_paused = self._ac_paused
+        pl.play_from(ms)
+        if was_paused:
+            pl.pause()
+        self._ac_tick()
+
+    def _ac_seek_release(self, _event=None):
+        self._ac_dragging = False
+        if self._ac_player.path:
+            try:
+                self._ac_goto(self._ac_pos_var.get() * self._ac_len_ms)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _ac_tick(self):
+        """Main thread: keeps the slider, the time and the play/pause caption in step with the player; re-arms itself while playing."""
+        pl = self._ac_player
+        try:
+            if not self._ac_win.winfo_exists() or not pl.path:
+                return
+            mode = pl.mode()
+            pos = pl.position_ms()
+            self._ac_play_btn.configure(text="⏸ Пауза" if mode == "playing" else "▶ Играть")
+            if not self._ac_dragging:
+                self._ac_pos_var.set(pos / self._ac_len_ms if self._ac_len_ms else 0.0)
+            self._ac_time.set(f"{format_time(pos / 1000)} / {format_time(self._ac_len_ms / 1000)}")
+            if mode == "playing" and not self._ac_tick_on:
+                self._ac_tick_on = True
+                self.after(200, self._ac_tick_loop)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ac_tick_loop(self):
+        self._ac_tick_on = False
+        self._ac_tick()
+
+    def _ac_release_player(self):
+        """The player keeps the chapter file open: close it before the file is rewritten and when the window goes away."""
+        try:
+            self._ac_player.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._ac_key = None
+        self._ac_paused = False
+        try:
+            self._ac_play_btn.configure(text="▶ Играть")
+            self._ac_pos_var.set(0.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ac_close_window(self):
+        self._ac_release_player()
+        if self._ac_scanning():
+            self._ac_cancel.set()
+        self._ac_win.destroy()
 
     def _ac_resynth(self):
         if self._ac_scanning():
@@ -275,6 +466,7 @@ class AudioCheckMixin:
         if getattr(self, "_worker", None) and self._worker.is_alive():
             messagebox.showinfo("Пересинтез", "Дождитесь окончания текущей озвучки.")
             return
+        self._ac_release_player()
         rows = self._ac_selected() or list(self._ac_rows.values())
         indices = sorted({r[0] for r in rows})
         if not indices:
