@@ -273,26 +273,47 @@ class AudioCheckMixin:
         self._ac_thread.start()
         self.after(250, self._ac_poll)
 
+    SCAN_WORKERS = int(os.environ.get("AUDIOBOOK_SCAN_WORKERS", "3") or 3)
+
     def _ac_scan_thread(self, jobs):
+        """Several recognisers work on different chapters at once: one whisper process leaves the GPU mostly idle (≈7x real time),
+        three give ≈11x (measured on `small`); the chapters are taken from a shared queue."""
         q = self._ac_q
-        worker = ar.AsrWorker(log=lambda m: q.put(("log", m)), model=ar.CHAPTER_SCAN_MODEL)
+        todo: "queue.Queue" = queue.Queue()
+        for job in jobs:
+            todo.put(job)
+        workers = []
         try:
-            if not worker.start():
+            for _ in range(max(1, min(self.SCAN_WORKERS, len(jobs)))):
+                w = ar.AsrWorker(log=lambda m: q.put(("log", m)), model=ar.CHAPTER_SCAN_MODEL)
+                if w.start():
+                    workers.append(w)
+            if not workers:
                 q.put(("error", "Не удалось запустить распознавание (подробности в журнале)."))
                 return
-            for n, (idx, title, text, wav) in enumerate(jobs, 1):
-                if self._ac_cancel.is_set():
-                    break
-                q.put(("progress", f"Распознаю главу {idx} «{title}» ({n}/{len(jobs)})…"))
-                try:
-                    defects = ar.scan_chapter(worker, wav, text)
-                except Exception as e:  # noqa: BLE001
-                    q.put(("log", f"Проверка звука: глава {idx}: {e}"))
-                    q.put(("rows", idx, title, wav, []))
-                    continue
-                q.put(("rows", idx, title, wav, defects))
+
+            def run(worker):
+                while not self._ac_cancel.is_set():
+                    try:
+                        idx, title, text, wav = todo.get_nowait()
+                    except queue.Empty:
+                        return
+                    q.put(("progress", f"Распознаю главу {idx} «{title}»… (распознавателей: {len(workers)})"))
+                    try:
+                        defects = ar.scan_chapter(worker, wav, text)
+                    except Exception as e:  # noqa: BLE001
+                        q.put(("log", f"Проверка звука: глава {idx}: {type(e).__name__}: {e}"))
+                        defects = []
+                    q.put(("rows", idx, title, wav, defects))
+
+            threads = [threading.Thread(target=run, args=(w,), daemon=True) for w in workers]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
         finally:
-            worker.close()
+            for w in workers:
+                w.close()
             q.put(("done",))
 
     def _ac_update_stats(self):
@@ -328,6 +349,9 @@ class AudioCheckMixin:
                         iid = self._ac_tree.insert("", "end", values=(
                             f"{idx}. {title}", format_time(d.get("t", 0.0)), KIND_TEXT.get(d["kind"], d["kind"]), d["text"]))
                         self._ac_rows[iid] = (idx, title, wav, d)
+                    for pos, iid in enumerate(sorted(self._ac_tree.get_children(), key=lambda i: (
+                            self._ac_rows[i][0], self._ac_rows[i][3].get("t", 0.0)))):
+                        self._ac_tree.move(iid, "", pos)   # chapters finish in any order: keep the table sorted
                     self._ac_n_done += 1
                     self._ac_bar.configure(value=self._ac_n_done)
                 elif kind == "done":
