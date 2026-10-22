@@ -49,6 +49,7 @@ def asr_status() -> tuple:
                             f"tools\\fetch_whisper_model.py {ASR_MODEL} или install.bat)")
     return "off", "Проверка ASR недоступна: нет моделей whisper (запустите install.bat)"
 STRETCH_S = 2.5          # one word longer than this (Whisper may also stretch a word over a pause: only a trigger for a retry)
+MISSING_SEC_PER_WORD = 0.2   # a "missing" run is real only if the audio between its neighbours is shorter than this per source word
 MISSING_WORDS = 8        # swallowed run of source words
 _HUM_RE = re.compile(r"^(м+|э+м*|хм+|ам+|ы+|а{4,}|у{4,}|о{4,})$")
 _COMMA_BREAK_RE = re.compile(r',<break time="\d+ms"/>')
@@ -169,6 +170,12 @@ def _chunk_defects(src: list, words: list, lead_ok: bool = False, kinds: "list |
                             "t0": kept[j][1]["s"], "t1": kept[j][1]["e"]})
                 break
         if tag in ("delete", "replace") and i2 - i1 >= MISSING_WORDS and j2 - j1 < (i2 - i1) / 2:
+            # time the audio really spends between the recognised words around the gap: swallowed text leaves (almost) none,
+            # a passage Whisper merely misheard (digits, names, a mangled word) is still spoken for its natural duration
+            t_prev = kept[j1 - 1][1]["e"] if j1 > 0 else None
+            t_next = kept[j2][1]["s"] if j2 < len(kept) else None
+            if t_prev is not None and t_next is not None and t_next - t_prev >= MISSING_SEC_PER_WORD * (i2 - i1):
+                continue
             out.append({"kind": "missing", "src_index": i1, "text": " ".join(src[i1:i2])[:100],
                         "t": kept[min(j1, len(kept) - 1)][1]["s"] if kept else 0.0})
     for j, (w, x) in enumerate(kept):
@@ -386,7 +393,13 @@ def scan_chapter(worker, wav_path, text: str) -> list:
     """Whole-chapter ASR check of a finished chapter file: -> defects (see chunk_defects) with "t" = seconds from the start.
     The chapter-level transcript records a hum as a word much more reliably than the transcript of a single chunk."""
     src, kinds = source_boundaries(text)
-    defects = chunk_defects(src, worker.transcribe(str(wav_path)), lead_ok=True, kinds=kinds)
+    try:
+        with wave.open(str(wav_path), "rb") as w:
+            seconds = w.getnframes() / float(w.getframerate())
+    except (OSError, EOFError, wave.Error):
+        seconds = 1500.0
+    # small decodes ~8 s per minute of audio (a 45-minute chapter: 376 s) - far over the 180 s of a single chunk
+    defects = chunk_defects(src, worker.transcribe(str(wav_path), timeout=300.0 + seconds * 0.6), lead_ok=True, kinds=kinds)
     def real(d):
         if d["kind"] == "gap" and kinds[d["src_index"]] == "p" and d["t1"] - d["t0"] < 1.6:
             return False   # paragraph pause up to the 99.9th percentile (1.6 s) is normal: chunk joins add silence the chunk check never sees

@@ -6,6 +6,7 @@
 с включённой автопочинкой (она ловит гулы на каждом куске и лечит их). ASR не проверяет ударения — только что текст произнесён.
 Логика без Tk (`chapter_wav`, `build_jobs`, `format_time`, `rows_to_csv`) тестируется в `tools/test_accentuation.py`."""
 import csv
+import os
 import queue
 import threading
 import time
@@ -78,7 +79,9 @@ class MciPlayer:
         buf = self._ctypes.create_unicode_buffer(256)
         err = self._mci(cmd, buf, 255, 0)
         if err:
-            raise RuntimeError(f"MCI error {err}: {cmd}")
+            msg = self._ctypes.create_unicode_buffer(256)
+            self._ctypes.windll.winmm.mciGetErrorStringW(err, msg, 255)
+            raise RuntimeError(f"{msg.value} (MCI {err}, команда «{cmd.split(' ')[0]}»)")
         return buf.value
 
     def open(self, path) -> None:
@@ -86,9 +89,13 @@ class MciPlayer:
         if self.path == path:
             return
         self.close()
-        self._send(f'open "{path}" type waveaudio alias {self.ALIAS}')
-        self._send(f"set {self.ALIAS} time format milliseconds")
+        try:   # a leftover handle under our alias (a failed earlier open) would make every next open fail
+            self._send(f"close {self.ALIAS}")
+        except Exception:  # noqa: BLE001
+            pass
+        self._send(f'open "{os.path.abspath(path)}" type waveaudio alias {self.ALIAS}')
         self.path = path
+        self._send(f"set {self.ALIAS} time format milliseconds")
 
     def length_ms(self) -> int:
         return int(self._send(f"status {self.ALIAS} length") or 0) if self.path else 0

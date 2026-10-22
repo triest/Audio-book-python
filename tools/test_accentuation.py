@@ -615,6 +615,13 @@ _long[5]["e"] = _long[5]["s"] + 3.0
 check("asr repair: stretched word is found", [d["kind"] for d in _ar.chunk_defects(_src, _long)] == ["stretch"])
 check("asr repair: swallowed run of 8+ words is found",
       [d["kind"] for d in _ar.chunk_defects(_src, _asr("планету со столь сильным тяготением едва ли"))] == ["missing"])
+_mid_src = "он сказал что вообще то мэтьюс снега не любил но время от времени готов был сделать для него исключение и ушел".split()
+_mid_ok = _asr("он сказал что бла бла ушел")        # 6 words heard over ~1.8 s for 14 source words: still ~spoken, just misheard
+_mid_ok[3:] = [{"w": x["w"], "s": x["s"] + 3.0, "e": x["e"] + 3.0} for x in _mid_ok[3:]]
+check("asr repair: misheard passage that takes its natural time is not «missing»",
+      "missing" not in [d["kind"] for d in _ar.chunk_defects(_mid_src, _mid_ok)])
+check("asr repair: run that left no time in the audio is «missing»",
+      "missing" in [d["kind"] for d in _ar.chunk_defects(_mid_src, _asr("он сказал что бла бла ушел"))])
 _ssml = '<s>назв+ать кур+ортом,<break time="120ms"/> но там,<break time="120ms"/> по кр+айней м+ере</s>'
 _tw = dict(_ar.tweaks_for(_hum, _src))
 check("asr repair: tweak 1 drops only the pause before the damaged word",
