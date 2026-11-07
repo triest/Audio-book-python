@@ -5423,7 +5423,8 @@ def _prosody_wrap(escaped_sentence: str, original_sentence: str, emphasize: bool
 
 def text_to_ssml(text: str, sentence_break_ms: int = 320,
                   paragraph_break_ms: int = 550, comma_break_ms: int = 180,
-                  emphasize: bool = True, paragraph_prosody: "list | None" = None) -> str:
+                  emphasize: bool = True, paragraph_prosody: "list | None" = None,
+                  sentence_prosody: "dict | None" = None) -> str:
     """Превращает обычный текст главы в SSML-документ для Silero.
 
     * абзацы -> <p>, между ними длинная пауза (paragraph_break_ms);
@@ -5464,7 +5465,11 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
             )
             escaped = _DA_UZH_RE.sub(r'\1<break time="60ms"/> ', escaped)
             escaped = _LETTER_MARK_RE.sub(lambda m: f'<break time="100ms"/> <prosody rate="80%">{m.group(1)}</prosody>', escaped)
-            s_chunks.append(_prosody_wrap(escaped, sent, emphasize))
+            wrapped = _prosody_wrap(escaped, sent, emphasize)
+            spr = sentence_prosody.get(" ".join(sent.split())) if sentence_prosody else None
+            if spr:
+                wrapped = f'<prosody rate="{spr["rate"]}" pitch="{spr["pitch"]}">{wrapped}</prosody>'
+            s_chunks.append(wrapped)
         if s_chunks:
             inner = f'<break time="{sentence_break_ms}ms"/>'.join(s_chunks)
             para_prosody = paragraph_prosody[para_idx] if paragraph_prosody and para_idx < len(paragraph_prosody) else None
@@ -5708,6 +5713,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     # Заполняется заново для каждой главы (см. основной цикл ниже) —
     # {абзац_исходного_текста: {"rate":..,"pitch":..}} по классификации LLM.
     _chapter_para_prosody: dict = {}
+    _chapter_sentence_prosody: dict = {}
 
     # ASR-автопочинка (asr_autorepair.py): гул/растяжка/проглоченный кусок -> пересинтез кусков
     # с другими паузами. Любой сбой ASR оставляет озвучку как есть.
@@ -5743,6 +5749,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             comma_break_ms=comma_break_ms,
             emphasize=emphasize,
             paragraph_prosody=para_prosody_list,
+            sentence_prosody={" ".join(s.split()): _chapter_sentence_prosody[" ".join(s.split())]
+                             for p in plain_text_chunk.split("\n") for s in _SENT_SPLIT_RE.split(p)
+                             if s.strip() and " ".join(s.split()) in _chapter_sentence_prosody}
+            if _chapter_sentence_prosody else None,
         )
         if ssml_tweak is not None:
             ssml = ssml_tweak(ssml)
@@ -5873,12 +5883,14 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         run_stress_review_for_chapter(text, stress_dict, title)
 
         _chapter_para_prosody = {}
+        _chapter_sentence_prosody = {}
         if smart_emotion and _llm_provider_allowed(((emotion_attribution if emotion_attribution is not None else attribution) or {}).get("provider")):
             chapter_paras = [p for p in text.split("\n") if p.strip()]
+            chapter_sentences = [s.strip() for p in chapter_paras for s in _SENT_SPLIT_RE.split(p) if s.strip()]
             _emo_creds = emotion_attribution if emotion_attribution is not None else attribution
             try:
-                emo_labels = classify_paragraph_emotions_llm(
-                    chapter_paras, allowed_emotions=list(SILERO_EMOTION_PROSODY.keys()),
+                emo_sentence_labels = classify_paragraph_emotions_llm(
+                    chapter_sentences, allowed_emotions=list(SILERO_EMOTION_PROSODY.keys()),
                     api_key=(_emo_creds or {}).get("api_key", ""),
                     model=(_emo_creds or {}).get("model", DEFAULT_ATTRIBUTION_MODEL),
                     provider=(_emo_creds or {}).get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
@@ -5889,13 +5901,14 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                 # Keep all occurrences: a dict keyed only by paragraph text
                 # silently overwrote repeated paragraphs and moved the emotion
                 # from the last occurrence to every identical occurrence.
-                _chapter_para_prosody = {}
-                for n, (p, pr) in enumerate(zip(chapter_paras, smooth_emotion_prosody(emo_labels))):
-                    _chapter_para_prosody.setdefault(p, []).append((n, pr))
-                log(f"smart_emotion: определены эмоции для {len(chapter_paras)} абзац(ев) главы.")
+                _chapter_sentence_prosody = {
+                    " ".join(s.split()): pr for s, pr in zip(chapter_sentences, smooth_emotion_prosody(emo_sentence_labels))
+                }
+                log(f"smart_emotion: эмоции определены для {len(chapter_sentences)} предложений и {len(chapter_paras)} абзац(ев) главы.")
             except Exception as e:
                 log(f"smart_emotion не удался ({e}) — глава озвучивается без эмоциональной окраски.")
                 _chapter_para_prosody = {}
+                _chapter_sentence_prosody = {}
 
         # Группируем по голосу (диалоги/повествование и/или LLM-атрибуция
         # по персонажам, см. attribution), затем каждую группу — как
