@@ -225,6 +225,8 @@ class AudioCheckMixin:
         ttk.Button(bot, text="▶ Послушать место", command=self._ac_play).pack(side="left")
         ttk.Button(bot, text="Пересинтезировать главы с дефектами (с автопочинкой)",
                    command=self._ac_resynth).pack(side="left", padx=8)
+        ttk.Button(bot, text="Проверить ударения и OOV",
+                   command=self.check_ambiguous_stress).pack(side="left", padx=8)
         ttk.Button(bot, text="Сохранить список (CSV)…", command=self._ac_export).pack(side="left")
         self._ac_rows: dict = {}      # tree iid -> (idx, title, wav, defect)
         self._ac_q: "queue.Queue" = queue.Queue()

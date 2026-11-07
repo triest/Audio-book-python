@@ -5530,9 +5530,22 @@ def _prosody_for_line(line: str, prosody_by_para: dict):
     norm = " ".join(line.split())
     if not norm:
         return None
+    # Кусок может быть подстрокой сразу нескольких абзацев (например,
+    # короткая реплика повторяется в соседних сценах). Выбор первого
+    # совпадения зависит от порядка словаря и даёт «гуляющую» эмоцию.
+    # Берём самое короткое подходящее исходное предложение: это наиболее
+    # специфичный владелец данного куска и результат стабилен.
+    candidates = []
     for para, pr in prosody_by_para.items():
-        if len(para) > len(line) and norm in " ".join(para.split()):
-            return pr
+        para_norm = " ".join(para.split())
+        if len(para_norm) > len(norm) and norm in para_norm:
+            if isinstance(pr, list):
+                pr = pr[0][1] if pr else None
+            if pr:
+                candidates.append((len(para_norm), pr))
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
     return None
 
 
@@ -5873,9 +5886,12 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                     ollama_host=(_emo_creds or {}).get("ollama_host", ""),
                     log_fn=log,
                 )
-                _chapter_para_prosody = {
-                    p: pr for p, pr in zip(chapter_paras, smooth_emotion_prosody(emo_labels))
-                }
+                # Keep all occurrences: a dict keyed only by paragraph text
+                # silently overwrote repeated paragraphs and moved the emotion
+                # from the last occurrence to every identical occurrence.
+                _chapter_para_prosody = {}
+                for n, (p, pr) in enumerate(zip(chapter_paras, smooth_emotion_prosody(emo_labels))):
+                    _chapter_para_prosody.setdefault(p, []).append((n, pr))
                 log(f"smart_emotion: определены эмоции для {len(chapter_paras)} абзац(ев) главы.")
             except Exception as e:
                 log(f"smart_emotion не удался ({e}) — глава озвучивается без эмоциональной окраски.")
