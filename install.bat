@@ -788,6 +788,21 @@ if errorlevel 1 (
 :llm_done
 echo.
 
+rem Optional local VoxCPM2 environment (Python 3.10-3.12; kept separate from
+rem the main Python 3.14 environment and from Silero/ESpeech).
+if not exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
+    echo Creating optional .venv_voxcpm environment...
+    py -3.11 -m venv "%~dp0.venv_voxcpm"
+)
+if exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
+    set "VOX_PY=%~dp0.venv_voxcpm\Scripts\python.exe"
+    "%VOX_PY%" -m pip install --upgrade pip wheel --quiet
+    "%VOX_PY%" -m pip install voxcpm fastapi uvicorn soundfile
+    "%VOX_PY%" -c "from voxcpm import VoxCPM; print('VoxCPM2 environment is ready')"
+    if errorlevel 1 echo WARNING: VoxCPM2 environment check failed - GUI mode is not enabled yet.
+) else echo WARNING: Python 3.11 was not found - skipping optional VoxCPM2 environment.
+echo.
+
 goto :done
 
 :warn_partial
