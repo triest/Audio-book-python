@@ -61,7 +61,7 @@ LOG_FILE_MAX_BYTES = 2_000_000  # ~2 МБ — после этого старый
 # версией, сама перезапускает его - иначе после обновления файлов сервис
 # продолжал бы молча работать со старым кодом, пока пользователь не
 # перезапустит компьютер вручную (именно так сломалось удаление голосов).
-COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-08-23.10"
+COSYVOICE_EXPECTED_SERVICE_VERSION = "2026-11-10.12-gpu-local-audio"
 
 # Движки синтеза, которые умеет запускать cosyvoice_rest_service.py (см. его
 # ENGINE/TTS_ENGINE) - код (ключ словаря) идёт в переменную окружения
@@ -74,6 +74,8 @@ COSYVOICE_ENGINE_LABELS = {
     "f5winter": "F5-TTS-Russian winter (свежий чекпоинт, с ударениями)",
     "xtts": "XTTS-v2 (запасной, шумнее)",
     "cosyvoice3": "CosyVoice 3 (экспериментально, отдельное окружение)",
+    "voxcpm2": "VoxCPM2 (русский, клонирование, отдельное окружение)",
+    "kokoro_ru": "Kokoro-RU (быстро, отдельное окружение)",
 }
 COSYVOICE_ENGINE_CODES = {label: code for code, label in COSYVOICE_ENGINE_LABELS.items()}
 COSYVOICE_DEFAULT_ENGINE = "espeech"
@@ -85,6 +87,10 @@ COSYVOICE_DEFAULT_ENGINE = "espeech"
 # Порт и ожидаемая версия сервиса поэтому тоже отдельные.
 COSYVOICE3_DEFAULT_REST_URL = "http://localhost:5012"
 COSYVOICE3_EXPECTED_SERVICE_VERSION = "2026-08-24.15-transcribe-window-fix"
+VOXCPM_DEFAULT_REST_URL = "http://localhost:5014"
+VOXCPM_EXPECTED_SERVICE_VERSION = "2026-11-10.2-gui"
+KOKORO_DEFAULT_REST_URL = "http://localhost:5015"
+KOKORO_EXPECTED_SERVICE_VERSION = "2026-11-10.11-gui"
 
 
 def _write_log_file(s: str):

@@ -40,6 +40,15 @@ __pycache__/
 # зависимостей, torch==2.3.1 и т.д., несовместимые с .venv_cosyvoice) —
 # ставит install.bat, у каждого своё, гигабайты, в репозитории не нужно.
 .venv_cosyvoice3/
+.venv_kokoro/
+.venv_voxcpm/
+
+# Local Tcl/Tk runtime copied for the Windows Tkinter launcher.
+tcl_runtime/
+
+# User-specific CosyVoice voice profiles and samples.
+cosyvoice_voices.json
+voices/
 
 # Склонированный репозиторий CosyVoice (install.bat делает git clone) — у
 # него свой .git внутри, и сам он не нужен в этом репозитории.

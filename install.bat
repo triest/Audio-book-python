@@ -343,14 +343,13 @@ rem refuses to use any torch older than 2.5 (it silently falls back to
 rem "no GPU / CPU-only-ish" behavior instead of a hard error, which is
 rem confusing) - so we install an unpinned, current torch/torchaudio here
 rem instead of an old fixed version.
-"%CV_PY%" -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+"%CV_PY%" -m pip install --force-reinstall --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 if errorlevel 1 (
-    echo WARNING: CUDA ^(cu124^) build of torch failed - trying cu121 index...
-    "%CV_PY%" -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+    echo WARNING: CUDA ^(cu126^) build of torch failed - trying cu124 index...
+    "%CV_PY%" -m pip install --force-reinstall --no-deps torch==2.11.0+cu124 torchaudio==2.11.0+cu124 --index-url https://download.pytorch.org/whl/cu124
     if errorlevel 1 (
-        echo WARNING: CUDA builds of torch failed - trying the plain
-        echo ^(CPU-only^) build instead...
-        "%CV_PY%" -m pip install torch torchaudio
+        echo WARNING: CUDA ^(cu124^) build failed - trying the plain CPU build...
+        "%CV_PY%" -m pip install --upgrade torch torchaudio
         if errorlevel 1 echo WARNING: torch/torchaudio failed to install.
     )
 )
@@ -534,6 +533,10 @@ if errorlevel 1 (
     echo fixed. You can try running install.bat again, or report the exact
     echo error if it keeps failing.
 ) else (
+    rem Recent pyarrow wheels require NumPy 2.x; keep the inference environment
+    rem consistent so importing f5_tts does not fail inside pyarrow.
+    "%CV_PY%" -m pip install --upgrade "numpy>=2.0"
+    if errorlevel 1 echo WARNING: NumPy 2.x failed to install - F5-TTS may not load.
     echo.
     echo Pre-downloading the F5-TTS-Russian checkpoint ^(~1.3 GB, only needs
     echo to happen once - if this step is skipped or fails, the service will
@@ -544,6 +547,8 @@ if errorlevel 1 (
         echo it will be downloaded automatically the first time you use voice
         echo cloning instead ^(just makes the very first use slower^).
     )
+    "%CV_PY%" -c "from huggingface_hub import snapshot_download; snapshot_download('charactr/vocos-mel-24khz')"
+    if errorlevel 1 echo WARNING: could not pre-download the Vocos vocoder - F5-TTS will download it on first use.
     echo.
     echo Pre-downloading the ESpeech RL-V2 checkpoint ^(F5-based, another
     echo Russian finetune - reportedly less noisy than XTTS-v2, understands
@@ -796,11 +801,29 @@ if not exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
 )
 if exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
     set "VOX_PY=%~dp0.venv_voxcpm\Scripts\python.exe"
-    "%VOX_PY%" -m pip install --upgrade pip wheel --quiet
-    "%VOX_PY%" -m pip install voxcpm fastapi uvicorn soundfile
-    "%VOX_PY%" -c "from voxcpm import VoxCPM; print('VoxCPM2 environment is ready')"
-    if errorlevel 1 echo WARNING: VoxCPM2 environment check failed - GUI mode is not enabled yet.
+    "!VOX_PY!" -m pip install --upgrade pip wheel --quiet
+    "!VOX_PY!" -m pip install voxcpm fastapi uvicorn soundfile
+    "!VOX_PY!" -m pip install --force-reinstall --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+    "!VOX_PY!" -c "from voxcpm import VoxCPM; print('VoxCPM2 environment is ready')"
+    if errorlevel 1 echo WARNING: VoxCPM2 environment check failed - the mode will be unavailable.
 ) else echo WARNING: Python 3.11 was not found - skipping optional VoxCPM2 environment.
+echo.
+
+rem Optional local Kokoro-RU environment. It is isolated because its torch and
+rem kokoro frontend versions must not alter the proven ESpeech environment.
+if not exist "%~dp0.venv_kokoro\Scripts\python.exe" (
+    echo Creating optional .venv_kokoro environment...
+    py -3.11 -m venv "%~dp0.venv_kokoro"
+)
+if exist "%~dp0.venv_kokoro\Scripts\python.exe" (
+    set "KOKORO_PY=%~dp0.venv_kokoro\Scripts\python.exe"
+    "!KOKORO_PY!" -m pip install --upgrade pip wheel --quiet
+    "!KOKORO_PY!" -m pip install kokoro ruaccent huggingface_hub fastapi uvicorn soundfile
+    "!KOKORO_PY!" -m pip install --force-reinstall --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+    "!KOKORO_PY!" -c "from huggingface_hub import snapshot_download; snapshot_download('zaakirio/kokoro-ru', allow_patterns=['ru_g2p.py','kokoro-config.json','espeak-data/*','kokoro-ru-v2-base.pth','kokoro-ru-v2-dima.pth','voices/*.pt']); snapshot_download('ruaccent/accentuator')"
+    "!KOKORO_PY!" -c "from kokoro import KModel; from ruaccent import RUAccent; print('Kokoro-RU environment is ready')"
+    if errorlevel 1 echo WARNING: Kokoro-RU environment check failed - the mode will be unavailable.
+) else echo WARNING: Python 3.11 was not found - skipping optional Kokoro-RU environment.
 echo.
 
 goto :done

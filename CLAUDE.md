@@ -708,3 +708,69 @@ Silero в ~0,4 % кусков выдаёт гул («ммм» вместо «н�
 
 ## VoxCPM2 (9 ноября 2026)
 Добавлено изолированное окружение `.venv_voxcpm` через `install.bat` и отдельный REST-сервис `voxcpm_rest_service.py` на порту 5014. Модель `openbmb/VoxCPM2` загружается лениво; Silero, ESpeech и F5-сервис используют свои окружения. Подключение режима VoxCPM2 к GUI и оркестратору выполняется после проверки API установленной версии пакета.
+
+## Поиск моделей и обновлений TTS (9 ноября 2026)
+
+Проверены официальные страницы релизов и карточки моделей. Приоритет определяется русским языком, локальным запуском на GPU, пригодностью для длинного текста, наличием Python/REST-интерфейса и лицензией.
+
+### Рекомендуемый порядок работ
+
+1. **Закончить проверку и подключение VoxCPM2** — в проекте уже есть `voxcpm_rest_service.py`, отдельный `.venv_voxcpm` и строки установки в `install.bat`. `openbmb/VoxCPM2` поддерживает русский и ещё 29 языков, клонирование голоса, управление стилем и вывод 48 кГц. Это модель примерно на 2B параметров, поэтому на RTX 4060 Ti нужно отдельно проверить VRAM, FP16 и квантизацию. Официальные источники: `https://github.com/OpenBMB/VoxCPM`, `https://huggingface.co/openbmb/VoxCPM2`.
+2. **Обновить runtime F5-TTS**, сохранив ESpeech RL-V2 основным эталоном на порту 5011. Последний релиз F5-TTS — `1.1.22`; в основной ветке после релиза есть исправления потери последних слов в коротких чанках, распределения длительности, потокового режима и совместимости Torch/Torchaudio/TorchCodec. Проверять прежде всего короткие фразы и границы чанков. Источники: `https://github.com/SWivid/F5-TTS/releases`, `https://github.com/SWivid/F5-TTS/commits`.
+3. **Проверить Kokoro-RU** как быстрый резервный движок. `zaakirio/kokoro-ru` содержит русские ONNX/PyTorch-варианты и голоса `sveta`, `masha`, `dima`; модель небольшая и подходит для отдельного локального сервиса. Проверить длинные главы, ударения и лицензию OpenRAIL до распространения аудиокниги. Источники: `https://huggingface.co/zaakirio/kokoro-ru`, `https://github.com/meshoklv/ru-speech-bench/blob/master/docs/engines/kokoro.md`.
+4. **Обновить Piper** в `install.bat` до актуального `piper-tts` и проверить русские голоса. Ветка `OHF-Voice/piper1-gpl` имеет релиз `1.8.0`, обновления Windows/HTTP/API и официальный каталог русских голосов. Это быстрый CPU-fallback, а не замена ESpeech по качеству. Сам runtime GPL-3.0; лицензию каждого голоса проверять отдельно. Источники: `https://github.com/OHF-Voice/piper1-gpl/releases`, `https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md`.
+
+### Кандидаты, отложенные до отдельного прототипа
+
+- **Zonos2** поддерживает русский и локальный запуск, но требует отдельного Mini-SGLang-сервера и существенно более тяжёлой интеграции под Windows. Подключать только после проверки VRAM и Windows-совместимости. Источники: `https://github.com/Zyphra/ZONOS2`, `https://huggingface.co/Zyphra/ZONOS2`.
+- **OmniVoice** интересен для клонирования и многоязычности, но пока нет проверенного в проекте Windows REST-пути и доказанного качества длинного русского audiobook-текста. Не добавлять зависимость до рабочего прототипа.
+
+### Ограничения интеграции
+
+- Новые зависимости добавлять только в `install.bat`; ручной `pip install` пользователю не предлагать.
+- Для каждого нового REST-сервиса добавлять `SERVICE_VERSION`, бампать ожидаемую версию в GUI и проверять, что старый процесс на порту остановлен.
+- Перед включением нового движка прогонять один и тот же набор: 10–20 русских предложений, числа, омографы, `ё`, длинный абзац, границы чанков и минимум одну главу из `pepel-pobedy.fb2`.
+- Проверять отдельно: пропуски последних слов, проглатывание чисел, повторы, гул, длительные паузы, неверные ударения и стабильность после повторного запуска.
+- В отчёте фиксировать размер модели, VRAM, скорость, лицензию весов/кода, качество на главе и причину принятия или откладывания.
+
+### Актуальные ссылки для мониторинга
+
+- F5-TTS: `https://github.com/SWivid/F5-TTS/releases`
+- ESpeech RL-V2: `https://huggingface.co/ESpeech/ESpeech-TTS-1_RL-V2`
+- VoxCPM2: `https://huggingface.co/openbmb/VoxCPM2`
+- Kokoro-RU: `https://huggingface.co/zaakirio/kokoro-ru`
+- Piper: `https://github.com/OHF-Voice/piper1-gpl/releases`
+- Zonos2: `https://github.com/Zyphra/ZONOS2`
+
+### План внедрения
+
+**Этап 1 — базовая проверка существующего стека.** Зафиксировать текущий результат ESpeech RL-V2 и Silero на одинаковом тестовом наборе и главе 1. Сохранить время загрузки, VRAM, скорость, пропуски слов, числа, ударения, паузы и субъективную оценку.
+
+**Этап 2 — F5-TTS.** Обновить только F5 runtime через `install.bat`, не менять логику ESpeech и порт 5011. Проверить короткие фразы, последний chunk, длинный абзац, повторный запуск и совместимость Torch/Torchaudio/TorchCodec. При регрессии вернуть зафиксированную рабочую версию.
+
+**Этап 3 — VoxCPM2.** Проверить отдельное окружение и `voxcpm_rest_service.py`: `/health`, загрузку модели на CUDA, один короткий запрос, русский абзац, клонирование голоса и главу 1. После успешной проверки добавить режим в GUI, обновить `SERVICE_VERSION` и ожидаемую версию GUI.
+
+**Этап 4 — Kokoro-RU.** Создать отдельный прототип сервиса без изменения основного маршрута. Сравнить `sveta`, `masha` и `dima` на одинаковом русском тексте, проверить ONNX CPU/GPU, числа, `ё`, ударения и длинный текст. Отдельно сохранить проверку лицензии OpenRAIL.
+
+**Этап 5 — Piper.** Обновить пакет и русские голоса через `install.bat`, проверить скачивание, Windows API и воспроизведение. Оставить Piper быстрым CPU-fallback после проверки лицензий голосов.
+
+**Этап 6 — решение.** Принять модель в основной GUI только если она проходит тестовый набор, главу 1, проверку ASR на пропуски/повторы и ручное прослушивание A/B. Любую отложенную модель записать в этот раздел с причиной.
+
+### Критерии готовности нового движка
+
+- все зависимости устанавливаются только через `install.bat`;
+- модель запускается в предусмотренном Windows-окружении и пишет активное устройство;
+- REST-сервис имеет актуальный `SERVICE_VERSION`, а GUI не принимает старый процесс;
+- текстовые чанки не теряют начало/конец, числа и слова около границ;
+- ударения и `ё` проходят сухой прогон текущей цепочки;
+- глава 1 синтезируется без необъяснимых падений, повторов, проглатывания текста и длинных артефактных пауз;
+- лицензии кода, весов и голосов записаны отдельно;
+- качество подтверждено прослушиванием, поскольку ASR проверяет полноту текста, но не правильность ударения.
+
+## TTS engine validation results (November 2026)
+
+- **F5-TTS-Russian (`hotstone228/F5-TTS-Russian`)**: the separate `.venv_cosyvoice` now loads the local checkpoint on CUDA and returns a valid WAV for a short request. It is deferred for Russian audiobook use because this checkpoint receives ordinary text and does not honor the project's `+` stress markers; homographs such as `глаза` can be pronounced incorrectly. Client stress dictionaries cannot correct a model that ignores the markers. Keep ESpeech RL-V2 as the reference engine for stress-sensitive Russian output.
+- **Kokoro-RU**: the separate service on port 5015 and CUDA torch were checked with a short WAV request. `install.bat` downloads compatible `voices/*.pt` profiles; requesting the incomplete `voices/*` set caused startup failures. Long chapter quality and Russian stress are not yet accepted as a primary path.
+- **VoxCPM2**: a separate venv, service on port 5014, and GUI mode exist. A health request was checked, but a full chapter and Russian stress comparison were not completed. Use `tts-engine-validation/SKILL.md` before promoting it.
+
+The reusable validation workflow is documented in `tts-engine-validation/SKILL.md`.

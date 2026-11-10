@@ -7,7 +7,7 @@ import time
 import urllib.error
 import urllib.request
 
-from fb2_reader import COSYVOICE_DEFAULT_REST_URL
+from fb2_reader import COSYVOICE_DEFAULT_REST_URL, VOXCPM_DEFAULT_REST_URL, KOKORO_DEFAULT_REST_URL
 from gui_shared import (
     _app_dir,
     _log_exception_to_file,
@@ -16,6 +16,8 @@ from gui_shared import (
     COSYVOICE_EXPECTED_SERVICE_VERSION,
     COSYVOICE3_DEFAULT_REST_URL,
     COSYVOICE3_EXPECTED_SERVICE_VERSION,
+    VOXCPM_EXPECTED_SERVICE_VERSION,
+    KOKORO_EXPECTED_SERVICE_VERSION,
 )
 
 
@@ -251,7 +253,7 @@ class ServiceManagementMixin:
         try:
             with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                if not data.get("model_loaded"):
+                if not data.get("model_loaded") and not data.get("lazy_load"):
                     return False
                 # Сверяем строго, включая случай "поля вообще нет" (значит,
                 # это ещё более старая версия сервиса, до появления самой
@@ -315,6 +317,13 @@ class ServiceManagementMixin:
         """Внутренний код выбранного движка ("f5"/"xtts") по подписи,
         выбранной в выпадающем списке — уходит в переменную окружения
         TTS_ENGINE процесса сервиса."""
+        mode = self._current_mode()
+        if mode == "voxcpm2":
+            return "voxcpm2"
+        if mode == "f5_tts":
+            return "f5"
+        if mode == "kokoro_ru":
+            return "kokoro_ru"
         return COSYVOICE_ENGINE_CODES.get(self.cosyvoice_engine_var.get(), COSYVOICE_DEFAULT_ENGINE)
     def _on_cosyvoice_engine_changed(self, event=None):
         """При смене движка в выпадающем списке уже запущенный сервис
@@ -338,7 +347,19 @@ class ServiceManagementMixin:
             if current_url in ("", COSYVOICE_DEFAULT_REST_URL):
                 self.cosyvoice_rest_url_var.set(COSYVOICE3_DEFAULT_REST_URL)
             return
-        if current_url == COSYVOICE3_DEFAULT_REST_URL:
+        if engine == "voxcpm2":
+            if current_url in ("", COSYVOICE_DEFAULT_REST_URL, KOKORO_DEFAULT_REST_URL):
+                self.cosyvoice_rest_url_var.set(VOXCPM_DEFAULT_REST_URL)
+            self._set_cosyvoice_voices()
+            self._populate_dialogue_list()
+            return
+        if engine == "kokoro_ru":
+            if current_url in ("", COSYVOICE_DEFAULT_REST_URL, VOXCPM_DEFAULT_REST_URL):
+                self.cosyvoice_rest_url_var.set(KOKORO_DEFAULT_REST_URL)
+            self._set_cosyvoice_voices()
+            self._populate_dialogue_list()
+            return
+        if current_url in (COSYVOICE3_DEFAULT_REST_URL, VOXCPM_DEFAULT_REST_URL, KOKORO_DEFAULT_REST_URL):
             self.cosyvoice_rest_url_var.set(COSYVOICE_DEFAULT_REST_URL)
 
         if self._cosyvoice_proc is not None and self._cosyvoice_proc.poll() is None:
@@ -496,7 +517,8 @@ class ServiceManagementMixin:
         Движок CosyVoice3 обрабатывается отдельно (см.
         _ensure_cosyvoice3_service_running) - у него своё окружение
         (.venv_cosyvoice3) и свой порт."""
-        if self._cosyvoice_engine_code() == "cosyvoice3":
+        engine = self._cosyvoice_engine_code()
+        if engine == "cosyvoice3":
             # CosyVoice3 при первом запуске ещё и скачивает веса модели
             # (~1-2 ГБ с HuggingFace) поверх обычной загрузки в память GPU,
             # так что 900 сек (15 мин) не хватало на медленном соединении -
@@ -506,6 +528,43 @@ class ServiceManagementMixin:
             # код не передал явный ready_timeout.
             cv3_timeout = ready_timeout if ready_timeout != 900.0 else 2700.0
             return self._ensure_cosyvoice3_service_running(rest_url, ready_timeout=cv3_timeout)
+
+        if engine in ("voxcpm2", "kokoro_ru"):
+            if engine == "voxcpm2":
+                venv_name, script_name, port, expected = ".venv_voxcpm", "voxcpm_rest_service.py", 5014, VOXCPM_EXPECTED_SERVICE_VERSION
+            else:
+                venv_name, script_name, port, expected = ".venv_kokoro", "kokoro_rest_service.py", 5015, KOKORO_EXPECTED_SERVICE_VERSION
+            py = _app_dir() / venv_name / "Scripts" / "python.exe"
+            service_path = _app_dir() / script_name
+            if not py.exists() or not service_path.exists():
+                self.after(0, lambda: self.log(f"Режим {engine} не установлен. Запустите install.bat."))
+                return False
+            if self._cosyvoice_model_loaded(rest_url, expected_version=expected):
+                return True
+            self._kill_process_on_port(port)
+            env = dict(os.environ)
+            env["VOXCPM_PORT" if engine == "voxcpm2" else "KOKORO_PORT"] = str(port)
+            try:
+                self._cosyvoice_proc = subprocess.Popen(
+                    [str(py), str(service_path)], cwd=str(_app_dir()),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    bufsize=1, env=env,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+            except Exception as exc:
+                _log_exception_to_file(f"запуск сервиса {engine}")
+                err = str(exc)
+                self.after(0, lambda e=err: self.log(f"Не удалось запустить {engine}: {e}"))
+                return False
+            deadline = time.time() + ready_timeout
+            while time.time() < deadline:
+                if self._cosyvoice_model_loaded(rest_url, expected_version=expected):
+                    self.after(0, lambda: self.log(f"Сервис {engine} запущен."))
+                    return True
+                if self._cosyvoice_proc.poll() is not None:
+                    return False
+                time.sleep(1.0)
+            return False
 
         if getattr(sys, "frozen", False):
             self.after(0, lambda: self.log(

@@ -13,6 +13,11 @@ from gui_shared import (
 
 class CosyVoiceVoicesMixin:
     def _set_cosyvoice_voices(self):
+        engine = self._cosyvoice_engine_code()
+        if engine == "kokoro_ru":
+            self._cosyvoice_voices = ["sveta", "masha", "dima"]
+        elif engine == "voxcpm2":
+            self._cosyvoice_voices = ["default"]
         if not self._cosyvoice_voices:
             labels = ["(нет голосов — нажмите «Обновить голоса»)"]
             self.voice_combo.configure(values=labels, state="disabled")
@@ -25,6 +30,10 @@ class CosyVoiceVoicesMixin:
         """Запрашивает у сервиса CosyVoice REST текущий список профилей
         голоса (GET /voices) в фоновом потоке, чтобы не подвешивать окно
         на время сетевого запроса (сервис может ещё загружать модель)."""
+        if self._cosyvoice_engine_code() in ("voxcpm2", "kokoro_ru"):
+            self._set_cosyvoice_voices()
+            self._populate_dialogue_list()
+            return
         rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
         self.cosyvoice_refresh_btn.configure(state="disabled")
         self.log(f"Запрашиваю список голосов CosyVoice у {rest_url} …")
@@ -96,7 +105,7 @@ class CosyVoiceVoicesMixin:
         if not sel:
             return
         name = self.cosyvoice_voices_listbox.get(sel[0])
-        if self._current_mode() == "cosyvoice" and name in self._cosyvoice_voices:
+        if self._current_mode() in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru") and name in self._cosyvoice_voices:
             self.voice_combo.current(self._cosyvoice_voices.index(name))
     def _delete_selected_cosyvoice_voice(self):
         """Удаляет выбранный в списке на вкладке «Голоса CosyVoice» профиль

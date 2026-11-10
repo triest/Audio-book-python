@@ -162,6 +162,9 @@ TTS_MODES = {
     "silero": "Silero (локально, лучшее качество)",
     "silero_rest": "Silero REST (через сервис, SSML-паузы)",
     "cosyvoice": "CosyVoice (локально, GPU, клонирование голоса)",
+    "voxcpm2": "VoxCPM2 (локально, GPU, клонирование голоса)",
+    "f5_tts": "F5-TTS (локально, GPU, клонирование голоса)",
+    "kokoro_ru": "Kokoro-RU (локально, быстро)",
     "piper": "Piper (локально, CPU, быстро, без клонирования)",
     "yandex": "Yandex SpeechKit (облако, платно, нужен API-ключ)",
     "qwen_tts": "Qwen3-TTS (облако DashScope, платно, нужен API-ключ)",
@@ -201,6 +204,8 @@ PIPER_SAMPLE_RATE = 22050  # частота дискретизации у все
 # аудио + его текст), которыми можно клонировать любой голос — список
 # профилей запрашивается у сервиса через /voices.
 COSYVOICE_DEFAULT_REST_URL = "http://localhost:5011"
+VOXCPM_DEFAULT_REST_URL = "http://localhost:5014"
+KOKORO_DEFAULT_REST_URL = "http://localhost:5015"
 
 # Голоса Yandex SpeechKit (v1) на момент добавления — актуальный список
 # стоит сверять в консоли Yandex Cloud, он время от времени пополняется
@@ -6075,7 +6080,12 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
             try:
                 # CosyVoice-синтез заметно медленнее Silero даже на GPU
                 # (секунды на фразу) — таймаут увеличен с запасом.
-                resp = requests.get(endpoint, params=params, timeout=600)
+                # Kokoro-RU может заметно дольше обрабатывать длинный фрагмент
+                # при первой загрузке модели или после очистки CUDA-кэша. В этот
+                # момент TCP-соединение остаётся открытым, но старый таймаут
+                # ошибочно помечал сервис как недоступный и вставлял тишину.
+                request_timeout = 1800 if rest_url.endswith(":5015") else 600
+                resp = requests.get(endpoint, params=params, timeout=request_timeout)
                 resp.raise_for_status()
                 return resp
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:

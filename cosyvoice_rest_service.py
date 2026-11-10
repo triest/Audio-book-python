@@ -109,7 +109,7 @@ app = FastAPI()
 # продолжал бы обслуживать запросы своим старым кодом сколько угодно долго
 # после того, как программу обновили - новые эндпоинты/исправления просто
 # не были бы видны, пока пользователь вручную не перезапустит компьютер.
-SERVICE_VERSION = "2026-08-23.10"
+SERVICE_VERSION = "2026-11-10.12-gpu-local-audio"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -287,12 +287,37 @@ def _load_f5_model():
     from huggingface_hub import hf_hub_download
     from f5_tts.api import F5TTS
 
+    # Новые torchaudio на Windows используют torchcodec и требуют отдельные
+    # FFmpeg DLL. Для WAV-профилей достаточно soundfile, который не зависит от
+    # системного FFmpeg. Подменяем только загрузчик F5-TTS и оставляем штатный
+    # путь первым, чтобы рабочие установки не менялись.
+    import f5_tts.infer.utils_infer as f5_utils
+    if not getattr(f5_utils, "_audiobook_soundfile_loader", False):
+        _torchaudio_load = f5_utils.torchaudio.load
+
+        def _load_audio_with_wav_fallback(path, *args, **kwargs):
+            try:
+                return _torchaudio_load(path, *args, **kwargs)
+            except Exception:
+                import soundfile as sf
+                arr, sr = sf.read(path, dtype="float32", always_2d=True)
+                return torch.from_numpy(np.ascontiguousarray(arr.T)), int(sr)
+
+        f5_utils.torchaudio.load = _load_audio_with_wav_fallback
+        f5_utils._audiobook_soundfile_loader = True
+
     logger.info(f"Скачиваю/проверяю чекпоинт F5-TTS-Russian ({F5_MODEL_REPO}) - "
                 "при первом запуске это ~1.3 ГБ, один раз...")
-    ckpt_path = hf_hub_download(repo_id=F5_MODEL_REPO, filename=F5_CKPT_FILENAME,
-                                 local_dir=str(F5_MODEL_DIR))
-    vocab_path = hf_hub_download(repo_id=F5_MODEL_REPO, filename=F5_VOCAB_FILENAME,
-                                  local_dir=str(F5_MODEL_DIR))
+    local_ckpt = F5_MODEL_DIR / F5_CKPT_FILENAME
+    local_vocab = F5_MODEL_DIR / F5_VOCAB_FILENAME
+    if local_ckpt.is_file() and local_ckpt.stat().st_size > 0 and local_vocab.is_file() and local_vocab.stat().st_size > 0:
+        ckpt_path, vocab_path = str(local_ckpt), str(local_vocab)
+        logger.info("Найден локальный чекпойнт F5-TTS-Russian — сетевое обращение к Hugging Face не требуется.")
+    else:
+        ckpt_path = hf_hub_download(repo_id=F5_MODEL_REPO, filename=F5_CKPT_FILENAME,
+                                     local_dir=str(F5_MODEL_DIR))
+        vocab_path = hf_hub_download(repo_id=F5_MODEL_REPO, filename=F5_VOCAB_FILENAME,
+                                     local_dir=str(F5_MODEL_DIR))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Загружаю модель F5-TTS-Russian на устройство {device} ...")

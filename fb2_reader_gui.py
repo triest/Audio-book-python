@@ -25,6 +25,8 @@ from fb2_reader import (
     PIPER_VOICES,
     PIPER_DEFAULT_VOICE,
     COSYVOICE_DEFAULT_REST_URL,
+    VOXCPM_DEFAULT_REST_URL,
+    KOKORO_DEFAULT_REST_URL,
     QWEN_TTS_VOICES,
     QWEN_TTS_DEFAULT_VOICE,
     QWEN_TTS_LOCAL_DEFAULT_URL,
@@ -82,6 +84,8 @@ from gui_shared import (
     COSYVOICE_DEFAULT_ENGINE,
     COSYVOICE3_DEFAULT_REST_URL,
     COSYVOICE3_EXPECTED_SERVICE_VERSION,
+    VOXCPM_EXPECTED_SERVICE_VERSION,
+    KOKORO_EXPECTED_SERVICE_VERSION,
     _app_dir,
     _write_log_file,
     _log_exception_to_file,
@@ -686,6 +690,8 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         mode = self._current_mode()
         self.mode_desc.configure(text=TTS_MODES.get(mode, ""))
         self._update_mode_dependent_widgets()
+        if mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru"):
+            self._on_cosyvoice_engine_changed()
 
     def _show_row(self, *widgets, show):
         """Показывает или полностью убирает из сетки (grid_remove/grid)
@@ -701,8 +707,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
 
     def _update_mode_dependent_widgets(self):
         mode = self._current_mode()
+        model_service_mode = mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru")
         silero_like = mode in ("silero", "silero_rest")
-        pauses_supported = mode in ("silero", "silero_rest", "cosyvoice", "piper")
+        pauses_supported = mode in ("silero", "silero_rest", "cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru", "piper")
         self.model_combo.configure(state="readonly" if silero_like else "disabled")
         self.rest_url_entry.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.auto_start_rest_check.configure(state="normal" if mode == "silero_rest" else "disabled")
@@ -730,11 +737,11 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         # не перегружать интерфейс полями, которые всё равно ни на что не
         # влияют в этом режиме.
         self._show_row(self.model_label, self.model_row, show=silero_like)
-        self._show_row(self.sample_rate_label, self.sample_rate_combo, show=silero_like or mode == "cosyvoice")
+        self._show_row(self.sample_rate_label, self.sample_rate_combo, show=silero_like or model_service_mode)
         self._show_row(self.rest_url_label, self.rest_url_entry, show=mode == "silero_rest")
         self._show_row(self.auto_start_rest_check, show=mode == "silero_rest")
         self._show_row(self.rate_label, self.rate_spin, show=mode == "offline")
-        self._show_row(self.cosyvoice_tab_hint, show=mode == "cosyvoice")
+        self._show_row(self.cosyvoice_tab_hint, show=model_service_mode)
 
         # Блок Yandex SpeechKit и блок интонации/пауз (для Silero и
         # CosyVoice — у CosyVoice нет SSML, но паузы вставляются вручную
@@ -764,7 +771,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             self._set_yandex_voice_placeholder()
         elif mode in ("qwen_tts", "qwen_tts_local"):
             self._set_qwen_voice_placeholder()
-        elif mode == "cosyvoice":
+        elif model_service_mode:
             self._set_cosyvoice_voices()
             if not self._cosyvoice_voices:
                 self.refresh_cosyvoice_voices()
@@ -833,7 +840,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             return list(self._yandex_voice_keys)
         if mode in ("qwen_tts", "qwen_tts_local"):
             return list(self._qwen_voice_keys)
-        if mode == "cosyvoice":
+        if mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru"):
             return list(self._cosyvoice_voices)
         if mode == "piper":
             return list(self._piper_voice_keys) or list(PIPER_VOICES.keys())
@@ -848,7 +855,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.dialogue_list.delete(0, "end")
         supported = mode in (
             "silero", "silero_rest", "offline", "yandex", "qwen_tts", "qwen_tts_local",
-            "cosyvoice", "piper",
+            "cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru", "piper",
         )
 
         if mode in ("silero", "silero_rest"):
@@ -870,7 +877,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             qwen_voices = QWEN_TTS_LOCAL_VOICES if mode == "qwen_tts_local" else QWEN_TTS_VOICES
             for k, v in qwen_voices.items():
                 self.dialogue_list.insert("end", f"{k} — {v}")
-        elif mode == "cosyvoice":
+        elif mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru"):
             for k in self._cosyvoice_voices:
                 self.dialogue_list.insert("end", k)
             if len(self._cosyvoice_voices) < 2:
@@ -1138,7 +1145,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             main_voice = self._selected_silero_speaker()
         elif mode == "offline":
             main_voice = self._selected_offline_voice_id()
-        elif mode == "cosyvoice":
+        elif mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru"):
             main_voice = self._selected_cosyvoice_voice()
         elif mode == "piper":
             main_voice = self._selected_piper_voice()
@@ -1282,8 +1289,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             self.clipboard_append(marked)
 
         def save():
+            safe_title = re.sub(r"[^\w-]+", "_", title).strip("_") or "chapter"
             path = filedialog.asksaveasfilename(parent=win, defaultextension=".txt",
-                                                initialfile=f"{re.sub(r'[^\w-]+', '_', title).strip('_') or 'chapter'}_ударения.txt",
+                                                initialfile=f"{safe_title}_ударения.txt",
                                                 filetypes=[("Text", "*.txt")])
             if path:
                 Path(path).write_text(marked, encoding="utf-8")
@@ -1500,9 +1508,14 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                     finally:
                         if self.qwen_local_auto_stop_var.get():
                             self._stop_qwen_local_service()
-                elif mode == "cosyvoice":
+                elif mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru"):
                     cv_rest_url = self.cosyvoice_rest_url_var.get().strip() or COSYVOICE_DEFAULT_REST_URL
                     if self._rest_url_is_local(cv_rest_url):
+                        service_label = {
+                            "voxcpm2": "VoxCPM2",
+                            "f5_tts": "F5-TTS",
+                            "kokoro_ru": "Kokoro-RU",
+                        }.get(mode, "CosyVoice")
                         # Не просто "не отвечает вообще" - вызываем всегда,
                         # т.к. _ensure_cosyvoice_service_running сам умеет
                         # отличить "сервис отвечает, но модель не
@@ -1510,14 +1523,14 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         # по-настоящему готового сервиса, и перезапускает
                         # его в первом случае.
                         self.after(0, lambda: self.log(
-                            "Проверяю сервис CosyVoice (при необходимости запущу/перезапущу "
+                            f"Проверяю сервис {service_label} (при необходимости запущу/перезапущу "
                             "его автоматически, без отдельной консоли)…"
                         ))
                         if not self._ensure_cosyvoice_service_running(cv_rest_url):
                             raise RuntimeError(
-                                "Не удалось автоматически запустить сервис CosyVoice. "
+                                f"Не удалось автоматически запустить сервис {service_label}. "
                                 "Подробности — в журнале выше и в logs\\fb2_reader_gui.log. "
-                                "Проверьте, что install.bat успешно поставил CosyVoice."
+                                f"Проверьте, что install.bat успешно поставил {service_label}."
                             )
                     cv_stats = run_cosyvoice(
                         self.chapters,
