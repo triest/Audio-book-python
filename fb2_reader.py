@@ -167,6 +167,7 @@ TTS_MODES = {
     "kokoro_ru": "Kokoro-RU (локально, быстро)",
     "piper": "Piper (локально, CPU, быстро, без клонирования)",
     "yandex": "Yandex SpeechKit (облако, платно, нужен API-ключ)",
+    "genvoice": "GenVoice (облако, API, оплата в рублях)",
     "qwen_tts": "Qwen3-TTS (облако DashScope, платно, нужен API-ключ)",
     "qwen_tts_local": "Qwen3-TTS (локально, GPU, без интернета/карты)",
     "online": "Google TTS (нужен интернет)",
@@ -2470,6 +2471,145 @@ def run_yandex(chapters, outdir: Path, start: int, play: bool, api_key: str, fol
             print("  Проигрывание...")
             (play_fn or play_file)(out_path)
 
+    print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
+
+
+GENVOICE_TTS_URL = "https://api.genvoice.ru/v1/api/tts"
+GENVOICE_MAX_CHARS = 480  # API limit is 500 source characters.
+
+
+def _split_genvoice_text(text: str) -> list[str]:
+    """Sentence-first split that guarantees no request exceeds the API cap."""
+    result = []
+    for sentence in split_text(text, GENVOICE_MAX_CHARS):
+        if len(sentence) <= GENVOICE_MAX_CHARS:
+            result.append(sentence)
+            continue
+        current = ""
+        for word in sentence.split():
+            pieces = ([word[i:i + GENVOICE_MAX_CHARS]
+                       for i in range(0, len(word), GENVOICE_MAX_CHARS)]
+                      if len(word) > GENVOICE_MAX_CHARS else [word])
+            for piece in pieces:
+                if current and len(current) + 1 + len(piece) > GENVOICE_MAX_CHARS:
+                    result.append(current)
+                    current = ""
+                current = f"{current} {piece}".strip()
+        if current:
+            result.append(current)
+    return result
+
+
+def synth_genvoice_chunk(text: str, api_key: str, voice_id: str, speed: float = 1.0,
+                         log_fn=None) -> bytes:
+    """Call GenVoice synchronous TTS endpoint and return MP3 bytes.
+
+    GenVoice documents '+' before a stressed vowel; keep the project stress
+    marks intact. The public endpoint accepts up to 500 source characters.
+    """
+    if not api_key:
+        raise ValueError("Не указан API-ключ GenVoice (поле в GUI или GENVOICE_API_KEY).")
+    if not voice_id:
+        raise ValueError("Укажите voice_id голоса GenVoice в настройках режима.")
+    import urllib.error
+    import urllib.request
+
+    payload = json.dumps({
+        "text": text,
+        "voice_id": voice_id,
+        "output_format": "mp3_24000_48",
+        "speed": speed,
+        "normalize": True,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        GENVOICE_TTS_URL,
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            data = response.read()
+            content_type = response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"GenVoice вернул HTTP {exc.code}: {body}") from exc
+    if not data or not ("audio" in content_type or data.startswith(b"ID3") or data[:2] == b"\xff\xfb"):
+        raise RuntimeError(f"GenVoice вернул не аудио (Content-Type: {content_type or 'не указан'}).")
+    if log_fn:
+        log_fn(f"GenVoice: получено {len(data)} байт ({content_type or 'audio'}).")
+    return data
+
+
+def run_genvoice(chapters, outdir: Path, start: int, play: bool, api_key: str,
+                 voice_id: str, speed: float = 1.0, on_progress=None,
+                 chapter_indices=None, char_ranges=None, should_stop=None, play_fn=None,
+                 book_stress_overrides_path=None, strip_monosyllables: bool = True):
+    """Generate chapter MP3 files through GenVoice, preserving project stress marks."""
+    import time as _time
+    outdir.mkdir(parents=True, exist_ok=True)
+    selection = _select_chapters(chapters, start=start, chapter_indices=chapter_indices,
+                                  char_ranges=char_ranges)
+    total = len(selection) or 1
+    log_path = outdir / "genvoice_client.log"
+
+    def log(message):
+        line = f"{_time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        print(f"  {message}")
+        try:
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+        except OSError:
+            pass
+
+    for pos, (idx, title, text) in enumerate(selection, 1):
+        if should_stop and should_stop():
+            print("Остановлено пользователем (после предыдущей главы).")
+            break
+        out_path = outdir / f"{idx:03d}_{sanitize_filename(title)}.mp3"
+        fingerprint = _params_fingerprint(
+            text, mode="genvoice", voice_id=voice_id, speed=speed,
+            strip_monosyllables=strip_monosyllables,
+            stress_dict=stress_dict_digest(load_stress_dictionary(book_overrides_path=book_stress_overrides_path), text),
+        )
+        if _is_already_done(out_path, fingerprint):
+            print(f"[{idx}/{len(chapters)}] Пропускаю (уже озвучено): {title} -> {out_path.name}")
+            if on_progress:
+                on_progress(pos, total, 1, 1)
+            continue
+        reset_stress_context()
+        marked_text, stress_info = stress_dry_run(
+            text, strip_monosyllables=strip_monosyllables,
+            book_overrides_path=book_stress_overrides_path,
+        )
+        chunks = _split_genvoice_text(marked_text)
+        chunks_total = len(chunks) or 1
+        if on_progress:
+            on_progress(pos, total, 0, chunks_total)
+        audio_chunks = []
+        log(f"Глава {idx}: чанков {len(chunks)}, меток ударения {stress_info.get('marks', 0)}.")
+        for chunk_no, chunk in enumerate(chunks, 1):
+            if chunk.strip() and _text_has_speakable_content(chunk):
+                audio_chunks.append(synth_genvoice_chunk(chunk, api_key, voice_id, speed, log_fn=log))
+            if on_progress:
+                on_progress(pos, total, chunk_no, chunks_total)
+        if not audio_chunks:
+            continue
+        if len(audio_chunks) == 1:
+            out_path.write_bytes(audio_chunks[0])
+        else:
+            try:
+                from pydub import AudioSegment
+                import io as _io
+                combined = AudioSegment.empty()
+                for data in audio_chunks:
+                    combined += AudioSegment.from_file(_io.BytesIO(data), format="mp3")
+                combined.export(str(out_path), format="mp3")
+            except ImportError as exc:
+                raise RuntimeError("Для склейки чанков GenVoice требуется pydub из install.bat.") from exc
+        _save_fingerprint(out_path, fingerprint)
+        if play:
+            (play_fn or play_file)(out_path)
     print(f"\nГотово. Файлы сохранены в: {outdir.resolve()}")
 
 
@@ -6811,7 +6951,7 @@ def main():
     ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
     ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
     ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "cosyvoice", "piper",
-                                        "yandex", "qwen_tts", "qwen_tts_local"],
+                                        "yandex", "genvoice", "qwen_tts", "qwen_tts_local"],
                      default="silero",
                      help="silero = нейросетевой голос локально через torch.hub; "
                           "silero_rest = синтез через Silero-REST-Service с интонационными паузами "
@@ -6942,6 +7082,12 @@ def main():
     ap.add_argument("--yandex-api-key", type=str, default="",
                      help="API-ключ Yandex SpeechKit (режим yandex); можно также задать "
                           "переменной окружения YANDEX_API_KEY")
+    ap.add_argument("--genvoice-api-key", type=str, default="",
+                     help="API-ключ GenVoice (режим genvoice); можно задать GENVOICE_API_KEY")
+    ap.add_argument("--genvoice-voice-id", type=str, default="",
+                     help="ID публичного или персонального голоса GenVoice")
+    ap.add_argument("--genvoice-speed", type=float, default=1.0,
+                     help="скорость GenVoice, от 0.5 до 2.0")
     ap.add_argument("--yandex-folder-id", type=str, default="",
                      help="Folder ID каталога в Yandex Cloud (режим yandex); можно также задать "
                           "переменной окружения YANDEX_FOLDER_ID")
@@ -7142,6 +7288,15 @@ def main():
                    voice=args.yandex_voice, speed=args.yandex_speed, emotion=args.yandex_emotion,
                    chapter_indices=chapter_indices, dialogue_voices=dialogue_voices,
                    attribution=attribution, smart_emotion=args.yandex_smart_emotion)
+    elif args.mode == "genvoice":
+        api_key = args.genvoice_api_key or os.environ.get("GENVOICE_API_KEY", "")
+        run_genvoice(
+            chapters, args.outdir, args.start, args.play, api_key,
+            args.genvoice_voice_id, speed=args.genvoice_speed,
+            chapter_indices=chapter_indices,
+            book_stress_overrides_path=book_manual_stress_overrides_path(args.book),
+            strip_monosyllables=not args.keep_monosyllable_stress,
+        )
     elif args.mode == "qwen_tts":
         api_key = args.qwen_api_key or os.environ.get("DASHSCOPE_API_KEY", "")
         dialogue_voices = [v.strip() for v in args.qwen_dialogue_voices.split(",") if v.strip()] or None

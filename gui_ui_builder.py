@@ -618,6 +618,34 @@ class UIBuilderMixin:
         yandex_frame.columnconfigure(1, weight=1)
         self._yandex_frame = yandex_frame
 
+        # --- GenVoice public TTS API ---
+        genvoice_frame = ttk.LabelFrame(right_scroll, text="GenVoice (облачный API)", padding=10)
+        genvoice_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(genvoice_frame, text="API-ключ:").grid(row=0, column=0, sticky="w", pady=3)
+        self.genvoice_api_key_var = tk.StringVar(value=os.environ.get("GENVOICE_API_KEY", ""))
+        self.genvoice_api_key_entry = add_context_menu(
+            ttk.Entry(genvoice_frame, textvariable=self.genvoice_api_key_var, show="•")
+        )
+        self.genvoice_api_key_entry.grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(genvoice_frame, text="ID голоса:").grid(row=1, column=0, sticky="w", pady=3)
+        self.genvoice_voice_id_var = tk.StringVar(value="")
+        self.genvoice_voice_id_entry = add_context_menu(
+            ttk.Entry(genvoice_frame, textvariable=self.genvoice_voice_id_var)
+        )
+        self.genvoice_voice_id_entry.grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Label(genvoice_frame, text="Скорость:").grid(row=2, column=0, sticky="w", pady=3)
+        self.genvoice_speed_var = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(genvoice_frame, from_=0.5, to=2.0, increment=0.1,
+                    textvariable=self.genvoice_speed_var, width=8).grid(row=2, column=1, sticky="w", pady=3)
+        ttk.Label(genvoice_frame,
+                  text="API: до 500 символов на запрос; ударения передаются знаком +. "
+                       "ID голоса возьмите из каталога GenVoice.",
+                  foreground="#555", justify="left", wraplength=360).grid(
+                      row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        genvoice_frame.columnconfigure(1, weight=1)
+        self._genvoice_frame = genvoice_frame
+        self._genvoice_frame.pack_forget()
+
         # --- Qwen3-TTS: облачный (DashScope) и локальный (свой сервер) ---
         qwen_frame = ttk.LabelFrame(
             right_scroll, text="Qwen3-TTS (режимы qwen_tts / qwen_tts_local)", padding=10

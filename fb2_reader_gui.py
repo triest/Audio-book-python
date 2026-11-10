@@ -47,6 +47,7 @@ from fb2_reader import (
     run_silero,
     run_silero_rest,
     run_yandex,
+    run_genvoice,
     run_qwen_tts,
     run_qwen_tts_local,
 )
@@ -133,6 +134,7 @@ SETTINGS_FIELDS = [
     "accent_var", "yo_var", "emphasis_var", "stress_engine_var", "smart_emotion_var",
     "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
     "yandex_emotion_var", "yandex_smart_emotion_var",
+    "genvoice_api_key_var", "genvoice_voice_id_var", "genvoice_speed_var",
     "qwen_api_key_var", "qwen_voice_var",
     "qwen_local_url_var", "qwen_local_start_cmd_var", "qwen_local_auto_stop_var",
     "dialogue_var", "attribution_var", "attribution_provider_var",
@@ -720,6 +722,10 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.yandex_folder_id_entry.configure(state=yandex_field_state)
         self.yandex_voice_combo.configure(state="readonly" if mode == "yandex" else "disabled")
 
+        genvoice_field_state = "normal" if mode == "genvoice" else "disabled"
+        self.genvoice_api_key_entry.configure(state=genvoice_field_state)
+        self.genvoice_voice_id_entry.configure(state=genvoice_field_state)
+
         qwen_field_state = "normal" if mode == "qwen_tts" else "disabled"
         self.qwen_api_key_entry.configure(state=qwen_field_state)
         qwen_local_field_state = "normal" if mode == "qwen_tts_local" else "disabled"
@@ -748,10 +754,13 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         # между кусками текста, см. run_cosyvoice) — целиком показываются/
         # прячутся вместе с рамкой.
         self._yandex_frame.pack_forget()
+        self._genvoice_frame.pack_forget()
         self._qwen_frame.pack_forget()
         self._intonation_frame.pack_forget()
         if mode == "yandex":
             self._yandex_frame.pack(fill="x", pady=(8, 0))
+        elif mode == "genvoice":
+            self._genvoice_frame.pack(fill="x", pady=(8, 0))
         if mode in ("qwen_tts", "qwen_tts_local"):
             self._qwen_frame.pack(fill="x", pady=(8, 0))
         if pauses_supported:
@@ -777,6 +786,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                 self.refresh_cosyvoice_voices()
         elif mode == "piper":
             self._set_piper_voices()
+        elif mode == "genvoice":
+            self.voice_combo.configure(values=["Голос задаётся по ID в блоке GenVoice"], state="disabled")
+            self.voice_combo.current(0)
         else:
             self._set_online_voice()
 
@@ -1458,6 +1470,22 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         play_fn=self._embedded_play,
                         smart_emotion=False,
                         emotion_attribution=self._selected_attribution(ignore_checkbox=True),
+                    )
+                elif mode == "genvoice":
+                    run_genvoice(
+                        self.chapters, outdir, start, play,
+                        self.genvoice_api_key_var.get().strip(),
+                        self.genvoice_voice_id_var.get().strip(),
+                        speed=float(self.genvoice_speed_var.get()),
+                        on_progress=self._on_synthesis_progress,
+                        chapter_indices=chapter_indices, char_ranges=char_ranges,
+                        should_stop=lambda: self._stop_requested,
+                        play_fn=self._embedded_play,
+                        book_stress_overrides_path=(
+                            book_manual_stress_overrides_path(self.book_path)
+                            if self.book_path else None
+                        ),
+                        strip_monosyllables=self.strip_mono_var.get(),
                     )
                 elif mode == "qwen_tts":
                     run_qwen_tts(

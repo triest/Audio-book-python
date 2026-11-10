@@ -763,3 +763,15 @@ CosyVoice/cosyvoice_rest_service.log (с ротацией, не растёт б�
     работает — статьи на Хабре.
   * Про изменения в самом Python-пакете (API silero_tts, аргументы
     apply_tts и т.п.) — PyPI и README репозитория на GitHub.
+
+## GenVoice (облачный TTS API)
+
+Режим `genvoice` использует REST API GenVoice (`https://api.genvoice.ru/v1/api/tts`).
+Для работы укажите API-ключ и ID голоса из публичного каталога GenVoice в GUI
+(или задайте `GENVOICE_API_KEY` и передайте CLI-флаги `--genvoice-api-key` и
+`--genvoice-voice-id`). API принимает до 500 символов; клиент делит длинные
+главы на фрагменты и собирает MP3. Перед отправкой используется текущая
+цепочка нормализации чисел и ударений проекта; GenVoice документирует знак
+`+` перед ударной гласной. Ключ хранится в локальном `config.json`, который
+не следует коммитить. Бесплатный план ограничен; текущие квоты и цены см.
+https://genvoice.ru/pricing .
