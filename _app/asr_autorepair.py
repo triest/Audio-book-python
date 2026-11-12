@@ -563,7 +563,8 @@ class AsrRepair:
                 return wav_bytes
             self._bump("defective")
             best, best_defects, tried, seen = wav_bytes, base, [], {}
-            for name, fn in tweaks_for(base, src)[: self.max_attempts]:
+            for attempt_no, (name, fn) in enumerate(tweaks_for(base, src)[: self.max_attempts], 1):
+                self.log(f"asr_repair {tag}: итерация {attempt_no}/{self.max_attempts} — «{name}»")
                 def capture(ssml, fn=fn):
                     seen.setdefault("ssml", ssml)
                     return fn(ssml)
