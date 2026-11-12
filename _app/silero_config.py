@@ -98,7 +98,7 @@ def load_silero_model(model_id: str = DEFAULT_SILERO_MODEL, device=None):
     import torch
 
     if device is None:
-        device = torch.device("cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Официальный способ (pip install silero) — обычно быстрее обновляется
     try:
@@ -267,7 +267,7 @@ def load_silero_package(model_id: str = DEFAULT_SILERO_MODEL, device=None):
         raise ValueError(f"Неизвестная модель {model_id!r}")
 
     if device is None:
-        device = torch.device("cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = SILERO_MODELS[model_id]
     import app_paths

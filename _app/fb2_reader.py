@@ -3049,9 +3049,20 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, 
 _LOCAL_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 _LOCAL_COMMA_SPLIT_RE = re.compile(r"(?<=[,;:—-])\s+")
 
+# Silero sometimes stretches the boundary in the hyphenated introductory
+# words "во-первых"/"во-вторых", especially when the stress mark is present
+# inside the second part.  A spoken space keeps the same pronunciation and
+# avoids making the hyphen part of the phonetic token.
+_SILERO_INTRO_COMPOUND_RE = re.compile(r"(?i)(?<![\w-])во-(п\+?ервых|втор\+?ых)(?![\w-])")
+
+
+def _normalize_silero_intro_compounds(text: str) -> str:
+    return _SILERO_INTRO_COMPOUND_RE.sub(r"во \1", text)
+
 
 def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms: int,
-                           comma_break_ms: int, max_chars: int = 350):
+                           comma_break_ms: int, max_chars: int = 350,
+                           split_commas: bool = True):
     """Делит текст главы на короткие озвучиваемые куски по знакам
     препинания (абзац -> предложение -> часть предложения по запятым/тире),
     и для каждого куска сразу вычисляет длину паузы (мс), которая должна
@@ -3072,7 +3083,12 @@ def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms:
         sentences = [s.strip() for s in _LOCAL_SENT_SPLIT_RE.split(para) if s.strip()] or [para]
         for si, sent in enumerate(sentences):
             is_last_sentence = si == len(sentences) - 1
-            comma_parts = [c.strip() for c in _LOCAL_COMMA_SPLIT_RE.split(sent) if c.strip()] or [sent]
+            # Для локального Silero лучше отправлять целое предложение одним
+            # запросом: модель стабильнее держит контекст и реже «глотает»
+            # короткий кусок после запятой. Остальные движки сохраняют старое
+            # разбиение по запятым.
+            comma_parts = ([c.strip() for c in _LOCAL_COMMA_SPLIT_RE.split(sent) if c.strip()]
+                           if split_commas else [sent]) or [sent]
             for ci, part in enumerate(comma_parts):
                 is_last_comma = ci == len(comma_parts) - 1
                 if not is_last_comma:
@@ -3094,6 +3110,17 @@ def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms:
                     for j, sub in enumerate(sub_chunks):
                         sub_pause = pause if j == len(sub_chunks) - 1 else min(comma_break_ms, 120)
                         segments.append((sub, sub_pause))
+
+    # Не отправляем в Silero крошечный хвост вроде финальных инициалов
+    # "А.А." отдельным запросом: без контекста модель иногда проглатывает
+    # буквы или обрывает интонацию. При допустимой длине присоединяем его к
+    # предыдущему предложению и сохраняем паузу последнего сегмента.
+    if len(segments) > 1 and len(segments[-1][0]) < 20:
+        prev_text, _prev_pause = segments[-2]
+        tail_text, tail_pause = segments[-1]
+        if len(prev_text) + 1 + len(tail_text) <= max_chars:
+            segments[-2] = (prev_text + " " + tail_text, tail_pause)
+            segments.pop()
 
     return segments
 
@@ -5277,6 +5304,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     import wave
 
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
+    pronunciation_subs = load_pronunciation_substitutions()
     stress_engine = normalize_stress_engine(stress_engine)
     reset_stress_review(label=Path(outdir).name)
     set_strip_monosyllables(strip_monosyllables)
@@ -5310,13 +5338,17 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 
     outdir.mkdir(parents=True, exist_ok=True)
 
-    max_chars = 350
+    # Более длинный запрос с целым предложением уменьшает число стыков,
+    # на которых локальный Silero иногда проглатывает начало следующего
+    # фрагмента.
+    max_chars = 600
 
     def synth_one(part_text: str, part_speaker: str):
         """Один вызов модели. Бросает исключение при неудаче."""
         # Локальный Silero (в отличие от silero_rest) не умеет сам
         # разворачивать числа в слова — без этого цифры либо пропускаются,
         # либо звучат странно.
+        part_text, _pron_held = protect_pronunciation_substitutions(part_text, pronunciation_subs)
         part_text = numbers_to_words_ru(part_text)
         # Порядок важен: сначала свой словарь (высший приоритет — конкретные
         # имена/термины книги), потом silero-stress (общая подстраховка для
@@ -5340,6 +5372,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         part_text, _stress_placeholders = apply_stress_dictionary_protected(part_text, stress_dict)
         part_text = apply_stress_layers(part_text, stress_engine, silero_stress_accentor)
         part_text = restore_stress_placeholders(part_text, _stress_placeholders)
+        part_text = restore_pronunciation_substitutions(part_text, _pron_held)
+        part_text = _normalize_silero_intro_compounds(part_text)
         # put_yo — тоже встроенный механизм САМОГО Silero (не silero-stress), и он
         # применяется к уже восстановленному тексту целиком, без разбора, что
         # именно пришло из словаря — в отличие от put_accent (который, судя
@@ -5354,7 +5388,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
         # влияет — там put_yo работает как раньше.
         # Pass-through guarantee: when the client chain (dictionary -> silero-stress -> gate)
         # is active, Silero's own put_accent/put_yo are OFF so it can never alter a "+" word.
-        effective_put_yo = put_yo and not _stress_placeholders and not _chain_active
+        effective_put_yo = put_yo and not _stress_placeholders and not _pron_held and not _chain_active
         _eff_put_accent = put_accent and not _chain_active
         return model.apply_tts(
             text=part_text,
@@ -5444,7 +5478,7 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
             for part_text, pause_ms in _segments_with_pauses(
                 group_text, sentence_break_ms=sentence_break_ms,
                 paragraph_break_ms=paragraph_break_ms, comma_break_ms=comma_break_ms,
-                max_chars=max_chars,
+                max_chars=max_chars, split_commas=False,
             ):
                 segments.append((part_text, pause_ms, group_voice))
 

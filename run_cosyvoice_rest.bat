@@ -21,8 +21,8 @@ if not exist ".venv_cosyvoice\Scripts\python.exe" (
     exit /b 1
 )
 
-if not exist "CosyVoice\cosyvoice_rest_service.py" (
-    echo cosyvoice_rest_service.py was not found inside the CosyVoice
+if not exist "CosyVoice\_app\cosyvoice_rest_service.py" (
+    echo _app\cosyvoice_rest_service.py was not found inside the CosyVoice
     echo folder. Run install.bat again to fix this.
     pause
     exit /b 1
@@ -35,5 +35,6 @@ echo ^(the first request will be slow - the model loads into the GPU then^)
 echo Leave this window open. Press Ctrl+C or close this window to stop it.
 echo.
 
-"%~dp0.venv_cosyvoice\Scripts\python.exe" cosyvoice_rest_service.py
+"%~dp0.venv_cosyvoice\Scripts\python.exe" _app\cosyvoice_rest_service.py
 if errorlevel 1 pause
+

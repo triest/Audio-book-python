@@ -1,5 +1,5 @@
 @echo off
-rem Runs silero_rest_service.py and automatically restarts it if the
+rem Runs _app\silero_rest_service.py and automatically restarts it if the
 rem process crashes (e.g. a native failure inside torch that Python
 rem cannot catch and log). A normal Ctrl+C still stops this wrapper too
 rem if pressed twice (or the window is closed).
@@ -19,8 +19,9 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 :loop
-echo [%date% %time%] Starting silero_rest_service.py...
-".venv\Scripts\python.exe" silero_rest_service.py
+echo [%date% %time%] Starting _app\silero_rest_service.py...
+".venv\Scripts\python.exe" _app\silero_rest_service.py
 echo [%date% %time%] Service exited (code %ERRORLEVEL%), restarting in 3 seconds...
 timeout /t 3 /nobreak >nul
 goto loop
+

@@ -91,10 +91,10 @@ rem not in stress_dictionary.json, well before it would fall back to
 rem looking the word up online (Wiktionary), which cuts down a lot on how
 rem often that online fallback is even needed - and how often it can hit
 rem the site's own rate limit (HTTP 429) on a long book. Best-effort only:
-rem tools\download_stress_corpus.py never fails the install if this can't be
+rem _app\tools\download_stress_corpus.py never fails the install if this can't be
 rem fetched (no internet right now, GitHub unreachable, etc.) - it just
 rem prints a warning and fb2_reader.py keeps working without it.
-"%VENV_PY%" tools\download_stress_corpus.py
+"%VENV_PY%" _app\tools\download_stress_corpus.py
 
 rem Local Silero synthesis (the main, recommended mode)
 rem CUDA build of torch in the MAIN venv (plain PyPI "torch" is CPU-only; Silero TTS can use the GPU).
@@ -112,11 +112,11 @@ rem Silero via a separate REST service (SSML pauses, optional)
 if errorlevel 1 goto :warn_partial
 
 rem silero-stress - the ONLY accentuation model (context-aware stress, ~0.5 s per chapter chunk on CPU).
-rem pinned to the verified version (stress_versions.lock.json); upgrade procedure: see tools\check_stress_versions.py
+rem pinned to the verified version (stress_versions.lock.json); upgrade procedure: see _app\tools\check_stress_versions.py
 "%VENV_PY%" -m pip install silero-stress==1.5
 if errorlevel 1 echo WARNING: silero-stress failed to install - there will be no automatic stress marks ^(only the dictionary^).
 
-rem faster-whisper - speech recognition (ASR) for checking finished chapters (tools\audio_verify.py: coverage/WER/CER).
+rem faster-whisper - speech recognition (ASR) for checking finished chapters (_app\tools\audio_verify.py: coverage/WER/CER).
 rem Dev/QA tool only: the app does not import it, so it is not packed into the .exe. Optional: a failure is not fatal.
 rem The recognition model itself is downloaded from Hugging Face on first use, not here.
 "%VENV_PY%" -m pip install faster-whisper "av>=11,<16"
@@ -129,7 +129,7 @@ if exist "%~dp0ruaccent_predictor_pkg" rmdir /s /q "%~dp0ruaccent_predictor_pkg"
 rem Grammar gate (case/number stress homographs): slovnet morphology tagger + 29 MB of models. Optional:
 rem if anything here fails the gate stays off and the rest of the pipeline is unaffected.
 "%VENV_PY%" -m pip install slovnet navec razdel
-"%VENV_PY%" fb2_reader.py fetch-models
+"%VENV_PY%" _app\fb2_reader.py fetch-models
 if errorlevel 1 echo WARNING: grammar models were not downloaded - the grammar gate stays off ^(and the .exe will not contain them^) until you run install.bat again.
 
 rem PyInstaller - builds the single-file .exe at the end of this script.
@@ -138,12 +138,12 @@ if errorlevel 1 echo WARNING: pyinstaller failed to install - the .exe build ste
 
 rem pymorphy3 - Russian morphology analyzer, used to pick the correct
 rem stress for a handful of common words whose stress depends on
-rem grammatical case ("звезды" - genitive singular vs nominative plural,
+rem grammatical case ("??????" - genitive singular vs nominative plural,
 rem etc. - see resolve_case_ambiguous_nouns in fb2_reader.py). Optional:
 rem if it fails to install, that specific feature is silently skipped and
 rem everything else keeps working as before.
 "%VENV_PY%" -m pip install pymorphy3 pymorphy3-dicts-ru
-if errorlevel 1 echo WARNING: pymorphy3 failed to install - context-based stress for a few case-ambiguous words (e.g. "звезды") will be less accurate.
+if errorlevel 1 echo WARNING: pymorphy3 failed to install - context-based stress for a few case-ambiguous words (e.g. "??????") will be less accurate.
 
 rem dashscope - client library for Qwen3-TTS (Alibaba's cloud TTS API,
 rem "qwen_tts" mode). Optional: only needed if you actually use that mode;
@@ -158,7 +158,7 @@ rem ("qwen_tts_local" mode) - no cloud account/card needed, runs on your own
 rem GPU via a separately installed server (e.g. through Pinokio). Optional,
 rem same as dashscope above.
 "%VENV_PY%" -m pip install gradio_client
-if errorlevel 1 echo WARNING: gradio_client failed to install - the "Qwen3-TTS (локально)" mode will not work until it is installed manually.
+if errorlevel 1 echo WARNING: gradio_client failed to install - the "Qwen3-TTS (????????)" mode will not work until it is installed manually.
 
 rem Some of the packages above can pull in an older version of click
 rem (used by third-party dependencies like huggingface-hub) - pip
@@ -383,8 +383,8 @@ if errorlevel 1 (
     if errorlevel 1 echo WARNING: openai-whisper failed to install.
 )
 rem The medium whisper model (1.4 GB) is what the auto-repair / chapter sound check (asr_autorepair.py) uses; resumable, SHA-256 verified.
-rem If the download fails the check falls back to the small model (see tools\asr_worker.py), so this is not fatal.
-"%CV_PY%" tools\fetch_whisper_model.py medium
+rem If the download fails the check falls back to the small model (see _app\tools\asr_worker.py), so this is not fatal.
+"%CV_PY%" _app\tools\fetch_whisper_model.py medium
 if errorlevel 1 echo WARNING: whisper medium model was not downloaded - the sound check will use the weaker small model. Run install.bat again to retry.
 "%CV_PY%" -m pip install transformers==4.51.3
 if errorlevel 1 (
@@ -892,3 +892,4 @@ if exist "%~dp0dist\fb2_reader.exe" (
     echo Check it with:  fb2_reader.exe selftest
 )
 exit /b 0
+

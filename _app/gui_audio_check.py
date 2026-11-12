@@ -335,7 +335,14 @@ class AudioCheckMixin:
                 msg = self._ac_q.get_nowait()
                 kind = msg[0]
                 if kind == "progress":
-                    self._ac_progress.set(msg[1])
+                    # Показываем ETA прямо в основной строке статуса, а не
+                    # только в маленьком счётчике под полосой: распознавание
+                    # одной длинной главы может идти несколько минут.
+                    eta = ""
+                    if self._ac_n_done:
+                        elapsed = time.monotonic() - self._ac_t0
+                        eta = f" · осталось ~{format_time(elapsed / self._ac_n_done * (self._ac_total - self._ac_n_done))}"
+                    self._ac_progress.set(msg[1] + eta)
                     if str(self._ac_bar.cget("mode")) == "indeterminate":
                         self._ac_bar.stop()
                         self._ac_bar.configure(mode="determinate", maximum=max(self._ac_total, 1), value=self._ac_n_done)

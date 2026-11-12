@@ -14,12 +14,13 @@ if not exist "%CV3_PY%" (
     pause
     exit /b 1
 )
-if not exist "%~dp0CosyVoice3\cosyvoice3_rest_service.py" (
-    echo CosyVoice3\cosyvoice3_rest_service.py not found - run install.bat first.
+if not exist "%~dp0CosyVoice3\_app\cosyvoice3_rest_service.py" (
+    echo CosyVoice3\_app\cosyvoice3_rest_service.py not found - run install.bat first.
     pause
     exit /b 1
 )
 
 cd /d "%~dp0CosyVoice3"
-"%CV3_PY%" cosyvoice3_rest_service.py
+"%CV3_PY%" _app\cosyvoice3_rest_service.py
 pause
+

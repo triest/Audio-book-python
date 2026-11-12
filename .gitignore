@@ -86,6 +86,7 @@ stress_corpus_ru.tsv.gz
 # Ротированные логи (fb2_reader_gui.log.1, .2 и т.п.) - *.log их не ловит.
 *.log.*
 /logs/
+/user_data/
 ruaccent_predictor_pkg/
 config.json
 review_list.json

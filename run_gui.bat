@@ -9,9 +9,9 @@ cd /d "%~dp0"
 rem Python 3.14 on this machine has Tcl/Tk installed, but tkinter does not
 rem discover the libraries from a venv reliably. Set the official runtime
 rem paths explicitly when they are available.
-if exist "%~dp0tcl_runtime\tcl8.6\init.tcl" (
-    set "TCL_LIBRARY=%~dp0tcl_runtime\tcl8.6"
-    set "TK_LIBRARY=%~dp0tcl_runtime\tk8.6"
+if exist "%~dp0_app\tcl_runtime\tcl8.6\init.tcl" (
+    set "TCL_LIBRARY=%~dp0_app\tcl_runtime\tcl8.6"
+    set "TK_LIBRARY=%~dp0_app\tcl_runtime\tk8.6"
 ) else if exist "%LOCALAPPDATA%\Python\pythoncore-3.14-64\tcl\tcl8.6\init.tcl" (
     set "TCL_LIBRARY=%LOCALAPPDATA%\Python\pythoncore-3.14-64\tcl\tcl8.6"
     set "TK_LIBRARY=%LOCALAPPDATA%\Python\pythoncore-3.14-64\tcl\tk8.6"
@@ -29,5 +29,6 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
-".venv\Scripts\python.exe" fb2_reader_gui.py %*
+".venv\Scripts\python.exe" _app\fb2_reader_gui.py %*
 if errorlevel 1 pause
+

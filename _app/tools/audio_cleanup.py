@@ -132,9 +132,14 @@ def clean_audio(
     target_silence_ms: int,
     fade_ms: int,
     trim_edges: bool,
+    filter_artifacts: bool = False,
 ) -> "AudioSegment":
     """Основная логика: см. подробное описание в шапке файла. Возвращает
     новый AudioSegment, исходный не модифицирует."""
+    if filter_artifacts:
+        # Осторожный фильтр постоянного гула и верхнего цифрового шума.
+        audio = audio.high_pass_filter(45).low_pass_filter(14000)
+
     # detect_nonsilent работает от АБСОЛЮТНОГО порога в dBFS (не от пика
     # файла) — silence_thresh_db задаётся относительно 0 dBFS, как и dBFS
     # самого сегмента (типичная тихая цифровая тишина у TTS обычно ниже
@@ -205,6 +210,7 @@ def process_file(path: Path, args: argparse.Namespace) -> "Path | None":
         target_silence_ms=args.target_silence_ms,
         fade_ms=args.fade_ms,
         trim_edges=args.trim_edges,
+        filter_artifacts=args.filter_artifacts,
     )
 
     after_ms = len(cleaned)
@@ -266,6 +272,8 @@ def main():
     ap.add_argument("--trim-edges", action="store_true",
                      help="также обрезать лишнюю тишину в самом начале и конце файла "
                           "(по умолчанию не трогается — так безопаснее для склейки глав)")
+    ap.add_argument("--filter-artifacts", action="store_true",
+                    help="осторожно убрать низкочастотный гул и верхний цифровой шум")
     ap.add_argument("--in-place", action="store_true",
                      help="ПЕРЕЗАПИСАТЬ исходные файлы (по умолчанию выключено — "
                           "результат пишется рядом с суффиксом --suffix)")
