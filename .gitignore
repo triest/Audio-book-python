@@ -116,3 +116,6 @@ sample_book/
 
 *.stress_prepass.json
 .venv_teratts/
+
+/_app/CosyVoice/
+/_app/CosyVoice3/
