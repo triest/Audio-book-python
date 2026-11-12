@@ -712,10 +712,27 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         model_service_mode = mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru")
         silero_like = mode in ("silero", "silero_rest")
         pauses_supported = mode in ("silero", "silero_rest", "cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru", "piper")
+        silero_stress_supported = silero_like
+        asr_repair_supported = mode == "silero_rest"
         self.model_combo.configure(state="readonly" if silero_like else "disabled")
         self.rest_url_entry.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.auto_start_rest_check.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.emphasis_check.configure(state="normal" if mode == "silero_rest" else "disabled")
+        self.accent_check.configure(state="normal" if silero_stress_supported else "disabled")
+        self.yo_check.configure(state="normal" if silero_stress_supported else "disabled")
+        self.stress_engine_combo.configure(state="readonly" if silero_stress_supported else "disabled")
+        self.stress_review_check.configure(state="normal" if silero_stress_supported else "disabled")
+        self.strip_mono_check.configure(state="normal" if silero_stress_supported else "disabled")
+        self.asr_repair_check.configure(state="normal" if asr_repair_supported else "disabled")
+        self.smart_emotion_check.configure(state="normal" if mode == "silero_rest" else "disabled")
+        self.yandex_smart_emotion_check.configure(state="normal" if mode == "yandex" else "disabled")
+        self.optimal_settings_button.configure(state="normal" if silero_stress_supported else "disabled")
+        self.open_stress_dict_button.configure(state="normal" if silero_stress_supported else "disabled")
+        for pause_widget in (self.comma_break_spin, self.sentence_break_spin, self.paragraph_break_spin):
+            pause_widget.configure(state="normal" if pauses_supported else "disabled")
+        # Attribution is currently not wired to an active provider in the GUI;
+        # keeping it disabled prevents a checked but ignored option.
+        self.attribution_check.configure(state="disabled")
 
         yandex_field_state = "normal" if mode == "yandex" else "disabled"
         self.yandex_api_key_entry.configure(state=yandex_field_state)
@@ -952,7 +969,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             var = getattr(self, name, None)
             if var is not None:
                 var.set(False)
-        for name in ("attribution_check", "yandex_smart_emotion_check"):
+        for name in ("attribution_check",):
             w = getattr(self, name, None)
             if w is not None:
                 try:

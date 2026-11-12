@@ -757,21 +757,24 @@ class UIBuilderMixin:
         irow = 0
         ttk.Label(intonation, text="Пауза на запятых/тире, мс:").grid(row=irow, column=0, sticky="w", pady=3)
         self.comma_break_var = tk.IntVar(value=180)
-        ttk.Spinbox(intonation, from_=0, to=1000, increment=10, textvariable=self.comma_break_var, width=8).grid(
+        self.comma_break_spin = ttk.Spinbox(intonation, from_=0, to=1000, increment=10, textvariable=self.comma_break_var, width=8)
+        self.comma_break_spin.grid(
             row=irow, column=1, sticky="w", pady=3
         )
 
         irow += 1
         ttk.Label(intonation, text="Пауза между предложениями, мс:").grid(row=irow, column=0, sticky="w", pady=3)
         self.sentence_break_var = tk.IntVar(value=320)
-        ttk.Spinbox(intonation, from_=0, to=2000, increment=10, textvariable=self.sentence_break_var, width=8).grid(
+        self.sentence_break_spin = ttk.Spinbox(intonation, from_=0, to=2000, increment=10, textvariable=self.sentence_break_var, width=8)
+        self.sentence_break_spin.grid(
             row=irow, column=1, sticky="w", pady=3
         )
 
         irow += 1
         ttk.Label(intonation, text="Пауза между абзацами, мс:").grid(row=irow, column=0, sticky="w", pady=3)
         self.paragraph_break_var = tk.IntVar(value=550)
-        ttk.Spinbox(intonation, from_=0, to=3000, increment=10, textvariable=self.paragraph_break_var, width=8).grid(
+        self.paragraph_break_spin = ttk.Spinbox(intonation, from_=0, to=3000, increment=10, textvariable=self.paragraph_break_var, width=8)
+        self.paragraph_break_spin.grid(
             row=irow, column=1, sticky="w", pady=3
         )
 
@@ -836,27 +839,30 @@ class UIBuilderMixin:
 
         irow += 1
         self.stress_review_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.stress_review_check = ttk.Checkbutton(
             intonation,
             text="Список слов на проверку → review_list.json (слова без ударения и неизвестные, по частоте)",
             variable=self.stress_review_var,
-        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+        )
+        self.stress_review_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
         self.strip_mono_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.strip_mono_check = ttk.Checkbutton(
             intonation,
             text='Убирать «+» в односложных словах (слова с «ё» сохраняют ударение)',
             variable=self.strip_mono_var,
-        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+        )
+        self.strip_mono_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
         self.asr_repair_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.asr_repair_check = ttk.Checkbutton(
             intonation,
             text='Автопочинка по распознаванию (Silero REST): гул/растяжка/проглоченный текст — пересинтез куска',
             variable=self.asr_repair_var,
-        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+        )
+        self.asr_repair_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
 
         irow += 1
         self._build_audio_check_row(intonation, irow)
