@@ -83,7 +83,18 @@ def compare(src, asr):
     # alignment difference (for example, ``ЛАК-1906`` versus its spoken form).
     # Keep it in the report for review, but do not start another synthesis loop
     # unless the chapter has broader corruption or several missing runs.
-    hard_missing = bool(missing) and (len(missing) >= 2 or cer > CER_LIMIT)
+    number_words = {
+        "ноль", "один", "одна", "две", "два", "три", "четыре", "пять", "шесть",
+        "семь", "восемь", "девять", "десять", "сто", "сот", "тысяча", "тысяч",
+        "тысячи", "миллион", "миллиона", "миллионов", "девятнадцатого",
+    }
+    numeric_alignment = any(
+        any(w in number_words or w.isdigit() for w in src[i1:i2])
+        for i1, i2 in missing
+    )
+    hard_missing = bool(missing) and (
+        cer > CER_LIMIT or (len(missing) >= 2 and not numeric_alignment)
+    )
     return {
         "source_words": len(src), "asr_words": len(asr), "coverage": round(matched / max(len(src), 1), 3),
         "wer": round(w_err / max(len(src), 1), 4), "cer": round(cer, 4), "loop_ratio": round(best, 2),
