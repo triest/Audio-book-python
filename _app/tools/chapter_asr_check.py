@@ -135,9 +135,11 @@ def main():
     a = ap.parse_args()
 
     import fb2_reader as f
-    out = Path(a.outdir)
-    out = out if out.is_absolute() else ROOT / out
-    _, chapters = f.parse_fb2(ROOT / a.book)
+    out = Path(a.outdir).resolve()
+    book = Path(a.book)
+    if not book.is_absolute():
+        book = Path.cwd() / book
+    _, chapters = f.parse_fb2(book)
     asr_dir = out / "_asr"
     (asr_dir / "clips").mkdir(parents=True, exist_ok=True)
     watch = [norm(w) for w in a.watch.split(",") if norm(w)]
