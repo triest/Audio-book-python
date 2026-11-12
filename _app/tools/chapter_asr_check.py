@@ -38,6 +38,24 @@ def lev(a, b):
     return prev[-1]
 
 
+def repeated_phrase(asr, n=12, max_gap=160):
+    """Return a repeated word run, or None.
+
+    Compression ratio is useful as a diagnostic, but it is not proof of a
+    TTS loop: Russian prose with many short words can compress very well.
+    Require the same sequence of words to occur twice before flagging it.
+    """
+    if len(asr) < n * 2:
+        return None
+    seen = {}
+    for i in range(len(asr) - n + 1):
+        key = tuple(asr[i:i + n])
+        if key in seen and n <= i - seen[key] <= max_gap:
+            return " ".join(key)
+        seen[key] = i
+    return None
+
+
 def compare(src, asr):
     """Word alignment of the source text against the ASR words -> metrics dict."""
     sm = difflib.SequenceMatcher(None, src, asr, autojunk=False)
@@ -60,12 +78,19 @@ def compare(src, asr):
         if len(t) > 100:
             best = max(best, len(t) / len(zlib.compress(t, 9)))
     cer = c_err / max(n_chars, 1)
+    repeated = repeated_phrase(asr)
+    # A single long diff with a low CER is commonly a numeric/abbreviation
+    # alignment difference (for example, ``ЛАК-1906`` versus its spoken form).
+    # Keep it in the report for review, but do not start another synthesis loop
+    # unless the chapter has broader corruption or several missing runs.
+    hard_missing = bool(missing) and (len(missing) >= 2 or cer > CER_LIMIT)
     return {
         "source_words": len(src), "asr_words": len(asr), "coverage": round(matched / max(len(src), 1), 3),
         "wer": round(w_err / max(len(src), 1), 4), "cer": round(cer, 4), "loop_ratio": round(best, 2),
         "missing_runs": [" ".join(src[i1:i2])[:90] for i1, i2 in missing[:20]],
         "extra_runs": [" ".join(asr[j1:j2])[:90] for j1, j2 in extra[:20]],
-        "resynth": bool(cer > CER_LIMIT or missing or best > LOOP_LIMIT),
+        "repeated_phrase": repeated,
+        "resynth": bool(cer > CER_LIMIT or hard_missing or repeated),
     }
 
 
