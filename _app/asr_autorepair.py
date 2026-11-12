@@ -27,7 +27,13 @@ MODEL_URLS_SHA256 = {"medium": "345ae4da62f9b3d59415adc60127b97c714f32e89e936602
 
 
 def asr_python() -> Path:
-    return Path(os.environ.get("AUDIOBOOK_ASR_PYTHON") or ROOT / ".venv_cosyvoice3" / "Scripts" / "python.exe")
+    if os.environ.get("AUDIOBOOK_ASR_PYTHON"):
+        return Path(os.environ["AUDIOBOOK_ASR_PYTHON"])
+    # Source files may live in _app while the virtual environments remain
+    # beside that folder in the user-facing application directory.
+    candidates = [ROOT / ".venv_cosyvoice3" / "Scripts" / "python.exe",
+                  ROOT.parent / ".venv_cosyvoice3" / "Scripts" / "python.exe"]
+    return next((p for p in candidates if p.exists()), candidates[-1])
 
 
 def asr_worker_script() -> Path:
