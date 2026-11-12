@@ -5669,20 +5669,19 @@ def _split_paragraphs_for_ssml(text: str, max_len: int):
     chunks, cur = [], []
     cur_len = 0
     for para in paragraphs:
-        if cur_len + len(para) + 1 > max_len and cur:
-            chunks.append("\n".join(cur))
-            cur, cur_len = [], 0
-        if len(para) > max_len:
-            # длинный абзац без переносов — режем по предложениям
-            for sent in split_text(para, max_len):
-                if cur_len + len(sent) + 1 > max_len and cur:
+        # Always expose sentence boundaries to the REST service.  Passing a
+        # whole short paragraph as one request can make Silero swallow a
+        # sentence in the middle; grouping complete sentences still preserves
+        # context while keeping each request below the service limit.
+        sentences = [s.strip() for s in _LOCAL_SENT_SPLIT_RE.split(para) if s.strip()] or [para]
+        for sent in sentences:
+            parts = split_text(sent, max_len) if len(sent) > max_len else [sent]
+            for part in parts:
+                if cur_len + len(part) + 1 > max_len and cur:
                     chunks.append("\n".join(cur))
                     cur, cur_len = [], 0
-                cur.append(sent)
-                cur_len += len(sent) + 1
-        else:
-            cur.append(para)
-            cur_len += len(para) + 1
+                cur.append(part)
+                cur_len += len(part) + 1
     if cur:
         chunks.append("\n".join(cur))
     # Every chunk is a separate synthesis call (a possible timbre jump). A tiny tail chunk is
