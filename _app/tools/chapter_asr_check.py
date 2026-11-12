@@ -95,6 +95,20 @@ def load_16k(wav):
 
 def transcribe(wav, model_name, chunk_s=300):
     """Whole chapter in slices of chunk_s seconds (limits peak RAM; word times are shifted back by the slice offset)."""
+    # faster-whisper/CTranslate2 may need CUDA DLLs from the main venv even
+    # when Windows has no system-wide CUDA installation.  Add torch's bundled
+    # DLL directory before importing the recognizer so CUDA is used instead of
+    # silently falling back to CPU.
+    import os
+    try:
+        import torch
+        torch_lib = Path(torch.__file__).resolve().parent / "lib"
+        if torch_lib.exists():
+            os.environ["PATH"] = str(torch_lib) + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(str(torch_lib))
+    except Exception:
+        pass
     from faster_whisper import WhisperModel
     audio = load_16k(wav)
     try:
