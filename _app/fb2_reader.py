@@ -3300,6 +3300,7 @@ def load_manual_stress_entries(book_overrides_path: "Path | str | None" = None) 
     silero-stress may change them."""
     d = dict(_load_manual_stress_overrides())
     if book_overrides_path:
+        d.update(_read_json_dict(book_auto_stress_cache_path(book_overrides_path)))
         d.update(_load_manual_stress_overrides(book_overrides_path))
     d.update(_load_forced_stress())
     return d
@@ -3324,6 +3325,46 @@ def book_manual_stress_overrides_path(book_path: "Path | str") -> Path:
     читаться в разных книгах, поэтому решение, принятое для одной книги, не
     должно молча становиться глобальным правилом для всех остальных."""
     return Path(str(Path(book_path).with_suffix("")) + ".manual_stress_overrides.json")
+
+
+def book_auto_stress_cache_path(book_overrides_path: "Path | str") -> Path:
+    """Separate cache for high-confidence proper-name stresses found by the
+    local silero-stress model. It never replaces the user's manual overrides."""
+    p = Path(book_overrides_path)
+    return p.with_name(p.name.replace(".manual_stress_overrides.json", ".auto_stress.json"))
+
+
+def auto_collect_name_stress(text: str, accentor, cache_path: "Path | str | None") -> dict:
+    """Cache only capitalised book names/terms with one confident stress mark."""
+    if accentor is None or not cache_path or not text:
+        return {}
+    cache = _read_json_dict(cache_path)
+    candidates = []
+    for m in _STRESS_WORD_RE.finditer(text):
+        word = m.group(0)
+        if len(word) < 4 or not word[0].isupper() or word.lower() in cache:
+            continue
+        before = text[:m.start()].rstrip()
+        if before and before[-1] in ".!?…":
+            continue
+        candidates.append(word)
+    if not candidates:
+        return {}
+    try:
+        marked = apply_silero_layer(" ".join(candidates), accentor)
+    except Exception:
+        return {}
+    learned = {}
+    for src, out in zip(candidates, marked.split()):
+        plain = out.replace("+", "").replace("ё", "е").lower()
+        if plain == src.replace("ё", "е").lower() and out.count("+") == 1:
+            learned[src.lower()] = out.lower()
+    if learned:
+        cache.update(learned)
+        p = Path(cache_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return learned
 
 
 def _load_manual_stress_overrides(path: "Path | str | None" = None) -> dict:
@@ -5311,6 +5352,10 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     if stress_review is not None:
         set_stress_review(stress_review)
     silero_stress_accentor = _load_silero_stress() if stress_engine_needs_silero(stress_engine) else None
+    if book_stress_overrides_path and silero_stress_accentor is not None:
+        learned = auto_collect_name_stress("\n".join(t for _, t in chapters), silero_stress_accentor,
+                                           book_auto_stress_cache_path(book_stress_overrides_path))
+        stress_dict.update(learned)
     # The client chain owns the marks only when silero-stress really loaded; otherwise Silero's own
     # put_accent/put_yo stay available as the fallback.
     _chain_active = stress_layers_are_client_side(stress_engine, silero_stress_accentor)
@@ -5812,6 +5857,10 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
     if stress_review is not None:
         set_stress_review(stress_review)
     silero_stress_accentor = _load_silero_stress() if stress_engine_needs_silero(stress_engine) else None
+    if book_stress_overrides_path and silero_stress_accentor is not None:
+        learned = auto_collect_name_stress("\n".join(t for _, t in chapters), silero_stress_accentor,
+                                           book_auto_stress_cache_path(book_stress_overrides_path))
+        stress_dict.update(learned)
     _client_layers = stress_layers_are_client_side(stress_engine, silero_stress_accentor)
     set_keep_hyphens(_client_layers)
 
