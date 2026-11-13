@@ -7071,9 +7071,10 @@ def main():
                           "(dictionary -> silero-stress -> grammar gate) and exit")
     ap.add_argument("--keep-monosyllable-stress", action="store_true",
                      help="do not strip the '+' mark from one-vowel words")
-    ap.add_argument("--asr-repair", action="store_true",
-                    help="silero_rest: проверять каждый кусок распознаванием (whisper в .venv_cosyvoice3) и пересинтезировать "
-                         "куски с гулом/растяжкой/проглоченным текстом с другими паузами (см. asr_autorepair.py)")
+    ap.add_argument("--asr-repair", dest="asr_repair", action="store_true", default=True,
+                    help="silero_rest: автоматически проверять каждый кусок распознаванием и чинить найденные дефекты (по умолчанию включено)")
+    ap.add_argument("--no-asr-repair", dest="asr_repair", action="store_false",
+                    help="silero_rest: отключить автоматическую ASR-проверку и пересинтез дефектных кусков")
     ap.add_argument("--no-stress-review", action="store_true",
                      help="do not write the per-chapter review list "
                           "review_list.json (same as AUDIOBOOK_STRESS_REVIEW=0)")
