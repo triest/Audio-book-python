@@ -115,6 +115,7 @@ llm_models/
 sample_book/
 
 *.stress_prepass.json
+*.auto_stress.json
 .venv_teratts/
 
 /_app/CosyVoice/

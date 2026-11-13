@@ -547,13 +547,28 @@ class AsrRepair:
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(wav_bytes)
-            return chunk_defects(src, worker.transcribe(tmp), lead_ok=lead_ok, kinds=kinds)
+            # On Windows the ASR subprocess can observe a just-created temp
+            # file a moment later than the parent process. Retry once by
+            # rewriting the file instead of silently skipping the check.
+            for attempt in range(2):
+                try:
+                    words = worker.transcribe(tmp)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 0 and "FileNotFoundError" in str(e):
+                        with open(tmp, "wb") as fh:
+                            fh.write(wav_bytes)
+                        continue
+                    raise
+            return chunk_defects(src, words, lead_ok=lead_ok, kinds=kinds)
         finally:
-            self._free.put(worker)
             try:
                 os.remove(tmp)
             except OSError:
                 pass
+            # Return the worker only after the request's temp file is gone;
+            # this avoids a second concurrent request racing with cleanup.
+            self._free.put(worker)
 
     def check_and_fix(self, plain_chunk: str, wav_bytes: bytes, resynth, tag: str = "", first_chunk: bool = False) -> bytes:
         """resynth(tweak) -> new wav bytes, tweak: function ssml -> ssml. Returns the best wav (the original if nothing is better or ASR fails)."""
@@ -609,8 +624,11 @@ class AsrRepair:
                 fh.write(json.dumps({"tag": tag, "before": base, "after": best_defects, "tried": tried,
                                      "text": plain_chunk[:120], "ssml": seen.get("ssml", "")}, ensure_ascii=False) + "\n")
             return best
+        except queue.Empty:
+            self.log(f"asr_repair {tag}: проверка пропущена (таймаут ответа ASR-worker)")
+            return wav_bytes
         except Exception as e:  # noqa: BLE001
-            self.log(f"asr_repair {tag}: проверка пропущена ({e})")
+            self.log(f"asr_repair {tag}: проверка пропущена ({type(e).__name__}: {e})")
             return wav_bytes
 
     def chapter_done(self, idx) -> str:
