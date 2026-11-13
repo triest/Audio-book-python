@@ -3339,10 +3339,12 @@ def auto_collect_name_stress(text: str, accentor, cache_path: "Path | str | None
     if accentor is None or not cache_path or not text:
         return {}
     cache = _read_json_dict(cache_path)
+    ambiguous = _load_ambiguous_stress_words()
     candidates = []
     for m in _STRESS_WORD_RE.finditer(text):
         word = m.group(0)
-        if len(word) < 4 or not word[0].isupper() or word.lower() in cache:
+        if (len(word) < 4 or not word[0].isupper() or word.lower() in cache
+                or word.lower() in ambiguous):
             continue
         before = text[:m.start()].rstrip()
         if before and before[-1] in ".!?…":
