@@ -1,0 +1,12 @@
+---
+description: Send completed audiobook project changes to the main branch by default
+alwaysApply: true
+---
+
+# Git branch policy
+
+- For this repository, use `main` as the default branch for all commits and pushes.
+- After completing an authorized change, commit the relevant tracked files and push `main` to `origin`.
+- Do not create or switch to another branch unless the user explicitly requests it.
+- Never include `fb2_reader_settings.json`, `dialogue_characters.json`, generated audiobook output folders, secrets, or unrelated user data in a commit.
+- Before pushing, show or inspect `git diff`, verify the target branch is `main`, and run the appropriate lightweight validation.

@@ -3049,15 +3049,18 @@ def run_online(chapters, outdir: Path, play: bool, start: int, voice_lang: str, 
 _LOCAL_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 _LOCAL_COMMA_SPLIT_RE = re.compile(r"(?<=[,;:—-])\s+")
 
-# Silero sometimes stretches the boundary in the hyphenated introductory
-# words "во-первых"/"во-вторых", especially when the stress mark is present
-# inside the second part.  A spoken space keeps the same pronunciation and
-# avoids making the hyphen part of the phonetic token.
+# Silero should pronounce the introductory words "во-первых"/"во-вторых"
+# as one spoken word.  Remove the orthographic hyphen only in the TTS text;
+# the source/book text remains unchanged.
 _SILERO_INTRO_COMPOUND_RE = re.compile(r"(?i)(?<![\w-])во-(п\+?ервых|втор\+?ых)(?![\w-])")
 
 
 def _normalize_silero_intro_compounds(text: str) -> str:
-    return _SILERO_INTRO_COMPOUND_RE.sub(r"во \1", text)
+    def _compound(m):
+        # во-пЕрвых / во-втОрЫх: keep one spoken token and make the
+        # intended vowel explicit for Silero.
+        return "воп+ервых" if m.group(1).startswith("п") else "вовтор+ых"
+    return _SILERO_INTRO_COMPOUND_RE.sub(_compound, text)
 
 
 def _segments_with_pauses(text: str, sentence_break_ms: int, paragraph_break_ms: int,
@@ -3951,7 +3954,6 @@ def strip_monosyllable_stress(text: str) -> str:
             return plain
         return w
     return _MONO_STRESS_RE.sub(repl, text)
-
 
 
 # ---------------------------------------------------------------------------
@@ -5591,7 +5593,10 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
 # --------------------------------------------------------------------------
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
-_SOFT_PAUSE_RE = re.compile(r"([,;:]|—|--)\s+")
+# Commas/colons need an explicit short SSML pause.  Leave em dashes to
+# Silero's own prosody: an inserted break here split phrases such as
+# "это — Честь" unnaturally.
+_SOFT_PAUSE_RE = re.compile(r"([,;:]|--)\s+")
 # «Да уж» без паузы между словами Silero сливает в «Длож»/«До уж» (замер ASR 16 окт 2026); 30 мс уже достаточно.
 _DA_UZH_RE = re.compile(r"(?<![А-Яа-яЁё+])([Дд]\+?а)\s+(?=\+?(?:уж|и|еще|ещё|это|у|или|о)(?![А-Яа-яЁё]))")
 
@@ -5850,10 +5855,13 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
               "(forced_stress_words.json + manual overrides) — для них нейросеть не вызывается.")
     vad_model, vad_get_timestamps = _load_silero_vad() if use_vad_trim else (None, None)
 
-    # stress_engine применяется ЦЕЛИКОМ на клиенте, ДО отправки на сервис:
-    # словарь -> silero-stress -> грамматический шлюз -> санитайзер. Сервис
-    # (silero_rest_service.py) ударения не расставляет и сохраняет все "+".
+    # Для v5_6_ru используем встроенные ударения/омографы самой модели.
+    # Ручной словарь ниже всё равно применяется к особым словам, а внешний
+    # silero-stress оставляем для старых/других моделей.
     stress_engine = normalize_stress_engine(stress_engine)
+    if model_id == "v5_6_ru" and stress_engine == "silero":
+        print("Silero v5_6_ru: встроенные ударения включены; внешний silero-stress отключён.")
+        stress_engine = "none"
     reset_stress_review(label=Path(outdir).name)
     set_strip_monosyllables(strip_monosyllables)
     if stress_review is not None:
@@ -5932,10 +5940,17 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         plain_text_chunk, _pron_held = protect_pronunciation_substitutions(plain_text_chunk, pron_subs)
         plain_text_chunk = protect_designator_letters(plain_text_chunk, _pron_held)
         plain_text_chunk = numbers_to_words_ru(plain_text_chunk)
+        # Keep the introductory compounds as one spoken word in the REST path too.
+        plain_text_chunk = _normalize_silero_intro_compounds(plain_text_chunk)
         if _client_layers:
             protected, placeholders = apply_stress_dictionary_protected(plain_text_chunk, stress_dict)
             protected = apply_stress_layers(protected, stress_engine, silero_stress_accentor)
-            return latin_to_cyrillic_ru(restore_pronunciation_substitutions(restore_stress_placeholders(protected, placeholders), _pron_held))
+            # The client-side stress path must perform the same final mono-syllable
+            # cleanup as the server path. Without it, dictionary entries such as
+            # "но"/"что" reached Silero as n+o/ch+t+o and were audibly stretched.
+            marked = restore_pronunciation_substitutions(
+                restore_stress_placeholders(protected, placeholders), _pron_held)
+            return latin_to_cyrillic_ru(strip_monosyllable_stress(marked))
         return latin_to_cyrillic_ru(restore_pronunciation_substitutions(
             strip_monosyllable_stress(apply_stress_dictionary(plain_text_chunk, stress_dict)), _pron_held))
 

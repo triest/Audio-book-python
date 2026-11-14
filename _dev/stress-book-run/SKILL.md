@@ -12,9 +12,14 @@ description: Полный (инкрементальный) прогон книг
 Из корня проекта, в фоне (`run_in_background`), лог в scratchpad. Сервис Silero должен слушать порт 5010 (`netstat -ano | grep :5010`):
 
 ```
+
+Для модели `v5_6_ru` используйте `--stress-engine none`: встроенные ударения
+и омографы модели работают лучше внешнего `silero-stress`. Ручные особые слова
+из словарей всё равно применяются. Для отдельного CLI-прогона выбирайте новую
+папку, которую не использует GUI.
 set PYTHONIOENCODING=utf-8
 .venv\Scripts\python.exe fb2_reader.py pepel-pobedy.fb2 --mode silero_rest --model v5_6_ru --speaker xenia ^
-  --sample-rate 48000 --sentence-break-ms 270 --paragraph-break-ms 490 --comma-break-ms 120 --outdir audiobook_output5
+  --sample-rate 48000 --sentence-break-ms 270 --paragraph-break-ms 490 --comma-break-ms 120 --outdir audiobook_output5 --stress-engine none
 ```
 
 - Параметры взяты из `*.wav.meta.json` готовых глав (mode/model/speaker/sample_rate/breaks). Меняешь параметры — пересинтезируется ВСЯ книга.
