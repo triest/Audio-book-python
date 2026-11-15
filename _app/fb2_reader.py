@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fb2_reader.py — озвучивание книг в формате FB2 на русском языке.
+fb2_reader.py — озвучивание электронных книг на русском языке.
 
 Возможности:
-  * извлечение текста из .fb2 (и .fb2.zip) по главам;
+  * извлечение текста из FB2/FB2.ZIP, EPUB, TXT, HTML/XHTML и DOCX по главам;
   * озвучка четырьмя способами:
       1) silero      — (рекомендуется, если torch не нужен на этой машине)
                        нейросетевой синтез Silero TTS локально через torch.hub.
@@ -93,6 +93,7 @@ kseniya (жен.), xenia (жен.), eugene (муж.), random (только v4_ru
 import argparse
 import collections
 import hashlib
+import html as html_lib
 import json
 import os
 import re
@@ -405,6 +406,94 @@ def parse_fb2(path: Path):
         raise ValueError("Не удалось извлечь текст из книги — возможно, файл повреждён.")
 
     return book_title, chapters
+
+
+def _chapters_from_blocks(title: str, blocks: list[str]):
+    chapters, current_title, current = [], "Текст", []
+    heading_re = re.compile(r"^(?:глава|часть|пролог|эпилог|введение|предисловие|послесловие)\b.*$|^\d{1,3}[.)]\s+.+$", re.I)
+    for block in blocks:
+        lines = [x.strip() for x in block.splitlines() if x.strip()]
+        if not lines:
+            continue
+        if len(lines) == 1 and heading_re.match(lines[0]) and current:
+            chapters.append((current_title, "\n\n".join(current).strip()))
+            current_title, current = lines[0], []
+        elif len(lines) == 1 and heading_re.match(lines[0]) and not current:
+            current_title = lines[0]
+        else:
+            current.append("\n".join(lines))
+    if current:
+        chapters.append((current_title, "\n\n".join(current).strip()))
+    if not chapters:
+        raise ValueError("Не удалось извлечь текст из книги.")
+    return chapters
+
+
+def parse_txt(path: Path):
+    raw = path.read_text(encoding="utf-8-sig", errors="replace")
+    return path.stem, _chapters_from_blocks(path.stem, re.split(r"\n\s*\n", raw))
+
+
+def parse_html_book(path: Path):
+    root = etree.fromstring(path.read_bytes(), parser=etree.HTMLParser())
+    body = next((el for el in root.iter() if strip_ns(el.tag).lower() == "body"), root)
+    blocks = []
+    for el in body.iter():
+        if strip_ns(el.tag).lower() in {"p", "div", "h1", "h2", "h3", "h4", "blockquote", "li"}:
+            text = html_lib.unescape(" ".join("".join(el.itertext()).split()))
+            if text:
+                blocks.append(text)
+    return path.stem, _chapters_from_blocks(path.stem, blocks)
+
+
+def parse_docx(path: Path):
+    with zipfile.ZipFile(path) as z:
+        root = etree.fromstring(z.read("word/document.xml"))
+    blocks = []
+    for para in root.iter():
+        if strip_ns(para.tag) == "p":
+            text = "".join(t.text or "" for t in para.iter() if strip_ns(t.tag) == "t").strip()
+            if text:
+                blocks.append(text)
+    return path.stem, _chapters_from_blocks(path.stem, blocks)
+
+
+def parse_epub(path: Path):
+    with zipfile.ZipFile(path) as z:
+        container = etree.fromstring(z.read("META-INF/container.xml"))
+        rootfile = next((el.get("full-path") for el in container.iter() if strip_ns(el.tag) == "rootfile"), None)
+        if not rootfile:
+            raise ValueError("В EPUB не найден OPF-файл.")
+        opf_dir = str(Path(rootfile).parent).replace("\\", "/")
+        opf = etree.fromstring(z.read(rootfile))
+        manifest = {el.get("id"): str(Path(opf_dir, el.get("href"))).replace("\\", "/")
+                    for el in opf.iter() if strip_ns(el.tag) == "item" and el.get("id") and el.get("href")}
+        chapters = []
+        for ref in opf.iter():
+            if strip_ns(ref.tag) != "itemref":
+                continue
+            href = manifest.get(ref.get("idref"))
+            if not href or not href.lower().endswith((".xhtml", ".html", ".htm")):
+                continue
+            doc = etree.fromstring(z.read(href), parser=etree.HTMLParser())
+            text = "\n".join(" ".join("".join(el.itertext()).split()) for el in doc.iter()
+                              if strip_ns(el.tag).lower() in {"p", "h1", "h2", "h3", "blockquote", "li"}).strip()
+            if text:
+                heading = next((x for x in text.splitlines() if x.strip()), f"Глава {len(chapters)+1}")
+                chapters.append((heading[:120], html_lib.unescape(text)))
+    if not chapters:
+        raise ValueError("Не удалось извлечь главы из EPUB.")
+    return path.stem, chapters
+
+
+def parse_book(path: Path):
+    suffix = path.suffix.lower()
+    if suffix in {".fb2", ".zip"}: return parse_fb2(path)
+    if suffix == ".epub": return parse_epub(path)
+    if suffix in {".txt", ".text"}: return parse_txt(path)
+    if suffix in {".html", ".htm", ".xhtml"}: return parse_html_book(path)
+    if suffix == ".docx": return parse_docx(path)
+    raise ValueError("Поддерживаются FB2, EPUB, TXT, HTML/XHTML и DOCX. MOBI/AZW3 пока нужно преобразовать в EPUB.")
 
 
 # --------------------------------------------------------------------------
@@ -7047,7 +7136,7 @@ def main():
     except Exception:
         pass
     ap = argparse.ArgumentParser(description="Озвучивание FB2-книг на русском языке")
-    ap.add_argument("book", type=Path, nargs="?", help="путь к .fb2 или .fb2.zip файлу")
+    ap.add_argument("book", type=Path, nargs="?", help="путь к книге: FB2, EPUB, TXT, HTML/XHTML или DOCX")
     ap.add_argument("--gui", action="store_true", help="запустить графический интерфейс")
     ap.add_argument("--mode", choices=["online", "offline", "silero", "silero_rest", "cosyvoice", "piper",
                                         "yandex", "genvoice", "qwen_tts", "qwen_tts_local"],
@@ -7091,8 +7180,8 @@ def main():
                      choices=list(SILERO_MODELS.keys()),
                      help="модель Silero для silero/silero_rest "
                           f"(по умолчанию {DEFAULT_SILERO_MODEL} — последняя)")
-    ap.add_argument("--sample-rate", type=int, default=48000,
-                     help="частота дискретизации для silero-режима (8000/24000/48000)")
+    ap.add_argument("--sample-rate", type=int, default=24000,
+                     help="частота дискретизации для silero-режима (8000/24000/48000; по умолчанию 24000)")
     ap.add_argument("--list", action="store_true", help="только показать список глав и выйти")
     ap.add_argument("--rest-url", type=str, default="http://localhost:5010",
                      help="адрес Silero-REST-Service для режима silero_rest")
@@ -7294,7 +7383,7 @@ def main():
         sys.exit(1)
 
     print(f"Читаю файл: {args.book}")
-    title, chapters = parse_fb2(args.book)
+    title, chapters = parse_book(args.book)
     print(f"Книга: {title}")
     print(f"Найдено глав: {len(chapters)}\n")
 

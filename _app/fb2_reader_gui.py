@@ -38,7 +38,7 @@ from fb2_reader import (
     _save_character_voice_map,
     cosyvoice_list_voices,
     list_offline_voices,
-    parse_fb2,
+    parse_book,
     play_file,
     run_cosyvoice,
     run_offline,
@@ -413,7 +413,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             title="Выберите FB2-книгу",
             initialdir=self._get_last_dir("book") or None,
             filetypes=[
-                ("FB2 книги", "*.fb2 *.fb2.zip *.zip"),
+                ("Книги (FB2, EPUB, TXT, HTML, DOCX)", "*.fb2 *.fb2.zip *.zip *.epub *.txt *.text *.html *.htm *.xhtml *.docx"),
                 ("Все файлы", "*.*"),
             ],
         )
@@ -447,7 +447,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
     def reload_book(self):
         path_str = self.book_var.get().strip()
         if not path_str:
-            messagebox.showwarning("Книга", "Укажите путь к файлу FB2.")
+            messagebox.showwarning("Книга", "Укажите путь к файлу книги.")
             return
         path = Path(path_str)
         if not path.exists():
@@ -457,7 +457,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
 
     def load_book(self, path: Path):
         try:
-            title, chapters = parse_fb2(path)
+            title, chapters = parse_book(path)
         except Exception as e:
             messagebox.showerror("Ошибка чтения", str(e))
             return

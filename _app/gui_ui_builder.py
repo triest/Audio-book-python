@@ -317,7 +317,10 @@ class UIBuilderMixin:
         row += 1
         self.sample_rate_label = ttk.Label(settings, text="Частота (Гц):")
         self.sample_rate_label.grid(row=row, column=0, sticky="w", pady=4)
-        self.sample_rate_var = tk.StringVar(value="48000")
+        # Для русской речи 24 kHz достаточно по полосе частот и вдвое
+        # уменьшает размер PCM16 WAV по сравнению с прежним значением 48 kHz.
+        # 48 kHz остаётся доступным для режимов, которым это действительно нужно.
+        self.sample_rate_var = tk.StringVar(value="24000")
         self.sample_rate_combo = ttk.Combobox(
             settings,
             textvariable=self.sample_rate_var,
