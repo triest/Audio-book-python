@@ -14,6 +14,22 @@ rem installer script's own scaffolding text is in English.
 
 setlocal enabledelayedexpansion
 
+rem Optional environments are opt-in so ESpeech-only users do not download
+rem XTTS/ASR weights, CosyVoice3, local LLM or unrelated TTS stacks.
+rem AUDIOBOOK_INSTALL_ESPEECH_ASR=1 enables Whisper/Transformers ASR.
+rem AUDIOBOOK_INSTALL_F5_FALLBACK=1 downloads F5-Russian fallback weights.
+rem AUDIOBOOK_INSTALL_XTTS=1 enables the XTTS fallback and its ~2 GB model.
+rem AUDIOBOOK_INSTALL_COSYVOICE3=1, AUDIOBOOK_INSTALL_LLM=1 and
+rem AUDIOBOOK_INSTALL_OTHER_TTS=1 enable their separate optional stacks.
+
+rem Keep pip quiet and deterministic on repeat runs.  pip already skips a
+rem package whose installed version satisfies the requirement; these settings
+rem also avoid the version check prompt and prefer cached binary wheels.
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
+set "PIP_NO_INPUT=1"
+set "PIP_PREFER_BINARY=1"
+set "PIP_UPGRADE_STRATEGY=only-if-needed"
+
 cd /d "%~dp0"
 
 rem Re-launch itself once, piping all output (both what you see on screen
@@ -74,11 +90,27 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 
-echo Installing dependencies - on first run this can take a few minutes
-echo (torch especially, usually 200-700 MB). Downloading...
+rem Narrow repair path for an interrupted CosyVoice/F5 dependency upgrade.
+rem Set AUDIOBOOK_REPAIR_ESPEECH_RUNTIME=1 to repair only the FastAPI
+rem runtime and apply the F5-TTS inference-only import optimization.
+if defined AUDIOBOOK_REPAIR_ESPEECH_RUNTIME (
+    set "CV_PY=%~dp0.venv_cosyvoice\Scripts\python.exe"
+    if not exist "!CV_PY!" (
+        echo CosyVoice environment is missing - run install.bat normally first.
+        exit /b 1
+    )
+    "!CV_PY!" -m pip install --no-deps "pydantic==2.14.3" "pydantic-core==2.50.4"
+    if errorlevel 1 exit /b 1
+    "!CV_PY!" _app\tools\patch_f5_inference.py
+    if errorlevel 1 exit /b 1
+    exit /b 0
+)
+
+echo Checking dependencies and model files...
+echo Missing or incompatible packages will be downloaded automatically.
 echo.
 
-"%VENV_PY%" -m pip install --upgrade pip --quiet
+"%VENV_PY%" -m pip install pip --quiet
 
 rem Base dependencies - needed almost always (fb2 parsing, GUI, downloads)
 "%VENV_PY%" -m pip install lxml numpy tqdm requests
@@ -98,13 +130,15 @@ rem prints a warning and fb2_reader.py keeps working without it.
 
 rem Local Silero synthesis (the main, recommended mode)
 rem CUDA build of torch in the MAIN venv (plain PyPI "torch" is CPU-only; Silero TTS can use the GPU).
-rem Skipped when the venv already has a CUDA build; otherwise the CPU build is replaced (cu126, then cu130 - cu121/cu124 have no wheels for Python 3.14).
-"%VENV_PY%" -c "import sys,torch; sys.exit(0 if torch.version.cuda else 1)" 2>nul
+rem Skip the download when any working CUDA build is already present.  The
+rem old command installed torch/torchaudio again on every run because the
+rem unqualified package names could resolve to a different wheel index.
+"%VENV_PY%" -c "import importlib.metadata as m,sys; from pathlib import Path; t=m.version('torch'); a=m.version('torchaudio'); r=Path(m.distribution('torch').locate_file('torch')); ar=Path(m.distribution('torchaudio').locate_file('torchaudio')); ok='+cu' in t and t.split('+')[0]==a.split('+')[0] and any(p.is_file() and p.stat().st_size>1024 for p in r.glob('_C*.pyd')) and all((r/'lib'/n).is_file() and (r/'lib'/n).stat().st_size>1024 for n in ('torch_cuda.dll','c10_cuda.dll')) and any(p.is_file() and p.stat().st_size>1024 for p in (ar/'lib').glob('*.pyd')); sys.exit(0 if ok else 1)" 2>nul
 if errorlevel 1 (
     "%VENV_PY%" -m pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu126
     if errorlevel 1 "%VENV_PY%" -m pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu130
 )
-"%VENV_PY%" -m pip install silero torch torchaudio omegaconf
+"%VENV_PY%" -m pip install silero omegaconf
 if errorlevel 1 goto :warn_partial
 
 rem Silero via a separate REST service (SSML pauses, optional)
@@ -133,7 +167,7 @@ rem if anything here fails the gate stays off and the rest of the pipeline is un
 if errorlevel 1 echo WARNING: grammar models were not downloaded - the grammar gate stays off ^(and the .exe will not contain them^) until you run install.bat again.
 
 rem PyInstaller - builds the single-file .exe at the end of this script.
-"%VENV_PY%" -m pip install --upgrade pyinstaller
+"%VENV_PY%" -m pip install pyinstaller
 if errorlevel 1 echo WARNING: pyinstaller failed to install - the .exe build step below will be skipped.
 
 rem pymorphy3 - Russian morphology analyzer, used to pick the correct
@@ -166,11 +200,14 @@ rem sometimes prints a warning about this: "dependency resolver does
 rem not... conflicts". That by itself is NOT an error (everything still
 rem installs and the program works) - but we pin a compatible version
 rem explicitly so the warning stops appearing, just in case.
-"%VENV_PY%" -m pip install "click>=8.4.2" --upgrade --quiet
+"%VENV_PY%" -m pip install "click>=8.4.2" --quiet
 
 rem Google TTS and system TTS (optional modes)
 "%VENV_PY%" -m pip install gTTS pyttsx3 pydub
 if errorlevel 1 goto :warn_partial
+
+"%VENV_PY%" -m pip check >nul
+if errorlevel 1 echo WARNING: dependency check found conflicts in the main environment.
 
 rem Piper TTS (optional mode) - small/fast local CPU voices, no cloning.
 rem Voice files (.onnx) are downloaded on first use into piper_voices/
@@ -309,7 +346,7 @@ rem No module named 'pkg_resources'" failures, even with --no-build-isolation
 rem below) - setuptools removed the pkg_resources module entirely starting
 rem around version 81, and openai-whisper's old setup.py still imports it.
 rem Pinning below that keeps pkg_resources available.
-"%CV_PY%" -m pip install --upgrade pip wheel --quiet
+"%CV_PY%" -m pip install pip wheel --quiet
 "%CV_PY%" -m pip install "setuptools<81" --quiet
 
 echo Installing CosyVoice dependencies - each package is installed
@@ -343,172 +380,69 @@ rem refuses to use any torch older than 2.5 (it silently falls back to
 rem "no GPU / CPU-only-ish" behavior instead of a hard error, which is
 rem confusing) - so we install an unpinned, current torch/torchaudio here
 rem instead of an old fixed version.
-"%CV_PY%" -m pip install --force-reinstall --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+rem Do not use --force-reinstall here.  It deleted several GB of perfectly
+rem good wheels on every run, even when the requested versions were unchanged.
+"%CV_PY%" -c "import importlib.metadata as m,sys; from pathlib import Path; t=m.version('torch'); a=m.version('torchaudio'); r=Path(m.distribution('torch').locate_file('torch')); ar=Path(m.distribution('torchaudio').locate_file('torchaudio')); ok=t in ('2.11.0+cu126','2.11.0+cu124') and a==t and all((r/'lib'/n).is_file() and (r/'lib'/n).stat().st_size>1024 for n in ('torch_cuda.dll','c10_cuda.dll')) and any(p.is_file() and p.stat().st_size>1024 for p in r.glob('_C*.pyd')) and any(p.is_file() and p.stat().st_size>1024 for p in (ar/'lib').glob('*.pyd')); sys.exit(0 if ok else 1)" >nul 2>nul
 if errorlevel 1 (
-    echo WARNING: CUDA ^(cu126^) build of torch failed - trying cu124 index...
-    "%CV_PY%" -m pip install --force-reinstall --no-deps torch==2.11.0+cu124 torchaudio==2.11.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+    "%CV_PY%" -m pip install --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
     if errorlevel 1 (
-        echo WARNING: CUDA ^(cu124^) build failed - trying the plain CPU build...
-        "%CV_PY%" -m pip install --upgrade torch torchaudio
-        if errorlevel 1 echo WARNING: torch/torchaudio failed to install.
+        echo WARNING: CUDA ^(cu126^) build of torch failed - trying cu124 index...
+        "%CV_PY%" -c "import importlib.metadata as m,sys; sys.exit(0 if m.version('torch')=='2.11.0+cu124' and m.version('torchaudio')=='2.11.0+cu124' else 1)" >nul 2>nul
+        if errorlevel 1 "%CV_PY%" -m pip install --no-deps torch==2.11.0+cu124 torchaudio==2.11.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+        if errorlevel 1 (
+            echo WARNING: CUDA ^(cu124^) build failed - trying the plain CPU build...
+            "%CV_PY%" -m pip install torch torchaudio
+            if errorlevel 1 echo WARNING: torch/torchaudio failed to install.
+        )
     )
 )
 
 if "!CV_PINNED!"=="1" (
-    "%CV_PY%" -m pip install numpy==1.26.4
-    if errorlevel 1 (
-        "%CV_PY%" -m pip install numpy
-        if errorlevel 1 echo WARNING: numpy failed to install.
-    )
+"%CV_PY%" -m pip install "numpy>=2.0,<2.6"
+    if errorlevel 1 echo WARNING: numpy failed to install.
 ) else (
-    "%CV_PY%" -m pip install numpy
+    "%CV_PY%" -m pip install "numpy>=2.0,<2.6"
     if errorlevel 1 echo WARNING: numpy failed to install.
 )
 
-if "!CV_PINNED!"=="1" (
-    "%CV_PY%" -m pip install onnxruntime-gpu==1.18.0
-    if errorlevel 1 (
-        echo WARNING: onnxruntime-gpu failed - trying CPU-only onnxruntime...
-        "%CV_PY%" -m pip install onnxruntime
-        if errorlevel 1 echo WARNING: onnxruntime failed to install.
-    )
-) else (
-    "%CV_PY%" -m pip install onnxruntime
-    if errorlevel 1 echo WARNING: onnxruntime failed to install.
+echo Installing only the ESpeech/F5 inference runtime packages...
+"%CV_PY%" -m pip install librosa pydub pypinyin rjieba torchdiffeq vocos "x-transformers==2.11.24" tqdm huggingface_hub num2words
+if errorlevel 1 echo WARNING: one or more ESpeech inference packages failed to install.
+
+rem ASR is only needed to transcribe voice references that do not provide a
+rem transcript. The ESpeech synthesis path works without these packages when
+the voice profile includes its reference text. Opt in with
+rem AUDIOBOOK_INSTALL_ESPEECH_ASR=1 to install them and fetch Whisper weights.
+if "%AUDIOBOOK_INSTALL_ESPEECH_ASR%"=="1" (
+    "%CV_PY%" -m pip install openai-whisper==20231117 "transformers==4.51.3"
+    if errorlevel 1 echo WARNING: optional ESpeech ASR dependencies failed to install.
+    "%CV_PY%" _app\tools\fetch_whisper_model.py small
+    if errorlevel 1 echo WARNING: Whisper small weights were not downloaded.
 )
 
-"%CV_PY%" -m pip install openai-whisper==20231117
-if errorlevel 1 (
-    "%CV_PY%" -m pip install openai-whisper
-    if errorlevel 1 echo WARNING: openai-whisper failed to install.
-)
-rem The medium whisper model (1.4 GB) is what the auto-repair / chapter sound check (asr_autorepair.py) uses; resumable, SHA-256 verified.
-rem If the download fails the check falls back to the small model (see _app\tools\asr_worker.py), so this is not fatal.
-"%CV_PY%" _app\tools\fetch_whisper_model.py medium
-if errorlevel 1 echo WARNING: whisper medium model was not downloaded - the sound check will use the weaker small model. Run install.bat again to retry.
-"%CV_PY%" -m pip install transformers==4.51.3
-if errorlevel 1 (
-    "%CV_PY%" -m pip install transformers
-    if errorlevel 1 echo WARNING: transformers failed to install.
-)
-"%CV_PY%" -m pip install diffusers==0.29.0
-if errorlevel 1 (
-    "%CV_PY%" -m pip install diffusers
-    if errorlevel 1 echo WARNING: diffusers failed to install.
-)
-"%CV_PY%" -m pip install funasr
-if errorlevel 1 echo WARNING: funasr failed to install.
-"%CV_PY%" -m pip install modelscope
-if errorlevel 1 echo WARNING: modelscope failed to install.
-"%CV_PY%" -m pip install huggingface_hub
-if errorlevel 1 echo WARNING: huggingface_hub failed to install.
-"%CV_PY%" -m pip install hyperpyyaml
-if errorlevel 1 echo WARNING: hyperpyyaml failed to install.
-"%CV_PY%" -m pip install conformer
-if errorlevel 1 echo WARNING: conformer failed to install.
-"%CV_PY%" -m pip install gdown
-if errorlevel 1 echo WARNING: gdown failed to install.
-"%CV_PY%" -m pip install inflect
-if errorlevel 1 echo WARNING: inflect failed to install.
-"%CV_PY%" -m pip install wetext
-if errorlevel 1 echo WARNING: wetext failed to install.
+"%CV_PY%" -m pip check >nul
+if errorlevel 1 echo WARNING: dependency check found conflicts in the CosyVoice environment.
 
-rem The "Matcha-TTS" submodule that CosyVoice vendors under third_party\ (see
-rem the "import matcha..." lines inside cosyvoice\flow\flow_matching.py) has
-rem its own extra dependencies that are not otherwise pulled in by anything
-rem above - without these, model loading fails with errors like
-rem "ModuleNotFoundError: No module named 'lightning'" the first time you
-rem actually try to synthesize something (the service still starts up fine,
-rem it just fails to load the model at that later point).
-"%CV_PY%" -m pip install lightning==2.2.4
-if errorlevel 1 (
-    "%CV_PY%" -m pip install lightning
-    if errorlevel 1 echo WARNING: lightning failed to install.
-)
-"%CV_PY%" -m pip install hydra-core==1.3.2
-if errorlevel 1 (
-    "%CV_PY%" -m pip install hydra-core
-    if errorlevel 1 echo WARNING: hydra-core failed to install.
-)
-"%CV_PY%" -m pip install omegaconf==2.3.0
-if errorlevel 1 (
-    "%CV_PY%" -m pip install omegaconf
-    if errorlevel 1 echo WARNING: omegaconf failed to install.
-)
-"%CV_PY%" -m pip install rich==13.7.1
-if errorlevel 1 (
-    "%CV_PY%" -m pip install rich
-    if errorlevel 1 echo WARNING: rich failed to install.
-)
-"%CV_PY%" -m pip install rootutils
-if errorlevel 1 echo WARNING: rootutils failed to install.
-"%CV_PY%" -m pip install einops
-if errorlevel 1 echo WARNING: einops failed to install.
-"%CV_PY%" -m pip install matplotlib==3.7.5
-if errorlevel 1 (
-    "%CV_PY%" -m pip install matplotlib
-    if errorlevel 1 echo WARNING: matplotlib failed to install.
-)
-"%CV_PY%" -m pip install networkx==3.1
-if errorlevel 1 (
-    "%CV_PY%" -m pip install networkx
-    if errorlevel 1 echo WARNING: networkx failed to install.
-)
-"%CV_PY%" -m pip install onnx==1.16.0
-if errorlevel 1 (
-    "%CV_PY%" -m pip install onnx
-    if errorlevel 1 echo WARNING: onnx failed to install.
-)
-"%CV_PY%" -m pip install pyworld==0.3.4
-if errorlevel 1 (
-    "%CV_PY%" -m pip install pyworld
-    if errorlevel 1 echo WARNING: pyworld failed to install.
-)
-"%CV_PY%" -m pip install x-transformers==2.11.24
-if errorlevel 1 (
-    "%CV_PY%" -m pip install x-transformers
-    if errorlevel 1 echo WARNING: x-transformers failed to install.
-)
-"%CV_PY%" -m pip install pyarrow==18.1.0
-if errorlevel 1 (
-    "%CV_PY%" -m pip install pyarrow
-    if errorlevel 1 echo WARNING: pyarrow failed to install.
-)
-"%CV_PY%" -m pip install grpcio==1.57.0
-if errorlevel 1 (
-    "%CV_PY%" -m pip install grpcio
-    if errorlevel 1 echo WARNING: grpcio failed to install.
-)
-"%CV_PY%" -m pip install grpcio-tools==1.57.0
-if errorlevel 1 (
-    "%CV_PY%" -m pip install grpcio-tools
-    if errorlevel 1 echo WARNING: grpcio-tools failed to install.
-)
-"%CV_PY%" -m pip install wget
-if errorlevel 1 echo WARNING: wget failed to install.
-
-if exist "CosyVoice\requirements.txt" (
-    "%CV_PY%" -m pip install --no-deps -r CosyVoice\requirements.txt
-)
-
-if exist "cosyvoice_rest_service.py" (
+rem The GUI sources live in _app, while this installer runs from the
+rem repository root.  Copy the service from the actual source location;
+rem keep the root-level path as a compatibility fallback for old layouts.
+if exist "_app\cosyvoice_rest_service.py" (
+    if not exist "_app\CosyVoice" mkdir "_app\CosyVoice"
+    copy /Y "_app\cosyvoice_rest_service.py" "_app\CosyVoice\cosyvoice_rest_service.py" >nul
+) else if exist "cosyvoice_rest_service.py" (
     copy /Y "cosyvoice_rest_service.py" "CosyVoice\cosyvoice_rest_service.py" >nul
 )
+if exist "_app\CosyVoice\cosyvoice_rest_service.py" (
+    set "CV_MODEL_DIR=%~dp0_app/CosyVoice"
+) else (
+    set "CV_MODEL_DIR=%~dp0CosyVoice"
+)
 
-rem NOTE: the voice cloning engine used by cosyvoice_rest_service.py was
-rem switched from CosyVoice2 first to XTTS-v2, then to F5-TTS with a
-rem Russian-specific finetuned checkpoint (F5-TTS-Russian) - CosyVoice2 is
-rem not trained on Russian at all and produced unintelligible output no
-rem matter how it was called; XTTS-v2 is officially multilingual (incl.
-rem Russian) but not specialized for it, so pronunciation/stress was often
-rem off; F5-TTS-Russian was actually finetuned on real Russian speech
-rem (Common Voice, SOVA RUDevices, SberDevices Golos), so it should sound
-rem noticeably more natural. The service tries F5-TTS first and falls back
-rem to XTTS automatically if F5-TTS fails to load - both are installed
-rem below so that fallback actually works. The CosyVoice2 model download
-rem step that used to be here was removed - no longer used.
+rem The service uses ESpeech RL-V2 as the selected Russian engine. Other
+rem model weights and fallback runtimes are optional and are not downloaded
+rem in an ESpeech-only install.
 echo.
-echo Installing f5-tts ^(F5-TTS-Russian voice cloning engine - primary^)...
+echo Installing f5-tts ^(ESpeech RL-V2 inference runtime^)...
 rem --no-build-isolation: pip's build isolation builds packages from source
 rem (like the old openai-whisper==20231117 that f5-tts pins, which has no
 rem pre-built wheel for newer Python) inside a throwaway "overlay"
@@ -516,64 +450,30 @@ rem environment that does NOT inherit the setuptools/wheel installed above
 rem into .venv_cosyvoice itself - so even with them installed, the build
 rem still failed with "No module named 'pkg_resources'". Without isolation,
 rem it builds using .venv_cosyvoice directly, which does have them.
-"%CV_PY%" -m pip install f5-tts huggingface_hub --no-build-isolation
-rem f5-tts pulls in "datasets" (only actually needed for TRAINING, not for
-rem the inference-only code paths this program uses - but f5-tts imports it
-rem unconditionally either way), which needs a newer pyarrow than what
-rem sometimes ends up installed - without this, loading f5/espeech fails
-rem with "AttributeError: module 'pyarrow' has no attribute 'json_'" and
-rem the service silently falls back to the noisier XTTS-v2 engine instead.
-"%CV_PY%" -m pip install --upgrade pyarrow
-if errorlevel 1 (
-    echo WARNING: f5-tts failed to install - this can happen because one of
-    echo its dependencies ^(bitsandbytes^) does not always have a ready-made
-    echo Windows wheel. The service will fall back to the XTTS-v2 engine
-    echo below if this happens, so this is not fatal - just means the
-    echo Russian-specialized voice will not be available until this is
-    echo fixed. You can try running install.bat again, or report the exact
-    echo error if it keeps failing.
-) else (
-    rem Recent pyarrow wheels require NumPy 2.x; keep the inference environment
-    rem consistent so importing f5_tts does not fail inside pyarrow.
-    "%CV_PY%" -m pip install --upgrade "numpy>=2.0"
-    if errorlevel 1 echo WARNING: NumPy 2.x failed to install - F5-TTS may not load.
-    echo.
-    echo Pre-downloading the F5-TTS-Russian checkpoint ^(~1.3 GB, only needs
-    echo to happen once - if this step is skipped or fails, the service will
-    echo just download it the first time voice cloning is used instead^)...
-    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='hotstone228/F5-TTS-Russian', filename='model_last.safetensors', local_dir='pretrained_models/f5-tts-russian'); hf_hub_download(repo_id='hotstone228/F5-TTS-Russian', filename='vocab.txt', local_dir='pretrained_models/f5-tts-russian')"
-    if errorlevel 1 (
-        echo WARNING: could not pre-download the F5-TTS-Russian checkpoint -
-        echo it will be downloaded automatically the first time you use voice
-        echo cloning instead ^(just makes the very first use slower^).
-    )
-    "%CV_PY%" -c "from huggingface_hub import snapshot_download; snapshot_download('charactr/vocos-mel-24khz')"
-    if errorlevel 1 echo WARNING: could not pre-download the Vocos vocoder - F5-TTS will download it on first use.
-    echo.
-    echo Pre-downloading the ESpeech RL-V2 checkpoint ^(F5-based, another
-    echo Russian finetune - reportedly less noisy than XTTS-v2, understands
-    echo stress marks and supports voice cloning - recommended engine, see
-    echo cosyvoice tab^). ~2.7 GB, only needs to happen once...
-    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='espeech_tts_rlv2.pt', local_dir='pretrained_models/espeech'); hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='vocab.txt', local_dir='pretrained_models/espeech')"
-    if errorlevel 1 (
-        echo WARNING: could not pre-download the ESpeech checkpoint - it will
-        echo be downloaded automatically the first time it is selected instead.
-    )
-    echo.
-    echo Pre-downloading the F5-TTS-Russian winter checkpoint ^(a newer
-    echo community F5-TTS finetune for Russian with full stress-mark support^).
-    echo ~1.4 GB, only needs to happen once...
-    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='Misha24-10/F5-TTS_RUSSIAN', filename='F5TTS_v1_Base_v4_winter/model_212000.safetensors', local_dir='pretrained_models/f5-tts-russian-winter'); hf_hub_download(repo_id='Misha24-10/F5-TTS_RUSSIAN', filename='F5TTS_v1_Base/vocab.txt', local_dir='pretrained_models/f5-tts-russian-winter')"
-    if errorlevel 1 (
-        echo WARNING: could not pre-download the F5-TTS-Russian winter
-        echo checkpoint - it will be downloaded automatically the first time
-        echo it is selected instead.
-    )
+rem Keep the already verified Torch/CUDA build intact. F5-TTS declares many
+rem training/UI/ASR dependencies; the inference runtime list above is the
+rem only set used by ESpeech when a reference transcript is present.
+"%CV_PY%" -m pip install "f5-tts==1.1.22" huggingface_hub --no-build-isolation --no-deps
+"%CV_PY%" _app\tools\patch_f5_inference.py
+if errorlevel 1 echo WARNING: could not apply the F5-TTS inference import optimization.
+rem ESpeech is the selected engine: prefetch only its 2.7 GB checkpoint and
+rem the small Vocos vocoder. hf_hub_download reuses valid local files/cache.
+"%CV_PY%" -c "from huggingface_hub import snapshot_download; snapshot_download('charactr/vocos-mel-24khz')"
+if errorlevel 1 echo WARNING: could not pre-download the Vocos vocoder; service will try again on first use.
+"%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='espeech_tts_rlv2.pt', local_dir='%CV_MODEL_DIR%/pretrained_models/espeech'); hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='vocab.txt', local_dir='%CV_MODEL_DIR%/pretrained_models/espeech')"
+if errorlevel 1 echo WARNING: could not pre-download the ESpeech checkpoint; service will try again on first use.
+
+if "%AUDIOBOOK_INSTALL_F5_FALLBACK%"=="1" (
+    echo Installing optional F5-Russian fallback weights...
+    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='hotstone228/F5-TTS-Russian', filename='model_last.safetensors', local_dir='%CV_MODEL_DIR%/pretrained_models/f5-tts-russian'); hf_hub_download(repo_id='hotstone228/F5-TTS-Russian', filename='vocab.txt', local_dir='%CV_MODEL_DIR%/pretrained_models/f5-tts-russian'); hf_hub_download(repo_id='Misha24-10/F5-TTS_RUSSIAN', filename='F5TTS_v1_Base_v4_winter/model_212000.safetensors', local_dir='%CV_MODEL_DIR%/pretrained_models/f5-tts-russian-winter'); hf_hub_download(repo_id='Misha24-10/F5-TTS_RUSSIAN', filename='F5TTS_v1_Base/vocab.txt', local_dir='%CV_MODEL_DIR%/pretrained_models/f5-tts-russian-winter')"
+    if errorlevel 1 echo WARNING: F5-Russian fallback weights were not downloaded.
 )
 
+rem Optional XTTS fallback. It downloads Coqui/Transformers packages and a
+rem separate ~2 GB model; keep it opt-in for ESpeech-only installations.
+if "%AUDIOBOOK_INSTALL_XTTS%"=="1" (
 echo.
-echo Installing coqui-tts ^(XTTS-v2 voice cloning engine - fallback, used if
-echo F5-TTS above failed to install or load^)...
+echo Installing optional coqui-tts ^(XTTS-v2 fallback^)...
 "%CV_PY%" -m pip install coqui-tts
 if errorlevel 1 (
     echo WARNING: coqui-tts failed to install - voice cloning mode will not
@@ -631,12 +531,19 @@ if errorlevel 1 (
         echo instead ^(just makes the very first use slower^).
     )
 )
+)
+
+rem Keep FastAPI's Pydantic runtime internally consistent. A previous
+rem interrupted pip resolver left pydantic 2.7.0 next to pydantic-core
+rem 2.50.4, making the REST service fail at import time.
+"%CV_PY%" -c "import sys; from importlib.metadata import version; sys.exit(0 if version('pydantic')=='2.14.3' and version('pydantic-core')=='2.50.4' else 1)" >nul 2>nul
+if errorlevel 1 "%CV_PY%" -m pip install --no-deps "pydantic==2.14.3" "pydantic-core==2.50.4"
+if errorlevel 1 echo WARNING: Pydantic versions are inconsistent - the CosyVoice REST service may fail to start.
 
 echo.
-echo CosyVoice setup finished ^(see any WARNING lines above for details^).
-echo If everything above succeeded, the "CosyVoice" voice mode will be
-echo available in the program, and its background service will start
-echo automatically when you select that mode - no separate window needed.
+echo ESpeech setup finished ^(see any WARNING lines above for details^).
+echo If the ESpeech dependencies and model files are ready, the voice mode
+echo will start its background service when selected in the program.
 
 rem ===============================================
 rem   CosyVoice3 (FunAudioLLM/CosyVoice, Fun-CosyVoice3-0.5B)
@@ -658,6 +565,10 @@ echo ===============================================
 echo   CosyVoice3 (experimental) - optional setup
 echo ===============================================
 echo.
+if not "%AUDIOBOOK_INSTALL_COSYVOICE3%"=="1" (
+    echo Skipping CosyVoice3. Set AUDIOBOOK_INSTALL_COSYVOICE3=1 to install it.
+    goto :cosyvoice3_done
+)
 
 if not exist "CosyVoice3" (
     where git >nul 2>nul
@@ -733,6 +644,8 @@ if errorlevel 1 (
 ) else (
     "%CV3_PY%" -m pip install num2words huggingface_hub
     copy /Y "cosyvoice3_rest_service.py" "CosyVoice3\cosyvoice3_rest_service.py" >nul
+    "%CV3_PY%" -m pip check >nul
+    if errorlevel 1 echo WARNING: dependency check found conflicts in the CosyVoice3 environment.
     echo.
     echo CosyVoice3 dependencies installed. Model weights ^(~1-2 GB^) are
     echo NOT downloaded here - they download automatically the first time
@@ -757,6 +670,10 @@ echo.
 echo ===============================================
 echo   Built-in local LLM - optional setup
 echo ===============================================
+if not "%AUDIOBOOK_INSTALL_LLM%"=="1" (
+    echo Skipping local LLM. Set AUDIOBOOK_INSTALL_LLM=1 to install it.
+    goto :llm_done
+)
 set "LLM_PYLAUNCHER="
 for %%V in (3.11 3.12 3.10) do (
     if not defined LLM_PYLAUNCHER (
@@ -795,6 +712,10 @@ echo.
 
 rem Optional local VoxCPM2 environment (Python 3.10-3.12; kept separate from
 rem the main Python 3.14 environment and from Silero/ESpeech).
+if not "%AUDIOBOOK_INSTALL_OTHER_TTS%"=="1" (
+    echo Skipping VoxCPM2 and Kokoro-RU. Set AUDIOBOOK_INSTALL_OTHER_TTS=1 to install them.
+    goto :optional_tts_done
+)
 if not exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
     echo Creating optional .venv_voxcpm environment...
     py -3.11 -m venv "%~dp0.venv_voxcpm"
@@ -803,7 +724,8 @@ if exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
     set "VOX_PY=%~dp0.venv_voxcpm\Scripts\python.exe"
     "!VOX_PY!" -m pip install --upgrade pip wheel --quiet
     "!VOX_PY!" -m pip install voxcpm fastapi uvicorn soundfile
-    "!VOX_PY!" -m pip install --force-reinstall --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+    "!VOX_PY!" -c "import sys,torch,torchaudio; sys.exit(0 if torch.__version__.startswith('2.11.0+cu126') and torchaudio.__version__.startswith('2.11.0+cu126') else 1)" >nul 2>nul
+    if errorlevel 1 "!VOX_PY!" -m pip install --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
     "!VOX_PY!" -c "from voxcpm import VoxCPM; print('VoxCPM2 environment is ready')"
     if errorlevel 1 echo WARNING: VoxCPM2 environment check failed - the mode will be unavailable.
 ) else echo WARNING: Python 3.11 was not found - skipping optional VoxCPM2 environment.
@@ -819,13 +741,15 @@ if exist "%~dp0.venv_kokoro\Scripts\python.exe" (
     set "KOKORO_PY=%~dp0.venv_kokoro\Scripts\python.exe"
     "!KOKORO_PY!" -m pip install --upgrade pip wheel --quiet
     "!KOKORO_PY!" -m pip install kokoro ruaccent huggingface_hub fastapi uvicorn soundfile
-    "!KOKORO_PY!" -m pip install --force-reinstall --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+    "!KOKORO_PY!" -c "import sys,torch,torchaudio; sys.exit(0 if torch.__version__.startswith('2.11.0+cu126') and torchaudio.__version__.startswith('2.11.0+cu126') else 1)" >nul 2>nul
+    if errorlevel 1 "!KOKORO_PY!" -m pip install --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
     "!KOKORO_PY!" -c "from huggingface_hub import snapshot_download; snapshot_download('zaakirio/kokoro-ru', allow_patterns=['ru_g2p.py','kokoro-config.json','espeak-data/*','kokoro-ru-v2-base.pth','kokoro-ru-v2-dima.pth','voices/*.pt']); snapshot_download('ruaccent/accentuator')"
     "!KOKORO_PY!" -c "from kokoro import KModel; from ruaccent import RUAccent; print('Kokoro-RU environment is ready')"
     if errorlevel 1 echo WARNING: Kokoro-RU environment check failed - the mode will be unavailable.
 ) else echo WARNING: Python 3.11 was not found - skipping optional Kokoro-RU environment.
 echo.
 
+:optional_tts_done
 goto :done
 
 :warn_partial
@@ -876,12 +800,11 @@ if not exist "%~dp0grammar_gate_models\slovnet_morph_news_v1.tar" echo WARNING: 
 if errorlevel 1 echo WARNING: silero-stress is not installed - the .exe would have no automatic stress marks.
 rem a running fb2_reader.exe locks the file and makes the build fail
 taskkill /F /IM fb2_reader.exe >nul 2>nul
-rem forced CLEAN build: no stale build\ / dist\ output from an earlier (e.g. folder-mode) build
-if exist "%~dp0build" rmdir /s /q "%~dp0build"
-if exist "%~dp0dist" rmdir /s /q "%~dp0dist"
+rem Keep PyInstaller's analysis cache between runs.  Deleting build\ and
+rem dist\ here made every install rebuild the whole executable from scratch.
 rem strictly ONE monolithic file (main.spec reads this variable; it is also its default)
 set "AUDIOBOOK_ONEFILE=1"
-"%VENV_PY%" -m PyInstaller main.spec --noconfirm --clean --distpath "%~dp0dist" --workpath "%~dp0build"
+"%VENV_PY%" -m PyInstaller main.spec --noconfirm --distpath "%~dp0dist" --workpath "%~dp0build"
 if errorlevel 1 (
     echo WARNING: the .exe build failed - see the messages above. The program still runs from sources ^(run_gui.bat^).
     exit /b 0

@@ -109,7 +109,7 @@ app = FastAPI()
 # продолжал бы обслуживать запросы своим старым кодом сколько угодно долго
 # после того, как программу обновили - новые эндпоинты/исправления просто
 # не были бы видны, пока пользователь вручную не перезапустит компьютер.
-SERVICE_VERSION = "2026-11-10.12-gpu-local-audio"
+SERVICE_VERSION = "2026-11-18.13-espeech-wav-loader"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -373,6 +373,23 @@ def _load_espeech_model():
     from huggingface_hub import hf_hub_download
     from f5_tts.model import DiT
     from f5_tts.infer.utils_infer import load_model, load_vocoder
+
+    # ESpeech uses the low-level inference path, so it does not pass through
+    # _load_f5_model() where the Windows WAV fallback is installed. Keep WAV
+    # reference loading independent of TorchCodec/FFmpeg here as well.
+    import f5_tts.infer.utils_infer as f5_utils
+    if not getattr(f5_utils, "_audiobook_soundfile_loader", False):
+        _torchaudio_load = f5_utils.torchaudio.load
+
+        def _load_audio_with_wav_fallback(path, *args, **kwargs):
+            try:
+                return _torchaudio_load(path, *args, **kwargs)
+            except Exception:
+                arr, sr = sf.read(path, dtype="float32", always_2d=True)
+                return torch.from_numpy(np.ascontiguousarray(arr.T)), int(sr)
+
+        f5_utils.torchaudio.load = _load_audio_with_wav_fallback
+        f5_utils._audiobook_soundfile_loader = True
 
     logger.info(f"Скачиваю/проверяю чекпоинт ESpeech ({ESPEECH_MODEL_REPO}) - "
                 "при первом запуске это ~2.7 ГБ, один раз...")
