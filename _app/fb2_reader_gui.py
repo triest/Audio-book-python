@@ -260,6 +260,16 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self._saved_voice = data.get("voice_var")
         self._saved_book = data.get("_last_book")
         self._restore_geometry(data.get("_geometry"))
+        recycle_setting_migrated = data.get("_silero_recycle_default_migrated") is True
+        if not recycle_setting_migrated:
+            # This checkbox used to default to True, so old settings files
+            # contain a value the user may never have chosen.  Migrate that
+            # legacy default once to False; from this release onward an
+            # explicit user choice is preserved normally.
+            if data.get("recycle_services_var") is True:
+                data["recycle_services_var"] = False
+            data["_silero_recycle_default_migrated"] = True
+            recycle_setting_migrated = False
         for name in SETTINGS_FIELDS:
             if name not in data:
                 continue
@@ -297,6 +307,8 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             pass
         if src is LEGACY_SETTINGS_PATH:
             self._save_settings()          # migrate: create config.json right away
+        elif not recycle_setting_migrated:
+            self._save_settings()          # persist the one-time Silero recycle migration
 
     def _restore_geometry(self, geo):
         """Restores the window size/position if it is still on a visible part of the screen."""
@@ -368,6 +380,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             except Exception:
                 pass
         data["_last_dirs"] = self._last_dirs
+        data["_silero_recycle_default_migrated"] = True
         try:
             data["voice_var"] = self.voice_var.get()
             data["_last_book"] = str(self.book_path) if self.book_path else (getattr(self, "_saved_book", None) or "")
