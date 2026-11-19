@@ -5489,11 +5489,8 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
     pronunciation_subs = load_pronunciation_substitutions()
     stress_engine = normalize_stress_engine(stress_engine)
-    # Практически лучший русский результат даёт собственное ударение v5_6_ru.
-    # Словарь применяется отдельно и сохраняет приоритет над моделью.
-    if model_id == "v5_6_ru" and stress_engine == "silero":
-        print("Silero v5_6_ru: встроенные ударения включены; внешний silero-stress отключён.")
-        stress_engine = "none"
+    # Keep the configured layered stress path: dictionary, silero-stress,
+    # then the model's own accent guessing for words the client leaves unmarked.
     reset_stress_review(label=Path(outdir).name)
     set_strip_monosyllables(strip_monosyllables)
     if stress_review is not None:
@@ -6004,13 +6001,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
               "(forced_stress_words.json + manual overrides) — для них нейросеть не вызывается.")
     vad_model, vad_get_timestamps = _load_silero_vad() if use_vad_trim else (None, None)
 
-    # Для v5_6_ru используем встроенные ударения/омографы самой модели.
-    # Ручной словарь ниже всё равно применяется к особым словам, а внешний
-    # silero-stress оставляем для старых/других моделей.
+    # Preserve the layered stress path for v5_6_ru too: explicit dictionary
+    # and confident silero-stress marks go first; Silero guesses only the rest.
     stress_engine = normalize_stress_engine(stress_engine)
-    if model_id == "v5_6_ru" and stress_engine == "silero":
-        print("Silero v5_6_ru: встроенные ударения включены; внешний silero-stress отключён.")
-        stress_engine = "none"
     reset_stress_review(label=Path(outdir).name)
     set_strip_monosyllables(strip_monosyllables)
     if stress_review is not None:
