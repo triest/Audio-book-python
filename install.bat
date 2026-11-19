@@ -842,7 +842,7 @@ if errorlevel 1 (
     echo WARNING: PyInstaller is not installed - skipping the .exe build.
     exit /b 0
 )
-if not exist "%~dp0grammar_gate_models\slovnet_morph_news_v1.tar" echo WARNING: grammar models are missing - the .exe will be built WITHOUT the grammar gate.
+if not exist "%~dp0_app\grammar_gate_models\slovnet_morph_news_v1.tar" echo WARNING: grammar models are missing - the .exe will be built WITHOUT the grammar gate.
 "%VENV_PY%" -c "from importlib.metadata import version; version('silero-stress')" >nul 2>nul
 if errorlevel 1 echo WARNING: silero-stress is not installed - the .exe would have no automatic stress marks.
 rem a running fb2_reader.exe locks the file and makes the build fail
