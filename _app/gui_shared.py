@@ -81,7 +81,7 @@ COSYVOICE_ENGINE_CODES = {label: code for code, label in COSYVOICE_ENGINE_LABELS
 COSYVOICE_DEFAULT_ENGINE = "espeech"
 
 SILERO_REST_DEFAULT_URL = "http://localhost:5010"
-SILERO_REST_EXPECTED_SERVICE_VERSION = "2026-11-19.1-silero-cuda-health"
+SILERO_REST_EXPECTED_SERVICE_VERSION = "2026-11-19.2-silero-startup-warmup"
 
 # CosyVoice3, в отличие от остальных движков (f5/espeech/f5winter/xtts),
 # запускается подпроцессом в СВОЁМ окружении .venv_cosyvoice3 (не в общем

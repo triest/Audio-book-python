@@ -10,14 +10,17 @@ import re
 import sys
 import logging
 import traceback
+import tempfile
+import time
 from num2words import num2words  # Библиотека для преобразования чисел в слова
 from xml.sax.saxutils import escape as xml_escape, unescape as xml_unescape
  
 app = FastAPI()
  
-SERVICE_VERSION = "2026-11-19.1-silero-cuda-health"
+SERVICE_VERSION = "2026-11-19.2-silero-startup-warmup"
 version = "1.5"  # legacy field kept for existing integrations
 model = None
+warmup_complete = False
  
 # --------------------------------------------------------------------------
 # Логирование: всё пишем и в консоль, и в файл silero_rest_service.log —
@@ -67,6 +70,7 @@ async def health():
         "status": "ok" if model is not None else "loading",
         "service_version": SERVICE_VERSION,
         "model_loaded": model is not None,
+        "warmup_complete": warmup_complete,
         "model": MODEL_ID,
         "device": str(getattr(model, "device", "unknown")) if model is not None else None,
     }
@@ -74,7 +78,7 @@ async def health():
  
 @app.on_event("startup")
 async def startup_event():
-    global model
+    global model, warmup_complete
  
     # Use CUDA automatically when the service environment has a CUDA-enabled
     # torch build. CPU remains the fallback when CUDA is unavailable.
@@ -90,6 +94,35 @@ async def startup_event():
         logger.info(f"Loading Silero TTS model {MODEL_ID}...")
         model = load_silero_package(MODEL_ID, device)
         logger.info(f"TTS Model {MODEL_ID} loaded successfully on {device}")
+        # The first inference after loading weights can initialize CUDA kernels
+        # and take much longer than normal requests. Do it before Uvicorn marks
+        # the service ready, so the first book fragment does not pay that cost.
+        fd, warmup_path = tempfile.mkstemp(prefix="silero-warmup-", suffix=".wav")
+        os.close(fd)
+        warmup_started = time.perf_counter()
+        try:
+            logger.info("Silero CUDA warm-up: synthesizing a short disposable phrase...")
+            await run_in_threadpool(
+                model.save_wav,
+                text="Проверка запуска.",
+                speaker="xenia",
+                audio_path=warmup_path,
+                sample_rate=48000,
+            )
+            if not os.path.isfile(warmup_path) or os.path.getsize(warmup_path) <= 44:
+                raise RuntimeError("warm-up returned no usable WAV")
+            warmup_complete = True
+            logger.info("Silero warm-up completed in %.1f seconds", time.perf_counter() - warmup_started)
+        except Exception:
+            logger.warning(
+                "Silero warm-up failed; the first synthesis request may be slower:\n%s",
+                traceback.format_exc(),
+            )
+        finally:
+            try:
+                os.remove(warmup_path)
+            except OSError:
+                logger.warning("Could not remove Silero warm-up WAV %s", warmup_path)
     except Exception:
         logger.error("Failed to load TTS model:\n" + traceback.format_exc())
         model = None
