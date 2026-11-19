@@ -347,7 +347,7 @@ class UIBuilderMixin:
         self.auto_start_rest_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
 
         row += 1
-        self.recycle_services_var = tk.BooleanVar(value=True)
+        self.recycle_services_var = tk.BooleanVar(value=False)
         self.recycle_services_check = ttk.Checkbutton(
             settings,
             text="При запуске программы перезапускать сервис Silero REST "

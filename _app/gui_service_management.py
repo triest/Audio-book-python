@@ -206,6 +206,7 @@ class ServiceManagementMixin:
         parsed_url = urlparse(rest_url)
         configured_port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
         is_silero_local = self._rest_url_is_local(rest_url) and configured_port == 5010
+        existing_startup_pids = set()
         if is_silero_local and self._silero_service_ready(rest_url):
             self._post_ui(lambda: self.log("Сервис Silero REST готов (версия актуальна)."))
             return True
@@ -223,7 +224,22 @@ class ServiceManagementMixin:
             self._post_ui(lambda: self.log("Настроенный сервис Silero REST отвечает."))
             return True
 
-        if self._rest_proc is None or self._rest_proc.poll() is not None:
+        if is_silero_local and (self._rest_proc is None or self._rest_proc.poll() is not None):
+            try:
+                existing_startup_pids = {
+                    pid for pid in self._find_service_pids("silero_rest_service.py", configured_port)
+                    if pid > 0
+                }
+            except Exception:
+                existing_startup_pids = set()
+            if existing_startup_pids:
+                self._post_ui(lambda: self.log(
+                    "Silero REST уже загружается в другом процессе; жду его готовности "
+                    "и не запускаю второй экземпляр."
+                ))
+
+        if ((self._rest_proc is None or self._rest_proc.poll() is not None)
+                and not existing_startup_pids):
             service_path = _app_dir() / "silero_rest_service.py"
             frozen = bool(getattr(sys, "frozen", False))
             if not frozen and not service_path.exists():
@@ -267,6 +283,21 @@ class ServiceManagementMixin:
                     or (not is_silero_local and self._ping_rest_service(rest_url))):
                 self._post_ui( lambda: self.log("Сервис Silero REST запущен и готов принимать запросы."))
                 return True
+            if existing_startup_pids:
+                alive = {pid for pid in existing_startup_pids if self._pid_alive(pid)}
+                if not alive:
+                    self._post_ui(lambda: self.log(
+                        "Найденный процесс Silero завершился до готовности; "
+                        "повторите запуск синтеза, чтобы создать новый."
+                    ))
+                    return False
+                if self._ping_rest_service(rest_url):
+                    self._kill_process_on_port(configured_port)
+                    self._post_ui(lambda: self.log(
+                        "Процесс Silero открыл порт без готовой модели или актуальной версии; "
+                        "остановил его. Повторите запуск синтеза для чистого старта."
+                    ))
+                    return False
             if self._rest_proc is not None and self._rest_proc.poll() is not None:
                 self._post_ui( lambda: self.log(
                     f"Сервис Silero REST завершился сам собой (код {self._rest_proc.returncode}) "
@@ -963,23 +994,23 @@ class ServiceManagementMixin:
         return "denied"
 
     def _startup_recycle_services(self):
-        """Recycle Silero REST only when the selected mode needs that service."""
+        """Warm Silero on startup without killing a reusable loaded model."""
         mode = self._current_mode()
         if mode != "silero_rest":
-            self.log(f"[service recycle] skipped: mode {mode} does not use Silero REST.")
             return
         try:
-            if not self.recycle_services_var.get():
-                return
+            force_recycle = bool(self.recycle_services_var.get())
         except Exception:
-            return
+            force_recycle = False
         if sys.platform != "win32":
-            self.log("Service recycle: skipped (Windows-only: uses taskkill/tasklist).")
-            return
+            force_recycle = False
         rest_url = self.rest_url_var.get().strip()
         auto_start = bool(self.auto_start_rest_var.get())
-        threading.Thread(target=self._recycle_rest_service, args=(rest_url, auto_start),
-                         daemon=True).start()
+        if force_recycle:
+            threading.Thread(target=self._recycle_rest_service, args=(rest_url, auto_start),
+                             daemon=True).start()
+        elif auto_start and self._rest_url_is_local(rest_url):
+            self._prewarm_silero_rest_service()
 
     def _recycle_rest_service(self, rest_url: str, auto_start: bool):
         def log(msg: str):
