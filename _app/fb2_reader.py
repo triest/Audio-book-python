@@ -162,7 +162,10 @@ SILERO_SPEAKERS = speaker_choices(DEFAULT_SILERO_MODEL)
 TTS_MODES = {
     "silero": "Silero (локально, лучшее качество)",
     "silero_rest": "Silero REST (через сервис, SSML-паузы)",
-    "cosyvoice": "CosyVoice (локально, GPU, клонирование голоса)",
+    # The public mode name must expose the actual recommended engine.  The
+    # detailed selector in the "Голоса CosyVoice" tab still lets the user
+    # switch between ESpeech, F5, XTTS and the other compatible services.
+    "cosyvoice": "ESpeech RL-V2 / CosyVoice (локально, GPU, клонирование голоса)",
     "voxcpm2": "VoxCPM2 (локально, GPU, клонирование голоса)",
     "f5_tts": "F5-TTS (локально, GPU, клонирование голоса)",
     "kokoro_ru": "Kokoro-RU (локально, быстро)",
@@ -1640,15 +1643,36 @@ _EMOTION_LABEL_HINTS = {
 }
 
 
+def _emotion_context_windows(sentences: "list[str]") -> "list[str]":
+    """Add adjacent sentence context while keeping one independently numbered target per item."""
+    result = []
+    for i, sentence in enumerate(sentences):
+        before = sentences[i - 1].strip()[-240:] if i else ""
+        after = sentences[i + 1].strip()[:240] if i + 1 < len(sentences) else ""
+        parts = []
+        if before:
+            parts.append("Перед этим: " + before)
+        parts.append("Целевая реплика: " + sentence.strip())
+        if after:
+            parts.append("Далее: " + after)
+        result.append("\n".join(parts))
+    return result
+
+
 def _emotion_prompt(paragraphs: "list[str]", allowed_emotions: "list[str]", keyed: bool = False) -> str:
     labels = "/".join(allowed_emotions)
     hints = "; ".join(f"'{e}' — {_EMOTION_LABEL_HINTS[e]}" for e in allowed_emotions if e in _EMOTION_LABEL_HINTS)
     numbered = "\n".join(f"{i + 1}. {p[:400]}" for i, p in enumerate(paragraphs))
     return (
-        "Ниже — пронумерованные абзацы одной главы книги на русском языке. Для КАЖДОГО "
-        f"абзаца определи наиболее подходящую эмоциональную окраску речи из набора: {labels}.\n"
+        "Ниже — пронумерованные фрагменты одной главы книги на русском языке. Для КАЖДОГО "
+        f"фрагмента определи наиболее подходящую эмоциональную окраску речи из набора: {labels}.\n"
         f"Значения: {hints}. Опирайся на смысл и контекст абзаца (что происходит, "
-        "какие эмоции у персонажей/рассказчика), а не на отдельные слова. Озвучка — "
+        "какие эмоции у персонажей/рассказчика), а не на отдельные слова. Если дано "
+        "«Перед этим» или «Далее», это только контекст: метку ставь для «Целевой реплики». "
+        "Учитывай, является ли целевая реплика диалогом или авторским повествованием; "
+        "не переноси автоматически эмоцию персонажа на нейтральный авторский текст. "
+        "Сарказм, скрытая угроза и сдержанные чувства отмечай только при ясной опоре в контексте. "
+        "Озвучка — "
         "аудиокнига: интонация НЕ должна скакать. Если окраска не выражена явно — ставь "
         "'neutral'; соседние абзацы одной сцены обычно имеют одну и ту же метку, меняй её "
         "только при явной смене настроения сцены.\n\n"
@@ -4792,7 +4816,22 @@ def _stall_guard_start(label: str, seconds: float = 180.0):
                 return
             lines = [f"!! STALL: '{label}' has been running for {n * seconds:.0f}s - thread stacks follow"]
             for tid, frame in sys._current_frames().items():
-                lines.append(f"--- thread {tid} ---\n" + "".join(traceback.format_stack(frame)))
+                # Do not resolve source lines here.  PyTorch's torch.package
+                # importer can leave synthetic filenames such as
+                # ``<torch_package_0>.models/...`` in a live frame; asking
+                # linecache for those paths raises and used to kill the very
+                # watchdog meant to explain a slow/hung model startup.
+                lines.append(f"--- thread {tid} ---")
+                try:
+                    stack = traceback.StackSummary.extract(
+                        traceback.walk_stack(frame), lookup_lines=False
+                    )
+                    lines.extend(
+                        f"  {entry.filename}:{entry.lineno} in {entry.name}"
+                        for entry in stack
+                    )
+                except Exception as stack_error:
+                    lines.append(f"  stack unavailable: {type(stack_error).__name__}: {stack_error}")
             print("\n".join(lines))
 
     threading.Thread(target=watch, name="stall-guard", daemon=True).start()
@@ -5134,6 +5173,14 @@ def stress_dry_run(text: str, strip_monosyllables: bool = True, book_overrides_p
         if progress_cb and done % 10 == 0:
             progress_cb(f"  …{done}/{todo} абзацев")
     result = "\n".join(out)
+    try:
+        from stress_postcheck import check_text
+        postcheck = check_text(result)
+    except Exception as e:
+        postcheck = []
+        if not getattr(stress_dry_run, "_postcheck_warned", False):
+            stress_dry_run._postcheck_warned = True
+            print(f"stress postcheck skipped ({type(e).__name__}: {e})")
     info = {
         "silero_stress": silero is not None,
         "dictionary_words": len(stress_dict),
@@ -5141,6 +5188,8 @@ def stress_dry_run(text: str, strip_monosyllables: bool = True, book_overrides_p
         "silero_filled": _fallback_stats.get("applied", 0) - blanks0,
         "marks": result.count("+"),
         "seconds": _time.time() - t0,
+        "postcheck": postcheck,
+        "postcheck_count": len(postcheck),
     }
     return result, info
 
@@ -5440,6 +5489,11 @@ def run_silero(chapters, outdir: Path, start: int, speaker: str, sample_rate: in
     stress_dict = load_stress_dictionary(stress_dict_path, book_stress_overrides_path)
     pronunciation_subs = load_pronunciation_substitutions()
     stress_engine = normalize_stress_engine(stress_engine)
+    # Практически лучший русский результат даёт собственное ударение v5_6_ru.
+    # Словарь применяется отдельно и сохраняет приоритет над моделью.
+    if model_id == "v5_6_ru" and stress_engine == "silero":
+        print("Silero v5_6_ru: встроенные ударения включены; внешний silero-stress отключён.")
+        stress_engine = "none"
     reset_stress_review(label=Path(outdir).name)
     set_strip_monosyllables(strip_monosyllables)
     if stress_review is not None:
@@ -5744,7 +5798,7 @@ def _prosody_wrap(escaped_sentence: str, original_sentence: str, emphasize: bool
 def text_to_ssml(text: str, sentence_break_ms: int = 320,
                   paragraph_break_ms: int = 550, comma_break_ms: int = 180,
                   emphasize: bool = True, paragraph_prosody: "list | None" = None,
-                  sentence_prosody: "dict | None" = None) -> str:
+                  sentence_prosody: "list | dict | None" = None) -> str:
     """Превращает обычный текст главы в SSML-документ для Silero.
 
     * абзацы -> <p>, между ними длинная пауза (paragraph_break_ms);
@@ -5774,6 +5828,7 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()] or [text.strip()]
 
     p_chunks = []
+    sentence_idx = 0
     for para_idx, para in enumerate(paragraphs):
         sentences = [s.strip() for s in _SENT_SPLIT_RE.split(para) if s.strip()]
         s_chunks = []
@@ -5786,7 +5841,11 @@ def text_to_ssml(text: str, sentence_break_ms: int = 320,
             escaped = _DA_UZH_RE.sub(r'\1<break time="60ms"/> ', escaped)
             escaped = _LETTER_MARK_RE.sub(lambda m: f'<break time="100ms"/> <prosody rate="80%">{m.group(1)}</prosody>', escaped)
             wrapped = _prosody_wrap(escaped, sent, emphasize)
-            spr = sentence_prosody.get(" ".join(sent.split())) if sentence_prosody else None
+            if isinstance(sentence_prosody, list):
+                spr = sentence_prosody[sentence_idx] if sentence_idx < len(sentence_prosody) else None
+            else:
+                spr = sentence_prosody.get(" ".join(sent.split())) if sentence_prosody else None
+            sentence_idx += 1
             if spr:
                 wrapped = f'<prosody rate="{spr["rate"]}" pitch="{spr["pitch"]}">{wrapped}</prosody>'
             s_chunks.append(wrapped)
@@ -5883,6 +5942,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                      use_vad_trim: bool = True, use_stress_online: bool = False,
                      book_stress_overrides_path: "Path | str | None" = None,
                      stress_engine: str = "silero",
+                     put_accent: bool = True,
                      smart_emotion: bool = False, emotion_attribution=None,
                      strip_monosyllables: bool = True,
                      stress_review: "bool | None" = None,
@@ -5961,6 +6021,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                                            book_auto_stress_cache_path(book_stress_overrides_path))
         stress_dict.update(learned)
     _client_layers = stress_layers_are_client_side(stress_engine, silero_stress_accentor)
+    # In the "только словарь" mode the REST service must not add its own
+    # guesses. With the client chain active, marks are already authoritative.
+    _server_accent = bool(put_accent) and not _client_layers
     set_keep_hyphens(_client_layers)
 
     if dialogue_speakers:
@@ -6044,9 +6107,9 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             strip_monosyllable_stress(apply_stress_dictionary(plain_text_chunk, stress_dict)), _pron_held))
 
     # Заполняется заново для каждой главы (см. основной цикл ниже) —
-    # {абзац_исходного_текста: {"rate":..,"pitch":..}} по классификации LLM.
+    # Абзацная просодия сопоставляется по тексту, фразовая — по порядку вхождений.
     _chapter_para_prosody: dict = {}
-    _chapter_sentence_prosody: dict = {}
+    _chapter_sentence_prosody: list | None = None
 
     # ASR-автопочинка (asr_autorepair.py): гул/растяжка/проглоченный кусок -> пересинтез кусков
     # с другими паузами. Любой сбой ASR оставляет озвучку как есть.
@@ -6062,7 +6125,8 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             log(f"asr_repair недоступен ({e_asr}) — озвучка без автопочинки.")
             _asr_fixer = None
 
-    def synth_via_ssml(plain_text_chunk: str, chunk_speaker: str, ssml_tweak=None) -> bytes:
+    def synth_via_ssml(plain_text_chunk: str, chunk_speaker: str, sentence_prosody=None,
+                       ssml_tweak=None) -> bytes:
         enrich_stress_dictionary_online(plain_text_chunk, stress_dict, stress_dict_path,
                                          enabled=use_stress_online)
         # paragraph_prosody передаётся ПО ПОЗИЦИИ абзаца (не по тексту) —
@@ -6082,10 +6146,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             comma_break_ms=comma_break_ms,
             emphasize=emphasize,
             paragraph_prosody=para_prosody_list,
-            sentence_prosody={" ".join(s.split()): _chapter_sentence_prosody[" ".join(s.split())]
-                             for p in plain_text_chunk.split("\n") for s in _SENT_SPLIT_RE.split(p)
-                             if s.strip() and " ".join(s.split()) in _chapter_sentence_prosody}
-            if _chapter_sentence_prosody else None,
+            sentence_prosody=sentence_prosody,
         )
         if ssml_tweak is not None:
             ssml = ssml_tweak(ssml)
@@ -6098,7 +6159,7 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                     "sample_rate": sample_rate,
                     "raw_ssml": "true",
                     "strip_mono": "true" if strip_monosyllables else "false",
-                    "server_accent": "false" if _client_layers else "true",
+                    "server_accent": "true" if _server_accent else "false",
                 })
             level = resp.headers.get("X-Synthesis-Level", "as-is")
             if level != "as-is":
@@ -6119,22 +6180,22 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
             "speaker": chunk_speaker,
             "sample_rate": sample_rate,
             "strip_mono": "true" if strip_monosyllables else "false",
-            "server_accent": "false" if _client_layers else "true",
+            "server_accent": "true" if _server_accent else "false",
         })
         return resp.content
 
     def synth_chunk(plain_text_chunk: str, chunk_no: int, idx: int, title: str,
-                     chunk_speaker: str) -> "np.ndarray":
+                     chunk_speaker: str, sentence_prosody=None) -> "np.ndarray":
         if not _text_has_speakable_content(plain_text_chunk):
             # разделитель сцен вроде "* * *" — нечего озвучивать, просто
             # короткая пауза вместо него, без обращения к сервису
             return np.zeros(int(sample_rate * 0.4), dtype=np.float32)
         try:
-            wav_bytes = synth_via_ssml(plain_text_chunk, chunk_speaker)
+            wav_bytes = synth_via_ssml(plain_text_chunk, chunk_speaker, sentence_prosody)
             if _asr_fixer is not None:
                 fut = _asr_fixer.submit(
                     plain_text_chunk, wav_bytes,
-                    lambda tweak: synth_via_ssml(plain_text_chunk, chunk_speaker, tweak),
+                    lambda tweak: synth_via_ssml(plain_text_chunk, chunk_speaker, sentence_prosody, tweak),
                     tag=f"гл.{idx} фрагм.{chunk_no}", first_chunk=(chunk_no == 1))
                 return _AsrPending(fut, wav_bytes, (plain_text_chunk, chunk_no, idx, title))
         except Exception as e_ssml:
@@ -6216,14 +6277,14 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         run_stress_review_for_chapter(text, stress_dict, title)
 
         _chapter_para_prosody = {}
-        _chapter_sentence_prosody = {}
+        _chapter_sentence_prosody = None
         if smart_emotion and _llm_provider_allowed(((emotion_attribution if emotion_attribution is not None else attribution) or {}).get("provider")):
             chapter_paras = [p for p in text.split("\n") if p.strip()]
             chapter_sentences = [s.strip() for p in chapter_paras for s in _SENT_SPLIT_RE.split(p) if s.strip()]
             _emo_creds = emotion_attribution if emotion_attribution is not None else attribution
             try:
                 emo_sentence_labels = classify_paragraph_emotions_llm(
-                    chapter_sentences, allowed_emotions=list(SILERO_EMOTION_PROSODY.keys()),
+                    _emotion_context_windows(chapter_sentences), allowed_emotions=list(SILERO_EMOTION_PROSODY.keys()),
                     api_key=(_emo_creds or {}).get("api_key", ""),
                     model=(_emo_creds or {}).get("model", DEFAULT_ATTRIBUTION_MODEL),
                     provider=(_emo_creds or {}).get("provider", DEFAULT_ATTRIBUTION_PROVIDER),
@@ -6231,28 +6292,36 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
                     ollama_host=(_emo_creds or {}).get("ollama_host", ""),
                     log_fn=log,
                 )
-                # Keep all occurrences: a dict keyed only by paragraph text
-                # silently overwrote repeated paragraphs and moved the emotion
-                # from the last occurrence to every identical occurrence.
-                _chapter_sentence_prosody = {
-                    " ".join(s.split()): pr for s, pr in zip(chapter_sentences, smooth_emotion_prosody(emo_sentence_labels))
-                }
+                # Keep one prosody item per sentence occurrence. Repeated
+                # identical sentences may have different context and emotion.
+                _chapter_sentence_prosody = smooth_emotion_prosody(emo_sentence_labels)
                 log(f"smart_emotion: эмоции определены для {len(chapter_sentences)} предложений и {len(chapter_paras)} абзац(ев) главы.")
             except Exception as e:
                 log(f"smart_emotion не удался ({e}) — глава озвучивается без эмоциональной окраски.")
                 _chapter_para_prosody = {}
-                _chapter_sentence_prosody = {}
+                _chapter_sentence_prosody = None
 
         # Группируем по голосу (диалоги/повествование и/или LLM-атрибуция
         # по персонажам, см. attribution), затем каждую группу — как
         # раньше, на куски под SSML-лимит max_len.
         voice_groups = resolve_voice_groups(text, speaker, dialogue_speakers, outdir,
                                              attribution=attribution, log_fn=log)
-        chunks = []  # [(текст, голос), ...]
+        chunks = []  # [(текст, голос, эмоции_по_вхождениям), ...]
+        emotion_cursor = 0
         for group_voice, group_text in voice_groups:
             for chunk in _split_paragraphs_for_ssml(group_text, max_len):
                 if chunk.strip():
-                    chunks.append((chunk, group_voice))
+                    chunk_emotions = None
+                    if _chapter_sentence_prosody is not None:
+                        n_sentences = sum(
+                            1 for para in chunk.split("\n")
+                            for sent in _SENT_SPLIT_RE.split(para) if sent.strip()
+                        )
+                        chunk_emotions = _chapter_sentence_prosody[
+                            emotion_cursor:emotion_cursor + n_sentences
+                        ]
+                        emotion_cursor += n_sentences
+                    chunks.append((chunk, group_voice, chunk_emotions))
 
         pause = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
         audio_parts = []
@@ -6261,14 +6330,14 @@ def run_silero_rest(chapters, outdir: Path, start: int, speaker: str, sample_rat
         if on_progress:
             on_progress(pos, total, 0, chunks_total)
 
-        for chunk_no, (chunk, chunk_voice) in enumerate(
+        for chunk_no, (chunk, chunk_voice, chunk_emotions) in enumerate(
             tqdm(chunks, desc=f"Гл.{idx}", unit="фрагм."), 1
         ):
             if not chunk.strip():
                 if on_progress:
                     on_progress(pos, total, chunk_no, chunks_total)
                 continue
-            audio = synth_chunk(chunk, chunk_no, idx, title, chunk_voice)
+            audio = synth_chunk(chunk, chunk_no, idx, title, chunk_voice, chunk_emotions)
             _stall_guard_stop(_sg)
             audio_parts.append(audio)
             if isinstance(audio, _AsrPending):
@@ -6330,7 +6399,9 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
                    paragraph_break_ms: int = 450, comma_break_ms: int = 120,
                    max_len: int = 400, on_progress=None,
                    chapter_indices=None, char_ranges=None, dialogue_voices=None, attribution=None,
-                   should_stop=None, play_fn=None):
+                   should_stop=None, play_fn=None, stress_engine: str = "none",
+                   strip_monosyllables: bool = True, stress_review: bool = False,
+                   book_stress_overrides_path=None):
     """Озвучка через локальный сервис cosyvoice_rest_service.py (CosyVoice2,
     работает на GPU) — см. install_cosyvoice.bat/README для установки в
     отдельное окружение .venv_cosyvoice. В отличие от Silero/Yandex, у
@@ -6358,6 +6429,26 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
     import wave as wave_mod
 
     rest_url = rest_url.rstrip("/")
+    kokoro_mode = rest_url.endswith(":5015")
+    stress_dict = {}
+    stress_accentor = None
+    if kokoro_mode:
+        stress_engine = normalize_stress_engine(stress_engine)
+        stress_dict = load_stress_dictionary(book_overrides_path=book_stress_overrides_path)
+        if stress_engine == "silero":
+            stress_accentor = _load_silero_stress()
+            if stress_accentor is not None:
+                set_keep_hyphens(True)
+                if book_stress_overrides_path:
+                    learned = auto_collect_name_stress(
+                        "\n".join(ch[1] for ch in chapters), stress_accentor,
+                        book_auto_stress_cache_path(book_stress_overrides_path),
+                    )
+                    for word, marked_word in learned.items():
+                        stress_dict.setdefault(word, marked_word)
+        reset_stress_review(label=Path(outdir).name)
+        set_stress_review(stress_review)
+        set_strip_monosyllables(strip_monosyllables)
     endpoint = f"{rest_url}/getwav"
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -6481,6 +6572,9 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
             text, mode="cosyvoice", voice=voice, sample_rate=sample_rate, max_len=max_len,
             sentence_break_ms=sentence_break_ms, paragraph_break_ms=paragraph_break_ms,
             comma_break_ms=comma_break_ms, engine=engine_tag,
+            stress_engine=stress_engine if kokoro_mode else "none",
+            stress_dict=stress_dict_digest(stress_dict, text) if kokoro_mode else "",
+            strip_monosyllables=bool(strip_monosyllables) if kokoro_mode else False,
             dialogue_voices=",".join(dialogue_voices) if dialogue_voices else "",
             attribution=(attribution.get("provider", ""), attribution.get("model", "")) if attribution else "",
         )
@@ -6494,6 +6588,9 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
             continue
 
         print(f"[{idx}/{len(chapters)}] Озвучиваю (CosyVoice): {title} -> {fname}")
+
+        if kokoro_mode and stress_review:
+            run_stress_review_for_chapter(text, stress_dict, title, log)
 
         voice_groups = resolve_voice_groups(text, voice, dialogue_voices, outdir,
                                              attribution=attribution, log_fn=log)
@@ -6517,7 +6614,15 @@ def run_cosyvoice(chapters, outdir: Path, start: int, voice: str, sample_rate: i
         for seg_i, (part_text, pause_ms, seg_voice) in enumerate(
             tqdm(segments, desc=f"Гл.{idx}", unit="фрагм."), 1
         ):
-            audio = synth_chunk(part_text, seg_i, idx, title, seg_voice)
+            synth_text = part_text
+            if kokoro_mode:
+                synth_text = numbers_to_words_ru(synth_text)
+                protected, placeholders = apply_stress_dictionary_protected(synth_text, stress_dict)
+                marked = apply_stress_layers(protected, stress_engine, stress_accentor)
+                synth_text = restore_stress_placeholders(marked, placeholders)
+                if strip_monosyllables:
+                    synth_text = strip_monosyllable_stress(synth_text)
+            audio = synth_chunk(synth_text, seg_i, idx, title, seg_voice)
             audio_parts.append(audio)
             if pause_ms > 0:
                 audio_parts.append(np.zeros(int(sample_rate * pause_ms / 1000), dtype=np.float32))
@@ -7451,6 +7556,7 @@ def main():
                          use_stress_online=args.stress_online,
                          book_stress_overrides_path=book_manual_stress_overrides_path(args.book),
                          stress_engine=args.stress_engine,
+                         put_accent=not args.no_accent,
                          smart_emotion=args.smart_emotion,
                          strip_monosyllables=not args.keep_monosyllable_stress,
                          asr_repair=args.asr_repair)

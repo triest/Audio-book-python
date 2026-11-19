@@ -14,6 +14,7 @@ from gui_shared import (
     COSYVOICE_DEFAULT_ENGINE,
     COSYVOICE_ENGINE_CODES,
     COSYVOICE_EXPECTED_SERVICE_VERSION,
+    SILERO_REST_EXPECTED_SERVICE_VERSION,
     COSYVOICE3_DEFAULT_REST_URL,
     COSYVOICE3_EXPECTED_SERVICE_VERSION,
     VOXCPM_EXPECTED_SERVICE_VERSION,
@@ -66,13 +67,13 @@ class ServiceManagementMixin:
         запущенный вручную процесс — глушим только то, что подняли сами."""
         self._qwen_local_started_by_us = False
         if self._ping_http_ok(server_url):
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 f"Локальный сервер Qwen3-TTS уже отвечает на {server_url} — использую его."
             ))
             return True
 
         if not start_cmd:
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 f"Локальный сервер Qwen3-TTS не отвечает на {server_url}, а команда "
                 "автозапуска не указана — запустите сервер вручную (см. блок "
                 "«Qwen3-TTS» справа) и повторите озвучку."
@@ -89,7 +90,7 @@ class ServiceManagementMixin:
                 self._qwen_local_proc = subprocess.Popen(start_cmd, shell=True, **popen_kwargs)
             except Exception as e:
                 err = str(e)
-                self.after(0, lambda t=err: self.log(
+                self._post_ui( lambda t=err: self.log(
                     f"Не удалось запустить команду автозапуска Qwen3-TTS: {t}"
                 ))
                 return False
@@ -102,11 +103,11 @@ class ServiceManagementMixin:
                 for line in proc.stdout:
                     line = line.rstrip()
                     if line:
-                        self.after(0, lambda l=line: self.log("  [Qwen3-TTS локально] " + l))
+                        self._post_ui( lambda l=line: self.log("  [Qwen3-TTS локально] " + l))
 
             threading.Thread(target=pump_output, daemon=True).start()
 
-        self.after(0, lambda: self.log(
+        self._post_ui( lambda: self.log(
             "…запускаю локальный сервер Qwen3-TTS (при первом запуске может загружать "
             "модель, это может занять несколько минут)…"
         ))
@@ -114,10 +115,10 @@ class ServiceManagementMixin:
         last_notice = 0.0
         while time.time() < deadline:
             if self._ping_http_ok(server_url):
-                self.after(0, lambda: self.log("Локальный сервер Qwen3-TTS запущен и готов."))
+                self._post_ui( lambda: self.log("Локальный сервер Qwen3-TTS запущен и готов."))
                 return True
             if self._qwen_local_proc is not None and self._qwen_local_proc.poll() is not None:
-                self.after(0, lambda: self.log(
+                self._post_ui( lambda: self.log(
                     f"Команда автозапуска Qwen3-TTS завершилась сама собой "
                     f"(код {self._qwen_local_proc.returncode}) во время запуска — "
                     "см. сообщения [Qwen3-TTS локально] выше."
@@ -125,10 +126,10 @@ class ServiceManagementMixin:
                 return False
             if time.time() - last_notice > 15:
                 last_notice = time.time()
-                self.after(0, lambda: self.log("…сервер Qwen3-TTS ещё запускается…"))
+                self._post_ui( lambda: self.log("…сервер Qwen3-TTS ещё запускается…"))
             time.sleep(1.0)
 
-        self.after(0, lambda: self.log("Локальный сервер Qwen3-TTS не успел запуститься за отведённое время."))
+        self._post_ui( lambda: self.log("Локальный сервер Qwen3-TTS не успел запуститься за отведённое время."))
         return False
 
     def _stop_qwen_local_service(self):
@@ -140,7 +141,7 @@ class ServiceManagementMixin:
         if self._qwen_local_proc is not None and self._qwen_local_proc.poll() is None:
             try:
                 self._qwen_local_proc.terminate()
-                self.after(0, lambda: self.log("Локальный сервер Qwen3-TTS остановлен."))
+                self._post_ui( lambda: self.log("Локальный сервер Qwen3-TTS остановлен."))
             except Exception:
                 pass
         self._qwen_local_proc = None
@@ -153,22 +154,80 @@ class ServiceManagementMixin:
         venv_py = _app_dir() / ".venv" / "Scripts" / "python.exe"
         return str(venv_py) if venv_py.exists() else sys.executable
 
-    def _ensure_rest_service_running(self, rest_url: str, ready_timeout: float = 600.0) -> bool:
+    def _prewarm_silero_rest_service(self):
+        """Warm Silero REST as soon as its mode is selected, in the background."""
+        if not getattr(self, "auto_start_rest_var", None):
+            return
+        try:
+            if not self.auto_start_rest_var.get():
+                return
+            rest_url = self.rest_url_var.get().strip()
+            if not self._rest_url_is_local(rest_url):
+                return
+        except Exception:
+            return
+        if getattr(self, "_silero_prewarm_active", False):
+            return
+        self._silero_prewarm_active = True
+
+        def prewarm():
+            try:
+                if self._silero_service_ready(rest_url):
+                    return
+                self._post_ui(lambda: self.log(
+                    "Режим Silero REST выбран: запускаю сервис заранее. "
+                    "Импорт PyTorch может занять несколько минут."
+                ))
+                if not self._ensure_rest_service_running(rest_url):
+                    self._post_ui(lambda: self.log(
+                        "Предварительный запуск Silero REST не удался; "
+                        "повторю запуск при начале озвучки."
+                    ))
+            except Exception as e:
+                error_text = f"Предварительный запуск Silero REST: {type(e).__name__}: {e}"
+                self._post_ui(lambda t=error_text: self.log(t))
+            finally:
+                self._silero_prewarm_active = False
+
+        threading.Thread(target=prewarm, name="silero-rest-prewarm", daemon=True).start()
+
+    def _ensure_rest_service_running(self, rest_url: str, ready_timeout: float = 1800.0) -> bool:
         """Thread-safe wrapper: the startup recycle (see _startup_recycle_services) and a
         "Start" click must never spawn two Silero REST processes at once."""
         with self._rest_svc_lock:
             return self._ensure_rest_service_running_impl(rest_url, ready_timeout)
 
-    def _ensure_rest_service_running_impl(self, rest_url: str, ready_timeout: float = 600.0) -> bool:
+    def _ensure_rest_service_running_impl(self, rest_url: str, ready_timeout: float = 1800.0) -> bool:
         """Запускает silero_rest_service.py в фоне (без консоли пользователя)
         и ждёт, пока он не начнёт отвечать на rest_url. При первом запуске
         сервис может несколько минут скачивать модель — поэтому таймаут
         большой, а в журнал периодически пишется, что процесс ещё идёт."""
+        from urllib.parse import urlparse
+        parsed_url = urlparse(rest_url)
+        configured_port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+        is_silero_local = self._rest_url_is_local(rest_url) and configured_port == 5010
+        if is_silero_local and self._silero_service_ready(rest_url):
+            self._post_ui(lambda: self.log("Сервис Silero REST готов (версия актуальна)."))
+            return True
+        if is_silero_local and self._ping_rest_service(rest_url):
+            # A process on the configured Silero port may have been left from
+            # an older checkout.  /docs alone cannot tell us whether it has
+            # the current fixes or a loaded model, so recycle it before launch.
+            self._post_ui(lambda: self.log(
+                "На порту Silero REST отвечает старая или неготовая версия; "
+                "перезапускаю сервис из текущих файлов…"
+            ))
+            self._kill_process_on_port(configured_port)
+            self._rest_proc = None
+        elif self._ping_rest_service(rest_url):
+            self._post_ui(lambda: self.log("Настроенный сервис Silero REST отвечает."))
+            return True
+
         if self._rest_proc is None or self._rest_proc.poll() is not None:
             service_path = _app_dir() / "silero_rest_service.py"
             frozen = bool(getattr(sys, "frozen", False))
             if not frozen and not service_path.exists():
-                self.after(0, lambda: self.log(f"Не найден файл сервиса: {service_path}"))
+                self._post_ui( lambda: self.log(f"Не найден файл сервиса: {service_path}"))
                 return False
             try:
                 popen_kwargs = dict(
@@ -187,7 +246,7 @@ class ServiceManagementMixin:
                 )
             except Exception as e:
                 err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис Silero REST: {t}"))
+                self._post_ui( lambda t=err: self.log(f"Не удалось запустить сервис Silero REST: {t}"))
                 return False
 
             def pump_output():
@@ -197,32 +256,49 @@ class ServiceManagementMixin:
                 for line in proc.stdout:
                     line = line.rstrip()
                     if line:
-                        self.after(0, lambda l=line: self.log("  [сервис Silero REST] " + l))
+                        self._post_ui( lambda l=line: self.log("  [сервис Silero REST] " + l))
 
             threading.Thread(target=pump_output, daemon=True).start()
 
         deadline = time.time() + ready_timeout
         last_notice = 0.0
         while time.time() < deadline:
-            if self._ping_rest_service(rest_url):
-                self.after(0, lambda: self.log("Сервис Silero REST запущен и готов принимать запросы."))
+            if ((is_silero_local and self._silero_service_ready(rest_url))
+                    or (not is_silero_local and self._ping_rest_service(rest_url))):
+                self._post_ui( lambda: self.log("Сервис Silero REST запущен и готов принимать запросы."))
                 return True
             if self._rest_proc is not None and self._rest_proc.poll() is not None:
-                self.after(0, lambda: self.log(
+                self._post_ui( lambda: self.log(
                     f"Сервис Silero REST завершился сам собой (код {self._rest_proc.returncode}) "
                     "во время запуска — см. сообщения [сервис Silero REST] выше."
                 ))
                 return False
             if time.time() - last_notice > 15:
                 last_notice = time.time()
-                self.after(0, lambda: self.log(
-                    "…сервис Silero REST ещё запускается (при первом запуске может скачивать "
-                    "модель, это может занять несколько минут)…"
+                self._post_ui( lambda: self.log(
+                    "…Silero REST запускается: импорт PyTorch и загрузка модели; "
+                    "этап импорта может занять несколько минут)…"
                 ))
             time.sleep(1.0)
 
-        self.after(0, lambda: self.log("Сервис Silero REST не успел запуститься за отведённое время."))
+        self._post_ui( lambda: self.log("Сервис Silero REST не успел запуститься за отведённое время."))
         return False
+
+    @staticmethod
+    def _silero_service_ready(url: str, timeout: float = 3.0) -> bool:
+        """Require both a loaded model and the expected REST code version."""
+        try:
+            req = urllib.request.Request(url.rstrip("/") + "/health")
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                if response.status != 200:
+                    return False
+                data = json.loads(response.read().decode("utf-8"))
+            return (
+                data.get("service_version") == SILERO_REST_EXPECTED_SERVICE_VERSION
+                and data.get("model_loaded") is True
+            )
+        except Exception:
+            return False
     @staticmethod
     def _cosyvoice_model_loaded(url: str, timeout: float = 3.0, expected_version: str = None) -> bool:
         """В отличие от _ping_rest_service (который считает сервис рабочим
@@ -385,7 +461,7 @@ class ServiceManagementMixin:
         пользователя оказался слишком капризным, поэтому вместо контейнера -
         обычный подпроцесс, как у остальных движков.)"""
         if getattr(sys, "frozen", False):
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "Автозапуск сервиса CosyVoice3 недоступен в собранной .exe-версии "
                 "программы. Запустите программу из исходников (run_gui.bat)."
             ))
@@ -399,7 +475,7 @@ class ServiceManagementMixin:
         service_path = service_dir / "cosyvoice3_rest_service.py"
 
         if not cosyvoice3_py.exists() or not service_path.exists():
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "Движок CosyVoice3 ещё не установлен на этом компьютере. Запустите "
                 "install.bat ещё раз (секция CosyVoice3 — отдельная, большая загрузка, "
                 "может занять время)."
@@ -426,12 +502,12 @@ class ServiceManagementMixin:
             # model not loaded..." forever instead of just using it or
             # replacing it once.
             if self._cosyvoice_model_loaded(rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION):
-                self.after(0, lambda: self.log(
+                self._post_ui( lambda: self.log(
                     "Сервис CosyVoice3 уже запущен (остался от предыдущего запуска "
                     "программы) и готов принимать запросы."
                 ))
                 return True
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "Обнаружен уже запущенный сервис CosyVoice3 (видимо, от предыдущего "
                 "запуска программы), но версия/модель не подходят — останавливаю его "
                 "и запускаю заново…"
@@ -441,7 +517,7 @@ class ServiceManagementMixin:
         elif not need_start and self._ping_rest_service(rest_url) and not self._cosyvoice_model_loaded(
             rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION
         ):
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "Обнаружен уже запущенный сервис CosyVoice3, у которого не загружена "
                 "модель — останавливаю его и запускаю заново…"
             ))
@@ -467,7 +543,7 @@ class ServiceManagementMixin:
             except Exception as e:
                 _log_exception_to_file("запуск сервиса CosyVoice3")
                 err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice3: {t}"))
+                self._post_ui( lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice3: {t}"))
                 return False
 
             def pump_output():
@@ -477,7 +553,7 @@ class ServiceManagementMixin:
                 for line in proc.stdout:
                     line = line.rstrip()
                     if line:
-                        self.after(0, lambda l=line: self.log("  [сервис CosyVoice3] " + l))
+                        self._post_ui( lambda l=line: self.log("  [сервис CosyVoice3] " + l))
 
             threading.Thread(target=pump_output, daemon=True).start()
 
@@ -487,24 +563,24 @@ class ServiceManagementMixin:
             just_exited = self._cosyvoice3_proc is not None and self._cosyvoice3_proc.poll() is not None
             if not just_exited and self._ping_rest_service(rest_url):
                 if self._cosyvoice_model_loaded(rest_url, expected_version=COSYVOICE3_EXPECTED_SERVICE_VERSION):
-                    self.after(0, lambda: self.log("Сервис CosyVoice3 запущен и готов принимать запросы."))
+                    self._post_ui( lambda: self.log("Сервис CosyVoice3 запущен и готов принимать запросы."))
                     return True
                 if time.time() - last_notice > 15:
                     last_notice = time.time()
-                    self.after(0, lambda: self.log(
+                    self._post_ui( lambda: self.log(
                         "Сервис CosyVoice3 отвечает, но модель ещё не загрузилась (первый "
                         "запуск также скачивает веса, ~1-2 ГБ) — жду… Подробности в "
                         "CosyVoice3\\data\\cosyvoice3_rest_service.log."
                     ))
             if just_exited:
-                self.after(0, lambda: self.log(
+                self._post_ui( lambda: self.log(
                     f"Сервис CosyVoice3 завершился сам собой (код {self._cosyvoice3_proc.returncode}) "
                     "— см. CosyVoice3\\data\\cosyvoice3_rest_service.log."
                 ))
                 return False
             time.sleep(1.0)
 
-        self.after(0, lambda: self.log("Сервис CosyVoice3 не успел запуститься за отведённое время."))
+        self._post_ui( lambda: self.log("Сервис CosyVoice3 не успел запуститься за отведённое время."))
         return False
     def _ensure_cosyvoice_service_running(self, rest_url: str, ready_timeout: float = 900.0) -> bool:
         """Аналог _ensure_rest_service_running для CosyVoice: запускает
@@ -534,10 +610,21 @@ class ServiceManagementMixin:
                 venv_name, script_name, port, expected = ".venv_voxcpm", "voxcpm_rest_service.py", 5014, VOXCPM_EXPECTED_SERVICE_VERSION
             else:
                 venv_name, script_name, port, expected = ".venv_kokoro", "kokoro_rest_service.py", 5015, KOKORO_EXPECTED_SERVICE_VERSION
-            py = _app_dir() / venv_name / "Scripts" / "python.exe"
-            service_path = _app_dir() / script_name
+            # install.bat lives in the repository root, while source files are
+            # kept in _app/. Prefer the root venv created by the installer, but
+            # continue to support packaged/older layouts with the venv beside
+            # the service script.
+            app_root = _app_dir()
+            runtime_roots = (app_root, app_root.parent)
+            py = next(
+                (root / venv_name / "Scripts" / "python.exe"
+                 for root in runtime_roots
+                 if (root / venv_name / "Scripts" / "python.exe").exists()),
+                app_root / venv_name / "Scripts" / "python.exe",
+            )
+            service_path = app_root / script_name
             if not py.exists() or not service_path.exists():
-                self.after(0, lambda: self.log(f"Режим {engine} не установлен. Запустите install.bat."))
+                self._post_ui( lambda: self.log(f"Режим {engine} не установлен. Запустите install.bat."))
                 return False
             if self._cosyvoice_model_loaded(rest_url, expected_version=expected):
                 return True
@@ -551,15 +638,28 @@ class ServiceManagementMixin:
                     bufsize=1, env=env,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
+                proc = self._cosyvoice_proc
+
+                def pump_output():
+                    if proc.stdout is None:
+                        return
+                    for line in proc.stdout:
+                        line = line.rstrip()
+                        if line:
+                            self._post_ui(
+                                lambda text=line: self.log(f"  [{engine}] {text}")
+                            )
+
+                threading.Thread(target=pump_output, daemon=True).start()
             except Exception as exc:
                 _log_exception_to_file(f"запуск сервиса {engine}")
                 err = str(exc)
-                self.after(0, lambda e=err: self.log(f"Не удалось запустить {engine}: {e}"))
+                self._post_ui( lambda e=err: self.log(f"Не удалось запустить {engine}: {e}"))
                 return False
             deadline = time.time() + ready_timeout
             while time.time() < deadline:
                 if self._cosyvoice_model_loaded(rest_url, expected_version=expected):
-                    self.after(0, lambda: self.log(f"Сервис {engine} запущен."))
+                    self._post_ui( lambda: self.log(f"Сервис {engine} запущен."))
                     return True
                 if self._cosyvoice_proc.poll() is not None:
                     return False
@@ -567,22 +667,42 @@ class ServiceManagementMixin:
             return False
 
         if getattr(sys, "frozen", False):
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "Автозапуск сервиса CosyVoice недоступен в собранной .exe-версии "
                 "программы. Запустите программу из исходников (run_gui.bat)."
             ))
             return False
 
-        cosyvoice_py = _app_dir() / ".venv_cosyvoice" / "Scripts" / "python.exe"
+        # В исходной раскладке проекта install.bat запускается из корня
+        # репозитория, а GUI лежит в _app/. Поэтому venv и клон CosyVoice
+        # могут быть на уровень выше app_dir(). Поддерживаем обе раскладки,
+        # чтобы обновление с прежней версии не требовало ручного переноса
+        # многогигабайтных весов ESpeech.
+        app_root = _app_dir()
+        runtime_roots = (app_root, app_root.parent)
+        cosyvoice_py = next(
+            (root / ".venv_cosyvoice" / "Scripts" / "python.exe"
+             for root in runtime_roots
+             if (root / ".venv_cosyvoice" / "Scripts" / "python.exe").exists()),
+            app_root / ".venv_cosyvoice" / "Scripts" / "python.exe",
+        )
         if not cosyvoice_py.exists():
-            # на всякий случай также проверяем "не-Windows" раскладку venv
-            alt = _app_dir() / ".venv_cosyvoice" / "bin" / "python"
-            cosyvoice_py = alt if alt.exists() else cosyvoice_py
-        service_dir = _app_dir() / "CosyVoice"
+            cosyvoice_py = next(
+                (root / ".venv_cosyvoice" / "bin" / "python"
+                 for root in runtime_roots
+                 if (root / ".venv_cosyvoice" / "bin" / "python").exists()),
+                cosyvoice_py,
+            )
+        service_dir = next(
+            (root / "CosyVoice"
+             for root in runtime_roots
+             if (root / "CosyVoice" / "cosyvoice_rest_service.py").exists()),
+            app_root / "CosyVoice",
+        )
         service_path = service_dir / "cosyvoice_rest_service.py"
 
         if not cosyvoice_py.exists() or not service_path.exists():
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "Режим CosyVoice ещё не установлен на этом компьютере. Запустите "
                 "install.bat ещё раз (он теперь заодно ставит и CosyVoice — это "
                 "большая, отдельная от остального загрузка, может занять время)."
@@ -603,7 +723,7 @@ class ServiceManagementMixin:
             # "зомби"-процесс нужно принудительно остановить и поднять
             # заново, иначе программа будет считать его рабочим и получать
             # HTTP 500 на каждый запрос без единой новой попытки перезапуска.
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "Обнаружен уже запущенный сервис CosyVoice, у которого не загружена "
                 "модель (скорее всего остался с прошлого раза, до недавнего "
                 "исправления) — останавливаю его и запускаю заново…"
@@ -632,7 +752,7 @@ class ServiceManagementMixin:
             except Exception as e:
                 _log_exception_to_file("запуск сервиса CosyVoice")
                 err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
+                self._post_ui( lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
                 return False
 
             def pump_output():
@@ -642,7 +762,7 @@ class ServiceManagementMixin:
                 for line in proc.stdout:
                     line = line.rstrip()
                     if line:
-                        self.after(0, lambda l=line: self.log("  [сервис CosyVoice] " + l))
+                        self._post_ui( lambda l=line: self.log("  [сервис CosyVoice] " + l))
 
             threading.Thread(target=pump_output, daemon=True).start()
 
@@ -663,11 +783,11 @@ class ServiceManagementMixin:
                 # - см. _cosyvoice_model_loaded). Дожидаемся именно этого,
                 # а не просто первого ответа сервера.
                 if self._cosyvoice_model_loaded(rest_url):
-                    self.after(0, lambda: self.log("Сервис CosyVoice запущен и готов принимать запросы."))
+                    self._post_ui( lambda: self.log("Сервис CosyVoice запущен и готов принимать запросы."))
                     return True
                 if time.time() - last_notice > 15:
                     last_notice = time.time()
-                    self.after(0, lambda: self.log(
+                    self._post_ui( lambda: self.log(
                         "Сервис CosyVoice отвечает, но модель ещё не загрузилась (или не "
                         "смогла загрузиться) — жду… Если это долго не проходит, смотрите "
                         "подробности в CosyVoice\\cosyvoice_rest_service.log."
@@ -682,7 +802,7 @@ class ServiceManagementMixin:
                     # use") - добираем ещё раз, уже с более долгим
                     # ожиданием освобождения порта, и пробуем один раз ещё.
                     port_retry_done = True
-                    self.after(0, lambda: self.log(
+                    self._post_ui( lambda: self.log(
                         "Сервис CosyVoice завершился сразу после запуска — возможно, порт "
                         "ещё не освободился от предыдущего процесса. Пробую ещё раз…"
                     ))
@@ -713,7 +833,7 @@ class ServiceManagementMixin:
                             for line in proc.stdout:
                                 line = line.rstrip()
                                 if line:
-                                    self.after(0, lambda l=line: self.log("  [сервис CosyVoice] " + l))
+                                    self._post_ui( lambda l=line: self.log("  [сервис CosyVoice] " + l))
 
                         threading.Thread(target=pump_output2, daemon=True).start()
                         time.sleep(1.0)
@@ -721,22 +841,22 @@ class ServiceManagementMixin:
                     except Exception as e:
                         _log_exception_to_file("повторный запуск сервиса CosyVoice")
                         err = str(e)
-                        self.after(0, lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
+                        self._post_ui( lambda t=err: self.log(f"Не удалось запустить сервис CosyVoice: {t}"))
                         return False
-                self.after(0, lambda: self.log(
+                self._post_ui( lambda: self.log(
                     f"Сервис CosyVoice завершился сам собой (код {self._cosyvoice_proc.returncode}) "
                     "во время запуска — см. сообщения [сервис CosyVoice] выше."
                 ))
                 return False
             if time.time() - last_notice > 15:
                 last_notice = time.time()
-                self.after(0, lambda: self.log(
+                self._post_ui( lambda: self.log(
                     "…сервис CosyVoice ещё запускается (модель грузится в память GPU, "
                     "при первом запуске это может занять несколько минут)…"
                 ))
             time.sleep(1.0)
 
-        self.after(0, lambda: self.log("Сервис CosyVoice не успел запуститься за отведённое время."))
+        self._post_ui( lambda: self.log("Сервис CosyVoice не успел запуститься за отведённое время."))
         return False
 
     # ------------------------------------------------------------------
@@ -843,7 +963,11 @@ class ServiceManagementMixin:
         return "denied"
 
     def _startup_recycle_services(self):
-        """Entry point, called once from the GUI initialisation. Runs in a worker thread."""
+        """Recycle Silero REST only when the selected mode needs that service."""
+        mode = self._current_mode()
+        if mode != "silero_rest":
+            self.log(f"[service recycle] skipped: mode {mode} does not use Silero REST.")
+            return
         try:
             if not self.recycle_services_var.get():
                 return
@@ -859,7 +983,7 @@ class ServiceManagementMixin:
 
     def _recycle_rest_service(self, rest_url: str, auto_start: bool):
         def log(msg: str):
-            self.after(0, lambda m=msg: self.log("[service recycle] " + m))
+            self._post_ui( lambda m=msg: self.log("[service recycle] " + m))
 
         try:
             if getattr(sys, "frozen", False):
@@ -869,7 +993,11 @@ class ServiceManagementMixin:
                 log(f"skipped: {rest_url} is not a local address.")
                 return
             from urllib.parse import urlparse
-            port = urlparse(rest_url).port or 5010
+            parsed = urlparse(rest_url)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if port != 5010:
+                log(f"skipped: local port {port} is not Silero's port 5010; left it untouched.")
+                return
             with self._rest_svc_lock:
                 log(f"looking for old Silero REST service processes (script or port {port})...")
                 found = self._find_service_pids("silero_rest_service.py", port)

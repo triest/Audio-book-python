@@ -753,7 +753,7 @@ class UIBuilderMixin:
 
         # --- интонация: паузы по знакам препинания, ударения, усиление ---
         intonation = self._intonation_frame = ttk.LabelFrame(
-            right_scroll, text="Интонация и паузы (silero / silero_rest / cosyvoice)", padding=10
+            right_scroll, text="Интонация, ударения и паузы", padding=10
         )
         intonation.pack(fill="x", pady=(8, 0))
 
@@ -784,20 +784,23 @@ class UIBuilderMixin:
         irow += 1
         self.accent_var = tk.BooleanVar(value=True)
         self.accent_check = ttk.Checkbutton(
-            intonation, text="Расставлять ударения автоматически (только silero/silero_rest)",
+            intonation, text="Автоматические ударения (управляются выбором режима ниже)",
             variable=self.accent_var,
         )
-        self.accent_check.grid(row=irow, column=0, columnspan=2, sticky="w", pady=3)
+        # Галочка оставлена как скрытый совместимый параметр старых настроек:
+        # пользователь выбирает режим одной строкой ниже, без двух независимых
+        # переключателей, которые могли противоречить друг другу.
 
         irow += 1
-        ttk.Label(intonation, text="Модуль ударений (silero/silero_rest):").grid(
+        self.stress_engine_label = ttk.Label(intonation, text="Режим ударений:")
+        self.stress_engine_label.grid(
             row=irow, column=0, sticky="w", pady=3
         )
         # Внутри хранится короткий ключ движка (он же в настройках и CLI), а
         # в списке показываются понятные подписи.
         _stress_labels = {
-            "silero": "silero-stress + грамматический шлюз slovnet (локально, без ИИ)",
-            "none": "Без автоматических ударений (только словарь)",
+            "silero": "Silero: встроенные ударения v5.6 + словарь (рекомендуется)",
+            "none": "Только словарь (без автоматического угадывания)",
         }
         _stress_by_label = {v: k for k, v in _stress_labels.items()}
         self.stress_engine_var = tk.StringVar(value="silero")
@@ -807,6 +810,40 @@ class UIBuilderMixin:
             values=list(_stress_labels.values()),
         )
         self.stress_engine_combo.grid(row=irow, column=1, sticky="w", pady=3)
+
+        irow += 1
+        self.kokoro_stress_label = ttk.Label(intonation, text="Ударения Kokoro:")
+        self.kokoro_stress_label.grid(row=irow, column=0, sticky="w", pady=3)
+        self.kokoro_stress_mode_var = tk.StringVar(value="ruaccent")
+        self._kokoro_stress_labels = {
+            "ruaccent": "RUAccent — встроенный в Kokoro (рекомендуется)",
+            "silero_ruaccent": "Silero-stress + RUAccent",
+        }
+        self._kokoro_stress_by_label = {
+            label: key for key, label in self._kokoro_stress_labels.items()
+        }
+        self._kokoro_stress_label_var = tk.StringVar(
+            value=self._kokoro_stress_labels["ruaccent"]
+        )
+        self.kokoro_stress_combo = ttk.Combobox(
+            intonation, textvariable=self._kokoro_stress_label_var,
+            state="readonly", width=46, values=list(self._kokoro_stress_labels.values()),
+        )
+        self.kokoro_stress_combo.grid(row=irow, column=1, sticky="w", pady=3)
+
+        def _kokoro_label_to_key(_e=None):
+            key = self._kokoro_stress_by_label.get(
+                self._kokoro_stress_label_var.get(), "ruaccent"
+            )
+            self.kokoro_stress_mode_var.set(key)
+
+        def _kokoro_key_to_label(*_a):
+            label = self._kokoro_stress_labels.get(self.kokoro_stress_mode_var.get())
+            if label and self._kokoro_stress_label_var.get() != label:
+                self._kokoro_stress_label_var.set(label)
+
+        self.kokoro_stress_mode_var.trace_add("write", _kokoro_key_to_label)
+        self.kokoro_stress_combo.bind("<<ComboboxSelected>>", _kokoro_label_to_key)
 
         def _label_to_key(_e=None):
             key = _stress_by_label.get(self._stress_label_var.get(), "silero")
@@ -823,14 +860,22 @@ class UIBuilderMixin:
         self.stress_engine_combo.bind("<<ComboboxSelected>>", _label_to_key)
 
         irow += 1
-        ttk.Label(
+        self.stress_engine_hint = ttk.Label(
             intonation,
-            text="Один процесс, без LLM: 1) forced_stress_words.json (абсолютный приоритет, нейросеть "
-                 "эти слова не трогает) -> 2) silero-stress по контексту предложений -> 3) грамматический "
-                 "шлюз slovnet (падеж/число: земли, сети, голоса...) -> 4) частица-фильтр. "
+            text="Для Silero v5.6: словарь применяется первым, остальные ударения определяет сама модель. "
+                 "Для старых моделей режим silero использует внешний silero-stress и грамматический шлюз. "
                  "Словарь удобно править на вкладке «Словарь ударений»",
             foreground="gray", justify="left", wraplength=560,
-        ).grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
+        )
+        self.stress_engine_hint.grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
+
+        irow += 1
+        self.kokoro_stress_hint = ttk.Label(
+            intonation,
+            text="RUAccent работает внутри Kokoro. Второй вариант добавляет Silero-stress перед RUAccent.",
+            foreground="gray", justify="left", wraplength=560,
+        )
+        self.kokoro_stress_hint.grid(row=irow, column=0, columnspan=2, sticky="w", pady=(0, 3))
 
         irow += 1
         self.yo_var = tk.BooleanVar(value=True)
@@ -1068,6 +1113,6 @@ class UIBuilderMixin:
 
         self._refresh_cosyvoice_voices_listbox()
     def _bind_events(self):
-        self.mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_changed())
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_changed(prewarm=True))
         self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
         self.protocol("WM_DELETE_WINDOW", self._on_close)

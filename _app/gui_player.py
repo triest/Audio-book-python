@@ -24,7 +24,7 @@ class PlayerMixin:
             # "не установлен", покажем причину, чтобы было понятнее, что
             # чинить.
             err = f"{type(e).__name__}: {e}"
-            self.after(0, lambda t=err: self.log(f"pygame не загрузился ({t})"))
+            self._post_ui( lambda t=err: self.log(f"pygame не загрузился ({t})"))
             return None
         if not self._mixer_ready:
             try:
@@ -32,7 +32,7 @@ class PlayerMixin:
                 self._mixer_ready = True
             except Exception as e:
                 err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось инициализировать аудио (pygame.mixer): {t}"))
+                self._post_ui( lambda t=err: self.log(f"Не удалось инициализировать аудио (pygame.mixer): {t}"))
                 return None
         return pygame
     @staticmethod
@@ -88,7 +88,7 @@ class PlayerMixin:
 
         def worker():
             duration = self._audio_duration_seconds(path)
-            self.after(0, lambda: self._finish_load_player_track(path, duration, token))
+            self._post_ui( lambda: self._finish_load_player_track(path, duration, token))
 
         threading.Thread(target=worker, daemon=True).start()
     def _finish_load_player_track(self, path: Path, duration: float, token: int):
@@ -276,7 +276,7 @@ class PlayerMixin:
         окончанию трека или по нажатию "Стоп" (см. _player_stop/_player_tick)."""
         pygame = self._ensure_mixer()
         if pygame is None:
-            self.after(0, lambda: self.log(
+            self._post_ui( lambda: self.log(
                 "pygame не установлен — играю через системный проигрыватель "
                 "(без кнопок паузы/стопа/перемотки здесь). Запустите install.bat "
                 "ещё раз, чтобы поставить pygame и получить управление проигрыванием."
@@ -285,7 +285,7 @@ class PlayerMixin:
                 play_file(path)
             except Exception as e:
                 err = str(e)
-                self.after(0, lambda t=err: self.log(f"Не удалось проиграть файл: {t}"))
+                self._post_ui( lambda t=err: self.log(f"Не удалось проиграть файл: {t}"))
             return
 
         duration = self._audio_duration_seconds(path)
@@ -303,6 +303,6 @@ class PlayerMixin:
             self.player_title_label.configure(text=f"▶ {path.name}")
             self._player_play_pause()
 
-        self.after(0, start_on_ui_thread)
+        self._post_ui( start_on_ui_thread)
         done_event.wait()
         self._player_block_event = None

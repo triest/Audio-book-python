@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -98,15 +99,16 @@ class TextRedirector(io.TextIOBase):
     """Перенаправляет print() в текстовое поле GUI (и дублирует в файл
     журнала — см. _write_log_file)."""
 
-    def __init__(self, widget: tk.Text, tag: str = "log"):
+    def __init__(self, widget: tk.Text, post_ui, tag: str = "log"):
         self.widget = widget
+        self.post_ui = post_ui
         self.tag = tag
 
     def write(self, s: str) -> int:
         if not s:
             return 0
         _write_log_file(s)
-        self.widget.after(0, self._append, s)
+        self.post_ui(self._append, s)
         return len(s)
 
     def _append(self, s: str):
@@ -131,7 +133,8 @@ SETTINGS_FIELDS = [
     "sample_rate_var", "rest_url_var", "auto_start_rest_var", "rate_var",
     "cosyvoice_rest_url_var", "cosyvoice_engine_var",
     "sentence_break_var", "paragraph_break_var", "comma_break_var",
-    "accent_var", "yo_var", "emphasis_var", "stress_engine_var", "smart_emotion_var",
+    "accent_var", "yo_var", "emphasis_var", "stress_engine_var", "kokoro_stress_mode_var",
+    "smart_emotion_var",
     "yandex_api_key_var", "yandex_folder_id_var", "yandex_voice_var", "yandex_speed_var",
     "yandex_emotion_var", "yandex_smart_emotion_var",
     "genvoice_api_key_var", "genvoice_voice_id_var", "genvoice_speed_var",
@@ -167,9 +170,11 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.book_title = ""
         self.chapters: list[tuple[str, str]] = []
         self._worker: threading.Thread | None = None
+        self._ui_tasks = queue.SimpleQueue()
         self._stop_requested = False
         self._offline_voices: list[dict] = []
         self._cosyvoice_voices: list[str] = []
+        self._cosyvoice_refresh_scheduled = False
         self._piper_voice_keys: list[str] = []
         self._rest_proc: subprocess.Popen | None = None
         self._cosyvoice_proc: subprocess.Popen | None = None
@@ -211,10 +216,33 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         else:
             self._restore_last_book()
 
-        # recycle the Silero REST service on every launch (kill the old process, start a fresh one)
+        # Recycle Silero REST on launch only when Silero REST is the selected mode.
         self.after(800, self._startup_recycle_services)
         # periodic autosave so a crash / kill does not lose the interface state
         self.after(60_000, self._autosave_tick)
+        # Only the Tk thread touches Tcl/Tk. Worker threads enqueue UI work;
+        # this poll was registered here on the main thread before mainloop.
+        self.after(25, self._drain_ui_tasks)
+
+    def _post_ui(self, callback, *args, **kwargs):
+        """Queue a UI callback without calling Tcl/Tk from worker threads."""
+        self._ui_tasks.put((callback, args, kwargs))
+
+    def _drain_ui_tasks(self):
+        """Run queued worker callbacks on Tk's main thread."""
+        for _ in range(200):
+            try:
+                callback, args, kwargs = self._ui_tasks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args, **kwargs)
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+        try:
+            self.after(25, self._drain_ui_tasks)
+        except tk.TclError:
+            pass
 
     def _load_settings(self):
         """Восстанавливает сохранённые настройки (в т.ч. API-ключ Yandex,
@@ -568,7 +596,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
 
         def worker():
             result = check_for_model_updates()
-            self.after(0, lambda: self._on_model_updates_checked(result))
+            self._post_ui( lambda: self._on_model_updates_checked(result))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -613,7 +641,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                     added.append(model_id)
                 except OSError as e:
                     failed.append(f"{model_id} ({e})")
-            self.after(0, lambda: self._on_models_added(added, failed))
+            self._post_ui( lambda: self._on_models_added(added, failed))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -688,12 +716,21 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         self.voice_combo.configure(values=["см. блок «Yandex SpeechKit» ниже"], state="disabled")
         self.voice_combo.current(0)
 
-    def _on_mode_changed(self):
+    def _on_mode_changed(self, prewarm: bool = False):
         mode = self._current_mode()
         self.mode_desc.configure(text=TTS_MODES.get(mode, ""))
         self._update_mode_dependent_widgets()
         if mode in ("cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru"):
             self._on_cosyvoice_engine_changed()
+        elif prewarm and mode == "silero_rest":
+            # Start the cold PyTorch import while the user is still adjusting
+            # synthesis settings, not after they press the synthesis button.
+            self.after(900, self._prewarm_silero_rest_service)
+
+    def _refresh_cosyvoice_voices_on_idle(self):
+        self._cosyvoice_refresh_scheduled = False
+        if self._current_mode() in ("cosyvoice", "f5_tts") and not self._cosyvoice_voices:
+            self.refresh_cosyvoice_voices()
 
     def _show_row(self, *widgets, show):
         """Показывает или полностью убирает из сетки (grid_remove/grid)
@@ -713,21 +750,32 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         silero_like = mode in ("silero", "silero_rest")
         pauses_supported = mode in ("silero", "silero_rest", "cosyvoice", "voxcpm2", "f5_tts", "kokoro_ru", "piper")
         silero_stress_supported = silero_like
+        kokoro_stress_supported = mode == "kokoro_ru"
         asr_repair_supported = mode == "silero_rest"
         self.model_combo.configure(state="readonly" if silero_like else "disabled")
         self.rest_url_entry.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.auto_start_rest_check.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.emphasis_check.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.accent_check.configure(state="normal" if silero_stress_supported else "disabled")
-        self.yo_check.configure(state="normal" if silero_stress_supported else "disabled")
+        self.yo_check.configure(state="normal" if silero_like else "disabled")
         self.stress_engine_combo.configure(state="readonly" if silero_stress_supported else "disabled")
-        self.stress_review_check.configure(state="normal" if silero_stress_supported else "disabled")
-        self.strip_mono_check.configure(state="normal" if silero_stress_supported else "disabled")
+        self.kokoro_stress_combo.configure(state="readonly" if kokoro_stress_supported else "disabled")
+        self.stress_review_check.configure(
+            state="normal" if silero_stress_supported or kokoro_stress_supported else "disabled"
+        )
+        self.strip_mono_check.configure(
+            state="normal" if silero_stress_supported or kokoro_stress_supported else "disabled"
+        )
         self.asr_repair_check.configure(state="normal" if asr_repair_supported else "disabled")
+        self.recycle_services_check.configure(
+            state="normal" if mode == "silero_rest" else "disabled"
+        )
         self.smart_emotion_check.configure(state="normal" if mode == "silero_rest" else "disabled")
         self.yandex_smart_emotion_check.configure(state="normal" if mode == "yandex" else "disabled")
         self.optimal_settings_button.configure(state="normal" if silero_stress_supported else "disabled")
-        self.open_stress_dict_button.configure(state="normal" if silero_stress_supported else "disabled")
+        self.open_stress_dict_button.configure(
+            state="normal" if silero_stress_supported or kokoro_stress_supported else "disabled"
+        )
         for pause_widget in (self.comma_break_spin, self.sentence_break_spin, self.paragraph_break_spin):
             pause_widget.configure(state="normal" if pauses_supported else "disabled")
         # Attribution is currently not wired to an active provider in the GUI;
@@ -785,7 +833,21 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         # "Усиливать интонацию «?!»" — это SSML-фича самого Silero REST;
         # ударения/"ё" — фичи самого Silero — у CosyVoice ничего этого нет,
         # прячем эти конкретные строки внутри общей рамки интонации.
-        self._show_row(self.accent_check, show=silero_like)
+        # The mode specific controls keep Silero's and Kokoro's accentors distinct.
+        self._show_row(
+            self.stress_engine_label, self.stress_engine_combo, self.stress_engine_hint,
+            show=silero_like,
+        )
+        self._show_row(
+            self.kokoro_stress_label, self.kokoro_stress_combo, self.kokoro_stress_hint,
+            show=kokoro_stress_supported,
+        )
+        stress_controls_supported = silero_stress_supported or kokoro_stress_supported
+        self._show_row(
+            self.stress_review_check, self.strip_mono_check,
+            self.optimal_settings_button, self.open_stress_dict_button,
+            show=stress_controls_supported,
+        )
         self._show_row(self.yo_check, show=silero_like)
         self._show_row(self.emphasis_check, show=mode == "silero_rest")
 
@@ -799,8 +861,12 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             self._set_qwen_voice_placeholder()
         elif model_service_mode:
             self._set_cosyvoice_voices()
-            if not self._cosyvoice_voices:
-                self.refresh_cosyvoice_voices()
+            if not self._cosyvoice_voices and not self._cosyvoice_refresh_scheduled:
+                # Mode widgets are also initialized before mainloop starts.
+                # Start the background service/voice lookup only from Tk's
+                # event loop, so its worker can safely post UI callbacks.
+                self._cosyvoice_refresh_scheduled = True
+                self.after_idle(self._refresh_cosyvoice_voices_on_idle)
         elif mode == "piper":
             self._set_piper_voices()
         elif mode == "genvoice":
@@ -991,6 +1057,9 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
         # the stress flow is LLM-free: legacy values (ruaccent/ollama/lmstudio/hybrid/silero_stress) -> silero
         if self.stress_engine_var.get() not in ("silero", "none"):
             self.stress_engine_var.set("silero")
+        # The visible choice is the single source of truth. Keep the hidden
+        # legacy variable in sync for old settings and synthesis call sites.
+        self.accent_var.set(self.stress_engine_var.get() != "none")
 
     def _current_attribution_provider_key(self):
         return self._attribution_provider_by_title.get(
@@ -1216,7 +1285,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             )
             self.ac_on_synthesis_progress(chapter_pos, chapters_total, fragment_done, fragments_total)
 
-        self.after(0, update)
+        self._post_ui( update)
 
 
 
@@ -1269,21 +1338,36 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
             try:
                 marked, info = stress_dry_run(
                     text, strip_monosyllables=strip_mono, book_overrides_path=book_overrides,
-                    progress_cb=lambda msg: self.after(0, self.log, msg))
+                    progress_cb=lambda msg: self._post_ui( self.log, msg))
             except Exception as e:
-                self.after(0, self.log, f"Проверка ударений не удалась: {type(e).__name__}: {e}")
-                self.after(0, messagebox.showerror, "Проверка ударений", f"{type(e).__name__}: {e}")
-                self.after(0, lambda: self.check_stress_btn.configure(state="normal"))
+                self._post_ui( self.log, f"Проверка ударений не удалась: {type(e).__name__}: {e}")
+                self._post_ui( messagebox.showerror, "Проверка ударений", f"{type(e).__name__}: {e}")
+                self._post_ui( lambda: self.check_stress_btn.configure(state="normal"))
                 return
 
             def done():
                 self.check_stress_btn.configure(state="normal")
+                report_path = ""
+                if self.book_path:
+                    try:
+                        from stress_postcheck import save_report
+                        report_path = save_report(
+                            str(Path(self.book_path).with_suffix(".stress_postcheck.json")),
+                            text=text, items=info.get("postcheck", []))
+                    except Exception as e:
+                        self.log(f"Отчёт постпроверки не сохранён: {type(e).__name__}: {e}")
                 self.log(f"Готово за {info['seconds']:.1f} с. "
                          f"меток «+»: {info['marks']}; слов из словаря в базе: {info['dictionary_words']}; "
-                         f"замен е→ё: {info['yo_swapped']}; проставлено silero-stress: {info['silero_filled']}.")
+                         f"замен е→ё: {info['yo_swapped']}; проставлено silero-stress: {info['silero_filled']}; "
+                         f"подозрительных мест после проверки: {info.get('postcheck_count', 0)}.")
+                if report_path:
+                    self.log(f"Отчёт постпроверки: {report_path}")
+                for item in info.get("postcheck", [])[:10]:
+                    self.log(f"  review: {item['word']} — {', '.join(item['reasons'])} "
+                             f"({', '.join(item['readings'])})")
                 self._show_stress_preview(title, marked, info)
 
-            self.after(0, done)
+            self._post_ui( done)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1382,7 +1466,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
 
         def worker():
             old_stdout = sys.stdout
-            sys.stdout = TextRedirector(self.log_text)
+            sys.stdout = TextRedirector(self.log_text, self._post_ui)
             self._synthesis_had_failures = None
             try:
                 if mode == "online":
@@ -1425,7 +1509,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                     rest_url = self.rest_url_var.get().strip()
                     if self.auto_start_rest_var.get() and self._rest_url_is_local(rest_url):
                         if not self._ping_rest_service(rest_url):
-                            self.after(0, lambda: self.log(
+                            self._post_ui( lambda: self.log(
                                 "Сервис Silero REST не отвечает — запускаю его автоматически "
                                 "(без отдельной консоли)…"
                             ))
@@ -1460,6 +1544,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                             if self.book_path else None
                         ),
                         stress_engine=self.stress_engine_var.get(),
+                        put_accent=self.accent_var.get(),
                         smart_emotion=self.smart_emotion_var.get(),
                         emotion_attribution=(self._builtin_emotion_credentials()
                                              if self.smart_emotion_var.get() else None),
@@ -1519,10 +1604,22 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         attribution=attribution,
                         should_stop=lambda: self._stop_requested,
                         play_fn=self._embedded_play,
+                        stress_engine=(
+                            "silero"
+                            if mode == "kokoro_ru"
+                            and self.kokoro_stress_mode_var.get() == "silero_ruaccent"
+                            else "none"
+                        ),
+                        strip_monosyllables=self.strip_mono_var.get(),
+                        stress_review=(self.stress_review_var.get() if mode == "kokoro_ru" else False),
+                        book_stress_overrides_path=(
+                            book_manual_stress_overrides_path(self.book_path)
+                            if mode == "kokoro_ru" and self.book_path else None
+                        ),
                     )
                 elif mode == "qwen_tts_local":
                     q_local_url = self.qwen_local_url_var.get().strip() or QWEN_TTS_LOCAL_DEFAULT_URL
-                    self.after(0, lambda: self.log(
+                    self._post_ui( lambda: self.log(
                         "Проверяю локальный сервер Qwen3-TTS (при необходимости запущу "
                         "автоматически, без отдельной консоли)…"
                     ))
@@ -1567,7 +1664,7 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                         # загрузилась" (зомби-процесс с прошлого раза) от
                         # по-настоящему готового сервиса, и перезапускает
                         # его в первом случае.
-                        self.after(0, lambda: self.log(
+                        self._post_ui( lambda: self.log(
                             f"Проверяю сервис {service_label} (при необходимости запущу/перезапущу "
                             "его автоматически, без отдельной консоли)…"
                         ))
@@ -1643,14 +1740,14 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                 if not self._stop_requested:
                     if self._synthesis_had_failures:
                         warn_text = self._synthesis_had_failures
-                        self.after(0, lambda t=warn_text: self.log(
+                        self._post_ui( lambda t=warn_text: self.log(
                             f"--- Озвучка завершена С ОШИБКАМИ: {t} ---"
                         ))
-                        self.after(0, lambda t=warn_text: messagebox.showwarning(
+                        self._post_ui( lambda t=warn_text: messagebox.showwarning(
                             "Озвучка завершена с ошибками", t
                         ))
                     else:
-                        self.after(0, lambda: self.log("--- Озвучка завершена ---"))
+                        self._post_ui( lambda: self.log("--- Озвучка завершена ---"))
             except Exception as e:
                 # Важно: захватываем e через значение по умолчанию (e=e), а
                 # не просто по имени из замыкания - Python неявно удаляет
@@ -1660,13 +1757,13 @@ class AudiobookApp(ServiceManagementMixin, CosyVoiceVoicesMixin, PlayerMixin, UI
                 import traceback as _tb
                 err_text = str(e) or repr(e)   # EOFError()/AssertionError() have an empty str()
                 _full_tb = _tb.format_exc()
-                self.after(0, lambda t=_full_tb: self.log("Полный traceback ошибки озвучки:\n" + t))
-                self.after(0, lambda t=err_text: messagebox.showerror("Ошибка", t))
-                self.after(0, lambda t=err_text: self.log(f"ОШИБКА: {t}"))
+                self._post_ui( lambda t=_full_tb: self.log("Полный traceback ошибки озвучки:\n" + t))
+                self._post_ui( lambda t=err_text: messagebox.showerror("Ошибка", t))
+                self._post_ui( lambda t=err_text: self.log(f"ОШИБКА: {t}"))
             finally:
                 sys.stdout = old_stdout
-                self.after(0, lambda: self._set_busy(False))
-                self.after(0, self.refresh_player_for_selection)
+                self._post_ui( lambda: self._set_busy(False))
+                self._post_ui( self.refresh_player_for_selection)
 
         self._worker = threading.Thread(target=worker, daemon=True)
         self._worker.start()

@@ -15,7 +15,8 @@ from xml.sax.saxutils import escape as xml_escape, unescape as xml_unescape
  
 app = FastAPI()
  
-version = "1.4"
+SERVICE_VERSION = "2026-11-19.1-silero-cuda-health"
+version = "1.5"  # legacy field kept for existing integrations
 model = None
  
 # --------------------------------------------------------------------------
@@ -57,19 +58,38 @@ from silero_config import DEFAULT_SILERO_MODEL, load_silero_package
 
 # Модель по умолчанию — v5_6_ru (последняя; прежняя v5_5_ru). Переопределить: set SILERO_MODEL=v5_4_ru
 MODEL_ID = os.environ.get("SILERO_MODEL", DEFAULT_SILERO_MODEL)
+
+
+@app.get("/health")
+async def health():
+    """Expose readiness and code version so the GUI never adopts stale code."""
+    return {
+        "status": "ok" if model is not None else "loading",
+        "service_version": SERVICE_VERSION,
+        "model_loaded": model is not None,
+        "model": MODEL_ID,
+        "device": str(getattr(model, "device", "unknown")) if model is not None else None,
+    }
  
  
 @app.on_event("startup")
 async def startup_event():
     global model
  
-    device = torch.device('cpu')
-    torch.set_num_threads(4)
+    # Use CUDA automatically when the service environment has a CUDA-enabled
+    # torch build. CPU remains the fallback when CUDA is unavailable.
+    use_cuda = bool(torch.cuda.is_available())
+    device = torch.device("cuda" if use_cuda else "cpu")
+    if use_cuda:
+        logger.info("CUDA доступна: Silero TTS запускается на GPU (%s)", torch.cuda.get_device_name(0))
+    else:
+        logger.warning("CUDA недоступна в окружении Silero; TTS запускается на CPU")
+        torch.set_num_threads(4)
 
     try:
         logger.info(f"Loading Silero TTS model {MODEL_ID}...")
         model = load_silero_package(MODEL_ID, device)
-        logger.info(f"TTS Model {MODEL_ID} loaded successfully")
+        logger.info(f"TTS Model {MODEL_ID} loaded successfully on {device}")
     except Exception:
         logger.error("Failed to load TTS model:\n" + traceback.format_exc())
         model = None

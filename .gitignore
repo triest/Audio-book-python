@@ -117,6 +117,7 @@ sample_book/
 *.stress_prepass.json
 *.auto_stress.json
 .venv_teratts/
+teraanaly_models/
 
 /_app/CosyVoice/
 /_app/CosyVoice3/

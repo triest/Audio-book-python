@@ -9,30 +9,34 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import re
 import shutil
 import sys
 import threading
 from pathlib import Path
 
-SERVICE_VERSION = "2026-11-18.4-ruaccent-copy-assets"
+SERVICE_VERSION = "2026-11-18.7-kokoro-init-progress"
 MODEL_REPO = os.environ.get("KOKORO_MODEL_REPO", "zaakirio/kokoro-ru")
 PORT = int(os.environ.get("KOKORO_PORT", "5015"))
 VOICES = {"sveta": "female", "masha": "female", "dima": "male"}
 
-# Kokoro's dependency resolver can leave a partial NumPy 2.x install in its
-# isolated venv when the offline ONNX Runtime fallback is used. Reuse the
-# known-good NumPy/ORT already installed for CosyVoice3, then remove that
-# temporary path so Kokoro's other dependencies still come from its own venv.
+# Prefer the Kokoro environment's ONNX Runtime, which can include CUDA. The
+# CosyVoice3 runtime is only a fallback for a partially installed environment.
 _shared_site = Path(__file__).resolve().parents[1] / ".venv_cosyvoice3" / "Lib" / "site-packages"
-_shared_site_text = str(_shared_site)
-_shared_site_added = _shared_site.is_dir()
-if _shared_site_added:
-    sys.path.insert(0, _shared_site_text)
 try:
     import numpy as np
     import onnxruntime as ort
-finally:
-    if _shared_site_added:
+except Exception as _kokoro_runtime_error:
+    if not _shared_site.is_dir():
+        raise
+    _shared_site_text = str(_shared_site)
+    sys.path.insert(0, _shared_site_text)
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except Exception:
+        raise _kokoro_runtime_error
+    finally:
         try:
             sys.path.remove(_shared_site_text)
         except ValueError:
@@ -164,6 +168,16 @@ def _load_g2p():
         espeak_data=snapshot / "espeak-data",
         vocab_path=snapshot / "kokoro-config.json",
     )
+    # Kokoro's RUAccent normally strips '+', the stress marker supplied by
+    # silero-stress, before it can skip already-accented words. Preserve it so
+    # RUAccent can still accent the remaining words while respecting overrides.
+    accent = getattr(_g2p, "_accent", None)
+    normalizer = getattr(accent, "normalize", None)
+    pattern = getattr(normalizer, "pattern", None)
+    if isinstance(pattern, str) and "+" not in pattern:
+        patched_pattern = pattern.replace("ёЁ—", "ёЁ+—", 1)
+        if patched_pattern != pattern:
+            accent.normalize = re.compile(patched_pattern, normalizer.flags)
     print("Kokoro-RU: RUAccent and phonemizer ready.", flush=True)
     return _g2p
 
@@ -216,7 +230,9 @@ def _synthesize(text: str, voice: str, sample_rate: int) -> bytes:
     if not text.strip():
         raise HTTPException(400, "text is empty")
     try:
+        print("Kokoro-RU: initializing PyTorch runtime...", flush=True)
         import torch
+        print(f"Kokoro-RU: PyTorch ready; CUDA available={torch.cuda.is_available()}.", flush=True)
         g2p = _load_g2p()
         model, pack = _load_voice(voice)
         ipa, oov = g2p(text)

@@ -40,7 +40,7 @@ class CosyVoiceVoicesMixin:
 
         def worker():
             if self._rest_url_is_local(rest_url) and not self._ping_rest_service(rest_url):
-                self.after(0, lambda: self.log(
+                self._post_ui( lambda: self.log(
                     "Сервис CosyVoice ещё не запущен — запускаю его автоматически…"
                 ))
                 self._ensure_cosyvoice_service_running(rest_url)
@@ -48,7 +48,7 @@ class CosyVoiceVoicesMixin:
                 voices = cosyvoice_list_voices(rest_url)
             except Exception:
                 voices = []
-            self.after(0, lambda: self._on_cosyvoice_voices_fetched(voices))
+            self._post_ui( lambda: self._on_cosyvoice_voices_fetched(voices))
 
         threading.Thread(target=worker, daemon=True).start()
     def _on_cosyvoice_voices_fetched(self, voices: list):
@@ -131,7 +131,7 @@ class CosyVoiceVoicesMixin:
         def worker():
             try:
                 if self._rest_url_is_local(rest_url):
-                    self.after(0, lambda: self.log(
+                    self._post_ui( lambda: self.log(
                         "Проверяю сервис CosyVoice (при необходимости запущу/перезапущу "
                         "его автоматически)…"
                     ))
@@ -147,11 +147,11 @@ class CosyVoiceVoicesMixin:
                     detail = resp.json().get("detail", resp.text) if resp.content else resp.text
                     raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
                 data = resp.json()
-                self.after(0, lambda: self._on_cosyvoice_voice_deleted(data))
+                self._post_ui( lambda: self._on_cosyvoice_voice_deleted(data))
             except Exception as e:
                 _log_exception_to_file("удаление голоса CosyVoice")
                 err = str(e)
-                self.after(0, lambda t=err: self._on_cosyvoice_voice_delete_failed(t))
+                self._post_ui( lambda t=err: self._on_cosyvoice_voice_delete_failed(t))
 
         threading.Thread(target=worker, daemon=True).start()
     def _on_cosyvoice_voice_deleted(self, data: dict):
@@ -222,7 +222,7 @@ class CosyVoiceVoicesMixin:
                     stage = "отправляю файл на сервис / сервис ещё может качать модель Whisper (~500 МБ, разово)"
                 else:
                     stage = "модель Whisper распознаёт речь"
-                self.after(0, lambda w=waited, s=stage: self.log(
+                self._post_ui( lambda w=waited, s=stage: self.log(
                     f"…распознавание ещё идёт ({_fmt_elapsed(w)}): {s}…"
                 ))
 
@@ -237,7 +237,7 @@ class CosyVoiceVoicesMixin:
                             f"журнала (logs\\{LOG_FILE_PATH.name}) и в самом окне «Журнал» выше."
                         )
                 import requests
-                self.after(0, lambda: self.log("Отправляю аудиофайл на сервис…"))
+                self._post_ui( lambda: self.log("Отправляю аудиофайл на сервис…"))
                 try:
                     with open(audio_path, "rb") as f:
                         resp = requests.post(
@@ -254,11 +254,11 @@ class CosyVoiceVoicesMixin:
                     detail = resp.json().get("detail", resp.text) if resp.content else resp.text
                     raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
                 text = resp.json().get("text", "")
-                self.after(0, lambda: self._on_cosyvoice_audio_transcribed(text))
+                self._post_ui( lambda: self._on_cosyvoice_audio_transcribed(text))
             except Exception as e:
                 _log_exception_to_file("распознавание речи CosyVoice")
                 err = str(e)
-                self.after(0, lambda t=err: self._on_cosyvoice_transcribe_failed(t))
+                self._post_ui( lambda t=err: self._on_cosyvoice_transcribe_failed(t))
             finally:
                 stop_ticker.set()
 
@@ -319,7 +319,7 @@ class CosyVoiceVoicesMixin:
             waited = 0
             while not stop_ticker.wait(10.0):
                 waited += 10
-                self.after(0, lambda w=waited: self.log(
+                self._post_ui( lambda w=waited: self.log(
                     f"…добавление голоса «{name}» ещё идёт ({_fmt_elapsed(w)}): сервис обрабатывает "
                     "и клонирует запись (при первом запуске здесь же может ещё загружаться модель CosyVoice)…"
                 ))
@@ -329,17 +329,17 @@ class CosyVoiceVoicesMixin:
         def worker():
             try:
                 if self._rest_url_is_local(rest_url) and not self._ping_rest_service(rest_url):
-                    self.after(0, lambda: self._cv_add_status_label.configure(
+                    self._post_ui( lambda: self._cv_add_status_label.configure(
                         text="Сервис CosyVoice ещё не запущен — запускаю автоматически…"
                     ))
-                    self.after(0, lambda: self.log("Сервис CosyVoice ещё не запущен — запускаю автоматически…"))
+                    self._post_ui( lambda: self.log("Сервис CosyVoice ещё не запущен — запускаю автоматически…"))
                     if not self._ensure_cosyvoice_service_running(rest_url):
                         raise RuntimeError(
                             "Не удалось запустить сервис CosyVoice — подробности в файле "
                             f"журнала (logs\\{LOG_FILE_PATH.name}) и в самом окне «Журнал» выше."
                         )
                 import requests
-                self.after(0, lambda: self.log("Сервис запущен, отправляю аудиофайл и текст…"))
+                self._post_ui( lambda: self.log("Сервис запущен, отправляю аудиофайл и текст…"))
                 try:
                     with open(audio_path, "rb") as f:
                         resp = requests.post(
@@ -362,11 +362,11 @@ class CosyVoiceVoicesMixin:
                     _write_log_file(f"\n--- /add_voice вернул {resp.status_code} ---\n{detail}\n")
                     raise RuntimeError(f"Сервис CosyVoice вернул ошибку {resp.status_code}: {detail}")
                 data = resp.json()
-                self.after(0, lambda: self._on_cosyvoice_voice_added_from_tab(data))
+                self._post_ui( lambda: self._on_cosyvoice_voice_added_from_tab(data))
             except Exception as e:
                 _log_exception_to_file("добавление голоса CosyVoice")
                 err = str(e)
-                self.after(0, lambda t=err: self._on_cosyvoice_voice_add_failed_in_tab(t))
+                self._post_ui( lambda t=err: self._on_cosyvoice_voice_add_failed_in_tab(t))
             finally:
                 stop_ticker.set()
 

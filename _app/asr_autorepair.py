@@ -497,7 +497,10 @@ class AsrWorker:
                 self.proc.kill()
 
 
-ASR_WORKERS = max(1, int(os.environ.get("AUDIOBOOK_ASR_WORKERS", "2")))   # measured: 1 worker 5.4 s/chunk, 2 workers 4.3 s/chunk effective
+# Один worker надёжнее на Windows: параллельный импорт torch двумя процессами
+# может зависнуть до @@ready и GUI отключит автопочинку. Параллельность можно
+# вернуть через AUDIOBOOK_ASR_WORKERS=2 на машине с достаточным запасом RAM/VRAM.
+ASR_WORKERS = max(1, int(os.environ.get("AUDIOBOOK_ASR_WORKERS", "1")))
 
 
 class AsrRepair:
@@ -509,25 +512,49 @@ class AsrRepair:
         self.log = log
         self.max_attempts = max_attempts
         self.report = Path(outdir) / "asr_repairs.jsonl"
+        # Learn which SSML variant has actually helped this book across runs.
+        # A few observations are not enough to reorder the safe default ladder.
+        self._wins = {}
+        try:
+            for line in self.report.read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                winner = row.get("winner")
+                if winner and len(row.get("after", [])) < len(row.get("before", [])):
+                    for kind in {d.get("kind", "unknown") for d in row.get("before", [])}:
+                        self._wins[(kind, winner)] = self._wins.get((kind, winner), 0) + 1
+        except (OSError, ValueError):
+            pass
         self.stats = {"checked": 0, "defective": 0, "fixed": 0, "kept_defect": 0}
         self._lock = threading.Lock()
-        found: list = []
-
-        def boot(_):
-            w = AsrWorker(log=log)
-            if w.start():
-                found.append(w)
-        threads = [threading.Thread(target=boot, args=(i,)) for i in range(max(workers, 1))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.workers = found
-        self.ok = bool(found)
+        self.workers: list[AsrWorker] = []
+        self.ok = False
+        self._closed = False
+        self._not_ready_logged = False
         self._free: "queue.Queue[AsrWorker]" = queue.Queue()
-        for w in found:
-            self._free.put(w)
-        self._pool = ThreadPoolExecutor(max_workers=max(len(found), 1)) if found else None
+        self._pool = ThreadPoolExecutor(max_workers=max(workers, 1))
+
+        def boot():
+            # Whisper's first torch import/model load can take several
+            # minutes. Keep it off the chapter path so Silero starts speaking
+            # immediately; chunks synthesized before @@ready simply skip
+            # their optional ASR repair.
+            for _ in range(max(workers, 1)):
+                worker = AsrWorker(log=log)
+                if not worker.start():
+                    continue
+                with self._lock:
+                    if self._closed:
+                        worker.close()
+                        return
+                    self.workers.append(worker)
+                    self._free.put(worker)
+                    self.ok = True
+                self.log("asr_repair: Whisper готов; проверка следующих фрагментов включена.")
+
+        self._boot_thread = threading.Thread(
+            target=boot, name="asr-repair-warmup", daemon=True
+        )
+        self._boot_thread.start()
 
     @property
     def parallelism(self) -> int:
@@ -535,6 +562,11 @@ class AsrRepair:
 
     def submit(self, plain_chunk: str, wav_bytes: bytes, resynth, tag: str = "", first_chunk: bool = False):
         """Starts check_and_fix in the background -> Future of the (possibly repaired) wav bytes; it never raises."""
+        if not self.ok or self._closed:
+            if not self._not_ready_logged:
+                self._not_ready_logged = True
+                self.log("asr_repair: Whisper ещё загружается; первые фрагменты озвучиваются без перепроверки.")
+            return wav_bytes
         return self._pool.submit(self.check_and_fix, plain_chunk, wav_bytes, resynth, tag, first_chunk)
 
     def _bump(self, key: str, n: int = 1):
@@ -584,7 +616,15 @@ class AsrRepair:
                 return wav_bytes
             self._bump("defective")
             best, best_defects, tried, seen = wav_bytes, base, [], {}
-            for attempt_no, (name, fn) in enumerate(tweaks_for(base, src)[: self.max_attempts], 1):
+            tweaks = tweaks_for(base, src)
+            default_order = {name: i for i, (name, _) in enumerate(tweaks)}
+            kinds = {d.get("kind", "unknown") for d in base}
+            if len(kinds) == 1:
+                kind = next(iter(kinds))
+                wins = {name: self._wins.get((kind, name), 0) for name, _ in tweaks}
+                if max(wins.values(), default=0) >= 3:
+                    tweaks.sort(key=lambda item: (-wins[item[0]], default_order[item[0]]))
+            for attempt_no, (name, fn) in enumerate(tweaks[: self.max_attempts], 1):
                 self.log(f"asr_repair {tag}: итерация {attempt_no}/{self.max_attempts} — «{name}»")
                 def capture(ssml, fn=fn):
                     seen.setdefault("ssml", ssml)
@@ -618,11 +658,17 @@ class AsrRepair:
                 except Exception as e:  # noqa: BLE001
                     self.log(f"asr_repair {tag}: вырезание гула не удалось ({e})")
             self._bump("fixed" if len(best_defects) < len(base) else "kept_defect")
+            winner = next((item["tweak"] for item in tried
+                           if item["defects"] == len(best_defects)
+                           and len(best_defects) < len(base)), None)
             what = "; ".join(d["kind"] + ": " + d["text"] for d in base[:3])
             self.log(f"asr_repair {tag}: дефектов {len(base)} -> {len(best_defects)} ({what})")
             with self._lock, open(self.report, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"tag": tag, "before": base, "after": best_defects, "tried": tried,
+                fh.write(json.dumps({"tag": tag, "before": base, "after": best_defects, "tried": tried, "winner": winner,
                                      "text": plain_chunk[:120], "ssml": seen.get("ssml", "")}, ensure_ascii=False) + "\n")
+            if winner and len(kinds) == 1:
+                key = (next(iter(kinds)), winner)
+                self._wins[key] = self._wins.get(key, 0) + 1
             return best
         except queue.Empty:
             self.log(f"asr_repair {tag}: проверка пропущена (таймаут ответа ASR-worker)")
@@ -643,8 +689,9 @@ class AsrRepair:
         return line
 
     def close(self):
-        if self._pool is not None:
-            self._pool.shutdown(wait=True)
+        with self._lock:
+            self._closed = True
+        self._pool.shutdown(wait=True)
         for w in self.workers:
             w.close()
         if self.ok:

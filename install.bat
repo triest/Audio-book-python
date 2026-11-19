@@ -19,8 +19,8 @@ rem XTTS/ASR weights, CosyVoice3, local LLM or unrelated TTS stacks.
 rem AUDIOBOOK_INSTALL_ESPEECH_ASR=1 enables Whisper/Transformers ASR.
 rem AUDIOBOOK_INSTALL_F5_FALLBACK=1 downloads F5-Russian fallback weights.
 rem AUDIOBOOK_INSTALL_XTTS=1 enables the XTTS fallback and its ~2 GB model.
-rem AUDIOBOOK_INSTALL_COSYVOICE3=1, AUDIOBOOK_INSTALL_LLM=1 and
-rem AUDIOBOOK_INSTALL_OTHER_TTS=1 enable their separate optional stacks.
+rem AUDIOBOOK_INSTALL_COSYVOICE3=1 and AUDIOBOOK_INSTALL_LLM=1 enable their
+rem separate optional stacks. VoxCPM2 and Kokoro-RU are installed by default.
 
 rem Keep pip quiet and deterministic on repeat runs.  pip already skips a
 rem package whose installed version satisfies the requirement; these settings
@@ -32,17 +32,26 @@ set "PIP_UPGRADE_STRATEGY=only-if-needed"
 
 cd /d "%~dp0"
 
+rem Optional narrow repair/update path for the Kokoro-RU environment only.
+if /i "%~1"=="kokoro" (
+    set "AUDIOBOOK_INSTALL_KOKORO_ONLY=1"
+)
+if /i "%~1"=="kokoro\" (
+    set "AUDIOBOOK_INSTALL_KOKORO_ONLY=1"
+)
+
 rem Re-launch itself once, piping all output (both what you see on screen
 rem AND everything below) through PowerShell's Tee-Object into
-rem install_log.txt next to this file - so if something goes wrong, you
-rem can just send that file instead of copy-pasting the console. The
-rem INSTALL_LOG_TEE marker prevents this from looping forever (the
-rem re-launched copy inherits it and skips straight past this block).
+rem a unique install_log_*.txt next to this file, so concurrent runs do not
+rem lock each other's logs. Forward the original arguments to the child.
+rem INSTALL_LOG_TEE prevents the re-launch from looping forever.
 if not defined INSTALL_LOG_TEE (
     set "INSTALL_LOG_TEE=1"
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%~f0' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$log=Join-Path '%~dp0' ('install_log_'+(Get-Date -Format 'yyyyMMdd_HHmmss_fff')+'.txt'); & '%~f0' %* 2>&1 | Tee-Object -FilePath $log"
     exit /b
 )
+
+if defined AUDIOBOOK_INSTALL_KOKORO_ONLY goto :kokoro_only
 
 echo ===============================================
 echo   FB2 Audiobook Reader - installing dependencies
@@ -110,7 +119,9 @@ echo Checking dependencies and model files...
 echo Missing or incompatible packages will be downloaded automatically.
 echo.
 
-"%VENV_PY%" -m pip install pip --quiet
+rem Keep the venv's bundled pip on repeat installs. An unpinned `pip install pip`
+rem contacts the index and upgrades the installer itself on every run, even
+rem when all application dependencies are already present.
 
 rem Base dependencies - needed almost always (fb2 parsing, GUI, downloads)
 "%VENV_PY%" -m pip install lxml numpy tqdm requests
@@ -297,10 +308,10 @@ if not exist "CosyVoice" (
     )
 )
 
-rem Older clones (before this fix) may be missing the Matcha-TTS submodule
-rem content, which CosyVoice needs internally ("import matcha...") - make
-rem sure it is present and up to date every run, just in case.
-if exist "CosyVoice\.git" (
+rem Older clones may be missing the Matcha-TTS submodule. Update it only if
+rem its Python package marker is absent; checking/updating git submodules on
+rem every install caused needless network traffic.
+if exist "CosyVoice\.git" if not exist "CosyVoice\third_party\Matcha-TTS\matcha\__init__.py" (
     pushd CosyVoice
     git submodule update --init --recursive
     popd
@@ -346,7 +357,7 @@ rem No module named 'pkg_resources'" failures, even with --no-build-isolation
 rem below) - setuptools removed the pkg_resources module entirely starting
 rem around version 81, and openai-whisper's old setup.py still imports it.
 rem Pinning below that keeps pkg_resources available.
-"%CV_PY%" -m pip install pip wheel --quiet
+"%CV_PY%" -m pip install wheel --quiet
 "%CV_PY%" -m pip install "setuptools<81" --quiet
 
 echo Installing CosyVoice dependencies - each package is installed
@@ -460,8 +471,14 @@ rem ESpeech is the selected engine: prefetch only its 2.7 GB checkpoint and
 rem the small Vocos vocoder. hf_hub_download reuses valid local files/cache.
 "%CV_PY%" -c "from huggingface_hub import snapshot_download; snapshot_download('charactr/vocos-mel-24khz')"
 if errorlevel 1 echo WARNING: could not pre-download the Vocos vocoder; service will try again on first use.
-"%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='espeech_tts_rlv2.pt', local_dir='%CV_MODEL_DIR%/pretrained_models/espeech'); hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='vocab.txt', local_dir='%CV_MODEL_DIR%/pretrained_models/espeech')"
-if errorlevel 1 echo WARNING: could not pre-download the ESpeech checkpoint; service will try again on first use.
+if not exist "%CV_MODEL_DIR%\pretrained_models\espeech\espeech_tts_rlv2.pt" (
+    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='espeech_tts_rlv2.pt', local_dir='%CV_MODEL_DIR%/pretrained_models/espeech'); hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='vocab.txt', local_dir='%CV_MODEL_DIR%/pretrained_models/espeech')"
+    if errorlevel 1 echo WARNING: could not pre-download the ESpeech checkpoint; service will try again on first use.
+)
+if not exist "%CV_MODEL_DIR%\pretrained_models\espeech\vocab.txt" (
+    "%CV_PY%" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ESpeech/ESpeech-TTS-1_RL-V2', filename='vocab.txt', local_dir='%CV_MODEL_DIR%/pretrained_models/espeech')"
+    if errorlevel 1 echo WARNING: could not pre-download the ESpeech vocabulary; service will try again on first use.
+)
 
 if "%AUDIOBOOK_INSTALL_F5_FALLBACK%"=="1" (
     echo Installing optional F5-Russian fallback weights...
@@ -501,7 +518,7 @@ if errorlevel 1 (
     rem only reinstall it if it is missing entirely (pip leaves an
     rem already-satisfying version alone, so this is a harmless no-op most
     rem of the time).
-    "%CV_PY%" -c "import torch" >nul 2>nul
+    "%CV_PY%" -c "import importlib.metadata as m,sys; from pathlib import Path; t=m.version('torch'); a=m.version('torchaudio'); r=Path(m.distribution('torch').locate_file('torch')); ar=Path(m.distribution('torchaudio').locate_file('torchaudio')); ok='+cu' in t and t.split('+')[0]==a.split('+')[0] and all((r/'lib'/n).is_file() and (r/'lib'/n).stat().st_size>1024 for n in ('torch_cuda.dll','c10_cuda.dll')) and any(p.is_file() and p.stat().st_size>1024 for p in r.glob('_C*.pyd')) and any(p.is_file() and p.stat().st_size>1024 for p in (ar/'lib').glob('*.pyd')); sys.exit(0 if ok else 1)" >nul 2>nul
     if errorlevel 1 (
         echo torch missing after coqui-tts install - reinstalling CUDA build...
         "%CV_PY%" -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
@@ -519,17 +536,12 @@ if errorlevel 1 (
     "%CV_PY%" -m pip install ruaccent
     if errorlevel 1 echo WARNING: ruaccent failed to install - Russian stress placement may be less accurate.
 
-    echo.
-    echo Pre-downloading the XTTS-v2 model ^(~2 GB, only needs to happen
-    echo once - if this step is skipped or fails, the service will just
-    echo download it the first time voice cloning is used instead^)...
-    set "COQUI_TOS_AGREED=1"
-    "%CV_PY%" -c "import os; os.environ['COQUI_TOS_AGREED']='1'; from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
-    if errorlevel 1 (
-        echo WARNING: could not pre-download the XTTS-v2 model - it will be
-        echo downloaded automatically the first time you use voice cloning
-        echo instead ^(just makes the very first use slower^).
-    )
+    if not exist "%LOCALAPPDATA%\tts\tts_models--multilingual--multi-dataset--xtts_v2\model.pth" (
+        echo Pre-downloading the XTTS-v2 model ^(~2 GB, one time^)...
+        set "COQUI_TOS_AGREED=1"
+        "%CV_PY%" -c "import os; os.environ['COQUI_TOS_AGREED']='1'; from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
+        if errorlevel 1 echo WARNING: could not pre-download the XTTS-v2 model - it will download on first use.
+    ) else echo XTTS-v2 weights already present - skipping the 2 GB download.
 )
 )
 
@@ -588,7 +600,7 @@ if not exist "CosyVoice3" (
     )
 )
 
-if exist "CosyVoice3\.git" (
+if exist "CosyVoice3\.git" if not exist "CosyVoice3\third_party\Matcha-TTS\matcha\__init__.py" (
     pushd CosyVoice3
     git submodule update --init --recursive
     popd
@@ -629,7 +641,7 @@ rem imports it, which is what actually caused the repeated
 rem "ModuleNotFoundError: No module named 'pkg_resources'" failures (even
 rem with --no-build-isolation below). Pinning below that keeps pkg_resources
 rem available.
-"%CV3_PY%" -m pip install --upgrade pip wheel --quiet
+"%CV3_PY%" -m pip install wheel --quiet
 "%CV3_PY%" -m pip install "setuptools<81" --quiet
 
 echo Installing CosyVoice3 dependencies - this is a large install (PyTorch
@@ -693,7 +705,6 @@ if not exist ".venv_llm\Scripts\python.exe" (
     )
 )
 set "LLM_PY=%~dp0.venv_llm\Scripts\python.exe"
-"%LLM_PY%" -m pip install --upgrade pip --quiet
 "%LLM_PY%" -m pip install "llama-cpp-python==0.3.4" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --only-binary=llama-cpp-python
 if errorlevel 1 (
     echo WARNING: llama-cpp-python CUDA wheel failed to install - built-in LLM will not be available.
@@ -710,47 +721,76 @@ if errorlevel 1 (
 :llm_done
 echo.
 
-rem Optional local VoxCPM2 environment (Python 3.10-3.12; kept separate from
-rem the main Python 3.14 environment and from Silero/ESpeech).
-if not "%AUDIOBOOK_INSTALL_OTHER_TTS%"=="1" (
-    echo Skipping VoxCPM2 and Kokoro-RU. Set AUDIOBOOK_INSTALL_OTHER_TTS=1 to install them.
-    goto :optional_tts_done
-)
+rem Local VoxCPM2 environment (Python 3.10-3.12; kept separate from
+rem the main Python 3.14 environment and from Silero/ESpeech). Installed by default.
 if not exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
-    echo Creating optional .venv_voxcpm environment...
+    echo Creating .venv_voxcpm environment...
     py -3.11 -m venv "%~dp0.venv_voxcpm"
 )
 if exist "%~dp0.venv_voxcpm\Scripts\python.exe" (
     set "VOX_PY=%~dp0.venv_voxcpm\Scripts\python.exe"
-    "!VOX_PY!" -m pip install --upgrade pip wheel --quiet
-    "!VOX_PY!" -m pip install voxcpm fastapi uvicorn soundfile
-    "!VOX_PY!" -c "import sys,torch,torchaudio; sys.exit(0 if torch.__version__.startswith('2.11.0+cu126') and torchaudio.__version__.startswith('2.11.0+cu126') else 1)" >nul 2>nul
+    "!VOX_PY!" -m pip install wheel --quiet
+    "!VOX_PY!" -c "from importlib.metadata import version; [version(p) for p in ('voxcpm','fastapi','uvicorn','soundfile')]" >nul 2>nul
+    if errorlevel 1 "!VOX_PY!" -m pip install voxcpm fastapi uvicorn soundfile
+    "!VOX_PY!" -c "import importlib.metadata as m,sys; from pathlib import Path; t=m.version('torch'); a=m.version('torchaudio'); r=Path(m.distribution('torch').locate_file('torch')); ar=Path(m.distribution('torchaudio').locate_file('torchaudio')); ok=t=='2.11.0+cu126' and a==t and all((r/'lib'/n).is_file() and (r/'lib'/n).stat().st_size>1024 for n in ('torch_cuda.dll','c10_cuda.dll')) and any(p.is_file() and p.stat().st_size>1024 for p in r.glob('_C*.pyd')) and any(p.is_file() and p.stat().st_size>1024 for p in (ar/'lib').glob('*.pyd')); sys.exit(0 if ok else 1)" >nul 2>nul
     if errorlevel 1 "!VOX_PY!" -m pip install --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
-    "!VOX_PY!" -c "from voxcpm import VoxCPM; print('VoxCPM2 environment is ready')"
+    "!VOX_PY!" -c "from importlib.metadata import version; [version(p) for p in ('voxcpm','fastapi','uvicorn','soundfile')]; print('VoxCPM2 package metadata is ready')"
     if errorlevel 1 echo WARNING: VoxCPM2 environment check failed - the mode will be unavailable.
 ) else echo WARNING: Python 3.11 was not found - skipping optional VoxCPM2 environment.
 echo.
 
-rem Optional local Kokoro-RU environment. It is isolated because its torch and
+:kokoro_only
+rem Local Kokoro-RU environment. It is isolated because its torch and
 rem kokoro frontend versions must not alter the proven ESpeech environment.
 if not exist "%~dp0.venv_kokoro\Scripts\python.exe" (
-    echo Creating optional .venv_kokoro environment...
+    echo Creating .venv_kokoro environment...
     py -3.11 -m venv "%~dp0.venv_kokoro"
 )
 if exist "%~dp0.venv_kokoro\Scripts\python.exe" (
     set "KOKORO_PY=%~dp0.venv_kokoro\Scripts\python.exe"
-    "!KOKORO_PY!" -m pip install --upgrade pip wheel --quiet
-    "!KOKORO_PY!" -m pip install kokoro ruaccent huggingface_hub fastapi uvicorn soundfile
-    "!KOKORO_PY!" -c "import sys,torch,torchaudio; sys.exit(0 if torch.__version__.startswith('2.11.0+cu126') and torchaudio.__version__.startswith('2.11.0+cu126') else 1)" >nul 2>nul
+    if not defined AUDIOBOOK_INSTALL_KOKORO_ONLY "!KOKORO_PY!" -m pip install wheel --quiet
+    if not defined AUDIOBOOK_INSTALL_KOKORO_ONLY (
+        "!KOKORO_PY!" -c "from importlib.metadata import version; [version(p) for p in ('kokoro','ruaccent','huggingface-hub','fastapi','uvicorn','soundfile')]" >nul 2>nul
+        if errorlevel 1 "!KOKORO_PY!" -m pip install kokoro ruaccent huggingface_hub fastapi uvicorn soundfile
+    )
+    "!KOKORO_PY!" -c "import sys,onnxruntime as ort; sys.exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)" >nul 2>nul
+    if errorlevel 1 (
+        rem Replace CPU-only ONNX Runtime with its CUDA 12.x build.
+        "!KOKORO_PY!" -m pip uninstall -y onnxruntime >nul 2>nul
+        "!KOKORO_PY!" -m pip install --no-deps onnxruntime-gpu==1.20.2
+        if errorlevel 1 (
+            echo WARNING: Could not fetch ONNX Runtime GPU. Restoring the cached CPU runtime if available.
+            "!KOKORO_PY!" -m pip uninstall -y onnxruntime onnxruntime-gpu >nul 2>nul
+            call :restore_kokoro_ort_cpu
+        )
+    )
+    "!KOKORO_PY!" -c "import sys; from importlib.metadata import version; sys.exit(0 if version('torch').startswith('2.11.0+cu126') and version('torchaudio').startswith('2.11.0+cu126') else 1)" >nul 2>nul
     if errorlevel 1 "!KOKORO_PY!" -m pip install --no-deps torch==2.11.0+cu126 torchaudio==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
-    "!KOKORO_PY!" -c "from huggingface_hub import snapshot_download; snapshot_download('zaakirio/kokoro-ru', allow_patterns=['ru_g2p.py','kokoro-config.json','espeak-data/*','kokoro-ru-v2-base.pth','kokoro-ru-v2-dima.pth','voices/*.pt']); snapshot_download('ruaccent/accentuator')"
-    "!KOKORO_PY!" -c "from kokoro import KModel; from ruaccent import RUAccent; print('Kokoro-RU environment is ready')"
+    if not defined AUDIOBOOK_INSTALL_KOKORO_ONLY "!KOKORO_PY!" -c "from huggingface_hub import snapshot_download; snapshot_download('zaakirio/kokoro-ru', allow_patterns=['ru_g2p.py','kokoro-config.json','espeak-data/*','kokoro-ru-v2-base.pth','kokoro-ru-v2-dima.pth','voices/*.pt']); snapshot_download('ruaccent/accentuator')"
+    "!KOKORO_PY!" -c "from importlib.metadata import version; [version(p) for p in ('kokoro','ruaccent','huggingface-hub','fastapi','uvicorn','soundfile')]; print('Kokoro-RU package metadata is ready')"
     if errorlevel 1 echo WARNING: Kokoro-RU environment check failed - the mode will be unavailable.
+    "!KOKORO_PY!" -c "import sys,onnxruntime as ort; sys.exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)"
+    if errorlevel 1 echo WARNING: ONNX Runtime CUDA provider is unavailable; RUAccent will use CPU.
 ) else echo WARNING: Python 3.11 was not found - skipping optional Kokoro-RU environment.
 echo.
 
-:optional_tts_done
 goto :done
+
+:restore_kokoro_ort_cpu
+rem Offline fallback: reuse the Python 3.11 CPU ONNX Runtime and NumPy already
+rem installed in the CosyVoice3 venv. Keep this environment isolated from them.
+set "KOKORO_SITE=%~dp0.venv_kokoro\Lib\site-packages"
+set "ORT_SOURCE=%~dp0.venv_cosyvoice3\Lib\site-packages"
+if not exist "!ORT_SOURCE!\onnxruntime\__init__.py" (
+    echo WARNING: No cached Python 3.11 ONNX Runtime; Kokoro-RU remains unavailable.
+    exit /b 0
+)
+for %%D in (onnxruntime onnxruntime-1.30.0.dist-info onnxruntime-1.18.0.dist-info onnxruntime_gpu-1.20.1.dist-info onnxruntime_gpu-1.20.2.dist-info numpy numpy.libs numpy-2.4.6.dist-info numpy-1.26.4.dist-info) do if exist "!KOKORO_SITE!\%%D" rmdir /S /Q "!KOKORO_SITE!\%%D"
+echo Restoring Kokoro's cached Python 3.11 CPU runtime from !ORT_SOURCE!.
+rem Exclude generated bytecode and optional ORT tooling; Kokoro needs core runtime only.
+if exist "!ORT_SOURCE!\onnxruntime" robocopy "!ORT_SOURCE!\onnxruntime" "!KOKORO_SITE!\onnxruntime" /MIR /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XF *.pyc /XD __pycache__ tests tools quantization transformers training
+for %%D in (onnxruntime-1.18.0.dist-info numpy numpy.libs numpy-1.26.4.dist-info) do if exist "!ORT_SOURCE!\%%D" robocopy "!ORT_SOURCE!\%%D" "!KOKORO_SITE!\%%D" /MIR /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XF *.pyc /XD __pycache__ tests
+exit /b 0
 
 :warn_partial
 call :build_exe
@@ -786,6 +826,13 @@ rem ===============================================
 :build_exe
 if defined BUILD_DONE exit /b 0
 set "BUILD_DONE=1"
+if exist "%~dp0fb2_reader.exe" (
+    powershell -NoProfile -Command "$root='%~dp0_app'; $exe=Get-Item '%~dp0fb2_reader.exe'; $files=@(Get-ChildItem $root -File -Filter '*.py')+@(Get-ChildItem (Join-Path $root 'tools') -File -Filter '*.py')+@(Get-Item (Join-Path $root 'main.spec')); $assets='ambiguous_stress_words_ru.txt','not_ambiguous_stress_words_ru.txt','stress_corpus_ru.tsv.gz','stress_dictionary.json','forced_stress_words.json','manual_stress_overrides.json','config.json','silero_stress_phrases.json','grammar_gate_models\slovnet_morph_news_v1.tar'; $files+=@($assets | ForEach-Object { Join-Path $root $_ } | Where-Object { Test-Path $_ } | ForEach-Object { Get-Item $_ }); if ($files | Where-Object { $_.LastWriteTimeUtc -gt $exe.LastWriteTimeUtc }) { exit 1 } else { exit 0 }" >nul 2>nul
+    if not errorlevel 1 (
+        echo Existing fb2_reader.exe is newer than the sources - skipping the rebuild.
+        exit /b 0
+    )
+)
 echo.
 echo ===============================================
 echo   Building the single-file fb2_reader.exe ^(PyInstaller^)
@@ -796,7 +843,7 @@ if errorlevel 1 (
     exit /b 0
 )
 if not exist "%~dp0grammar_gate_models\slovnet_morph_news_v1.tar" echo WARNING: grammar models are missing - the .exe will be built WITHOUT the grammar gate.
-"%VENV_PY%" -c "import silero_stress" >nul 2>nul
+"%VENV_PY%" -c "from importlib.metadata import version; version('silero-stress')" >nul 2>nul
 if errorlevel 1 echo WARNING: silero-stress is not installed - the .exe would have no automatic stress marks.
 rem a running fb2_reader.exe locks the file and makes the build fail
 taskkill /F /IM fb2_reader.exe >nul 2>nul
@@ -804,7 +851,7 @@ rem Keep PyInstaller's analysis cache between runs.  Deleting build\ and
 rem dist\ here made every install rebuild the whole executable from scratch.
 rem strictly ONE monolithic file (main.spec reads this variable; it is also its default)
 set "AUDIOBOOK_ONEFILE=1"
-"%VENV_PY%" -m PyInstaller main.spec --noconfirm --distpath "%~dp0dist" --workpath "%~dp0build"
+"%VENV_PY%" -m PyInstaller _app\main.spec --noconfirm --distpath "%~dp0dist" --workpath "%~dp0build"
 if errorlevel 1 (
     echo WARNING: the .exe build failed - see the messages above. The program still runs from sources ^(run_gui.bat^).
     exit /b 0

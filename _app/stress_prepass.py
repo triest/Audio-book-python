@@ -113,6 +113,10 @@ def scan_prepass(chapters, only_chapters=None, skip_keys=(), skip_words=(), prog
     if book_overrides_path:
         try:
             decided |= sq.dictionary_words(book_overrides_path)
+            # Confirmed automatic readings are book-specific decisions too.
+            # Keep them out of the review queue without promoting them into
+            # the user's global/manual dictionary.
+            decided |= sq.dictionary_words(fr.book_auto_stress_cache_path(book_overrides_path))
         except Exception:
             pass
     skip = set(skip_keys)

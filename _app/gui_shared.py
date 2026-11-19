@@ -80,6 +80,9 @@ COSYVOICE_ENGINE_LABELS = {
 COSYVOICE_ENGINE_CODES = {label: code for code, label in COSYVOICE_ENGINE_LABELS.items()}
 COSYVOICE_DEFAULT_ENGINE = "espeech"
 
+SILERO_REST_DEFAULT_URL = "http://localhost:5010"
+SILERO_REST_EXPECTED_SERVICE_VERSION = "2026-11-19.1-silero-cuda-health"
+
 # CosyVoice3, в отличие от остальных движков (f5/espeech/f5winter/xtts),
 # запускается подпроцессом в СВОЁМ окружении .venv_cosyvoice3 (не в общем
 # .venv_cosyvoice - см. cosyvoice3_rest_service.py и install.bat) - у него
@@ -90,7 +93,7 @@ COSYVOICE3_EXPECTED_SERVICE_VERSION = "2026-08-24.15-transcribe-window-fix"
 VOXCPM_DEFAULT_REST_URL = "http://localhost:5014"
 VOXCPM_EXPECTED_SERVICE_VERSION = "2026-11-10.2-gui"
 KOKORO_DEFAULT_REST_URL = "http://localhost:5015"
-KOKORO_EXPECTED_SERVICE_VERSION = "2026-11-18.4-ruaccent-copy-assets"
+KOKORO_EXPECTED_SERVICE_VERSION = "2026-11-18.7-kokoro-init-progress"
 
 
 def _write_log_file(s: str):
